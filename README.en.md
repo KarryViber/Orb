@@ -1,5 +1,9 @@
 # SNS Web Search & Messaging System
 
+**Language / 言語 / 语言:** [English](./README.md) | [中文](./README.zh.md) | [日本語](./README.ja.md)
+
+---
+
 ## Project Overview
 
 This is an intelligent management platform designed specifically for social media marketing and customer development. The system helps businesses and marketers efficiently discover potential customers across major social platforms and achieve precision marketing through automated messaging features.
