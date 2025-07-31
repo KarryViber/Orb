@@ -1,0 +1,255 @@
+<template>
+  <div class="user-view">
+    <el-tabs v-model="activeTab" class="user-tabs">
+      <!-- 用户管理标签页 -->
+      <el-tab-pane label="用户管理" name="users">
+        <!-- 用户管理工具栏 -->
+        <data-table-toolbar
+          v-model:search="userSearch.keyword"
+          v-model:platform="userSearch.platform"
+          v-model:tags="userSearch.tags"
+          search-placeholder="搜索用户名/显示名称"
+          create-button-text="添加用户"
+          :show-tag-select="true"
+          :tag-options="tagOptions"
+          @search="handleUserSearch"
+          @create="handleUserCreate"
+        >
+          <template #additional-buttons>
+            <el-button type="success" @click="handleImport">
+              <el-icon><Upload /></el-icon>批量导入
+            </el-button>
+            <el-button type="warning" @click="handleExport">
+              <el-icon><Download /></el-icon>导出
+            </el-button>
+            <el-button 
+              type="warning" 
+              :disabled="!selectedUsers.length"
+              @click="handleBatchAddToGroup"
+            >
+              <el-icon><FolderAdd /></el-icon>添加到用户组
+            </el-button>
+          </template>
+        </data-table-toolbar>
+
+        <!-- 用户列表 -->
+        <data-table
+          :data="userList"
+          :loading="userLoading"
+          :total="userTotal"
+          :current-page="userCurrentPage"
+          :page-size="userPageSize"
+          :show-selection="true"
+          @selection-change="handleUserSelectionChange"
+          @page-change="handleUserPageChange"
+          @edit="handleUserEdit"
+          @delete="handleUserDelete"
+        >
+          <el-table-column prop="username" label="用户名" min-width="120" />
+          <el-table-column prop="display_name" label="显示名称" min-width="120" />
+          <el-table-column label="平台" width="120">
+            <template #default="{ row }">
+              <el-tag :type="getPlatformTagType(row.platform)">
+                {{ row.platform }}
+              </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column prop="followers_count" label="粉丝数" width="120" />
+          <el-table-column prop="following_count" label="关注数" width="120" />
+          <el-table-column label="标签" min-width="200">
+            <template #default="{ row }">
+              <el-tag
+                v-for="tag in row.tags"
+                :key="tag"
+                class="mx-1"
+                closable
+                @close="handleRemoveTag(row, tag)"
+              >
+                {{ tag }}
+              </el-tag>
+              <el-button link @click="handleAddTag(row)">
+                <el-icon><Plus /></el-icon>
+              </el-button>
+            </template>
+          </el-table-column>
+
+          <template #additional-actions="{ row }">
+            <el-button type="success" link @click="handleAddToGroup(row)">
+              添加到组
+            </el-button>
+          </template>
+        </data-table>
+      </el-tab-pane>
+
+      <!-- 用户组管理标签页将在下一步添加 -->
+    </el-tabs>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { ref, onMounted } from 'vue'
+import { Plus, Upload, Download, FolderAdd } from '@element-plus/icons-vue'
+import DataTableToolbar from '@/components/common/DataTableToolbar.vue'
+import DataTable from '@/components/common/DataTable.vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import type { Tag } from '@/types/common'
+import type { UserResponse } from '@/types/user'
+import { Platform } from '@/types/common'
+import { getUsers, createUser, updateUser, deleteUser } from '@/api/users'
+
+// 标签页状态
+const activeTab = ref('users')
+
+// 用户管理相关状态
+const userSearch = ref({
+  keyword: '',
+  platform: '',
+  tags: [] as string[]
+})
+
+const userList = ref<UserResponse[]>([])
+const userLoading = ref(false)
+const userTotal = ref(0)
+const userCurrentPage = ref(1)
+const userPageSize = ref(10)
+const selectedUsers = ref<UserResponse[]>([])
+
+// 标签选项
+const tagOptions = ref<Tag[]>([
+  { label: 'VIP', value: 'vip' },
+  { label: '活跃用户', value: 'active' },
+  { label: '新用户', value: 'new' }
+])
+
+// 加载用户列表
+const loadUsers = async () => {
+  userLoading.value = true
+  try {
+    const response = await getUsers({
+      keyword: userSearch.value.keyword,
+      platform: userSearch.value.platform as Platform,
+      tags: userSearch.value.tags,
+      page: userCurrentPage.value,
+      pageSize: userPageSize.value
+    })
+    userList.value = response.data
+    userTotal.value = response.total
+  } catch (error) {
+    console.error('加载用户列表失败:', error)
+    ElMessage.error('加载用户列表失败')
+  } finally {
+    userLoading.value = false
+  }
+}
+
+// 用户相关操作处理器
+const handleUserSearch = () => {
+  userCurrentPage.value = 1
+  loadUsers()
+}
+
+const handleUserPageChange = (page: number) => {
+  userCurrentPage.value = page
+  loadUsers()
+}
+
+const handleUserSelectionChange = (selection: UserResponse[]) => {
+  selectedUsers.value = selection
+}
+
+const handleUserCreate = () => {
+  // 将在后续步骤中实现
+  console.log('创建用户')
+}
+
+const handleUserEdit = (user: UserResponse) => {
+  // 将在后续步骤中实现
+  console.log('编辑用户', user)
+}
+
+const handleUserDelete = async (user: UserResponse) => {
+  try {
+    await ElMessageBox.confirm(
+      '确定要删除这个用户吗？删除后无法恢复。',
+      '删除确认',
+      {
+        confirmButtonText: '确定',
+        cancelButtonText: '取消',
+        type: 'warning'
+      }
+    )
+    
+    await deleteUser(user.id)
+    ElMessage.success('删除成功')
+    loadUsers()
+  } catch (error) {
+    if (error !== 'cancel') {
+      console.error('删除用户失败:', error)
+      ElMessage.error('删除用户失败')
+    }
+  }
+}
+
+const handleAddTag = (user: UserResponse) => {
+  // 将在后续步骤中实现
+  console.log('添加标签', user)
+}
+
+const handleRemoveTag = (user: UserResponse, tag: string) => {
+  // 将在后续步骤中实现
+  console.log('移除标签', user, tag)
+}
+
+const handleImport = () => {
+  // 将在后续步骤中实现
+  console.log('导入用户')
+}
+
+const handleExport = () => {
+  // 将在后续步骤中实现
+  console.log('导出用户')
+}
+
+const handleBatchAddToGroup = () => {
+  if (!selectedUsers.value.length) {
+    ElMessage.warning('请先选择用户')
+    return
+  }
+  // 将在后续步骤中实现
+  console.log('批量添加到用户组')
+}
+
+const handleAddToGroup = (user: UserResponse) => {
+  // 将在后续步骤中实现
+  console.log('添加到用户组', user)
+}
+
+// 辅助方法
+const getPlatformTagType = (platform: string) => {
+  const map: Record<string, string> = {
+    [Platform.INSTAGRAM]: 'danger',
+    [Platform.TWITTER]: 'primary',
+    [Platform.FACEBOOK]: 'success'
+  }
+  return map[platform.toLowerCase()] || 'info'
+}
+
+// 初始化
+onMounted(() => {
+  loadUsers()
+})
+</script>
+
+<style scoped>
+.user-view {
+  padding: 20px;
+}
+
+.user-tabs {
+  margin-bottom: 20px;
+}
+
+.mx-1 {
+  margin: 0 4px;
+}
+</style>

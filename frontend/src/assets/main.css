@@ -1,0 +1,97 @@
+/* 全局样式 */
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+}
+
+#app {
+  height: 100%;
+}
+
+/* Element Plus 主题覆盖 */
+:root {
+  --el-color-primary: #409EFF;
+}
+
+/* 通用布局样式 */
+.app-container {
+  padding: 20px;
+}
+
+.page-header {
+  margin-bottom: 20px;
+}
+
+.page-title {
+  font-size: 24px;
+  font-weight: 500;
+  color: #303133;
+  margin: 0;
+}
+
+/* 表格样式优化 */
+.el-table {
+  margin-top: 20px;
+}
+
+/* 分页样式优化 */
+.pagination-container {
+  margin-top: 20px;
+  display: flex;
+  justify-content: flex-end;
+}
+
+/* 表单样式优化 */
+.el-form-item {
+  margin-bottom: 22px;
+}
+
+/* 卡片样式优化 */
+.el-card {
+  margin-bottom: 20px;
+}
+
+/* 按钮组样式优化 */
+.el-button-group {
+  margin-right: 10px;
+}
+
+/* 标签样式优化 */
+.el-tag {
+  margin-right: 5px;
+  margin-bottom: 5px;
+}
+
+/* 头像样式优化 */
+.el-avatar {
+  background-color: #409EFF;
+  color: #fff;
+}
+
+/* 加载状态样式 */
+.loading-container {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: 200px;
+}
+
+/* 空状态样式 */
+.empty-container {
+  text-align: center;
+  padding: 40px 0;
+  color: #909399;
+}
+
+/* 响应式布局 */
+@media (max-width: 768px) {
+  .el-dialog {
+    width: 90% !important;
+  }
+  
+  .el-form-item {
+    margin-bottom: 15px;
+  }
+} 

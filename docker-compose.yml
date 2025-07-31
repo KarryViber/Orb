@@ -1,0 +1,46 @@
+version: '3'
+
+services:
+  frontend:
+    image: sns-web-frontend
+    container_name: sns-web-frontend
+    restart: always
+    networks:
+      - sns-network
+
+  backend:
+    image: sns-web-backend
+    container_name: sns-web-backend
+    restart: always
+    volumes:
+      - /data/karry/sns-web/logs:/app/logs
+      - /data/karry/sns-web/data:/app/data
+      - /data/karry/sns-web/config:/app/config
+    environment:
+      - ENV=production
+      - DB_PRESERVE_DATA=true
+    networks:
+      - sns-network
+
+  nginx:
+    image: nginx:alpine
+    container_name: sns-web-nginx
+    restart: always
+    ports:
+      - "8000:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - /data/karry/sns-web/logs/nginx:/var/log/nginx
+    depends_on:
+      - frontend
+      - backend
+    networks:
+      - sns-network
+
+networks:
+  sns-network:
+    driver: bridge
+
+volumes:
+  sns_data:
+    driver: local 

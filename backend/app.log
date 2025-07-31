@@ -1,0 +1,6 @@
+2025-02-13 21:08:45,703 - main - INFO - 环境变量:
+2025-02-13 21:08:45,703 - main - INFO - APIFY_API_TOKEN: 
+2025-02-13 21:08:45,703 - main - INFO - APIFY_INSTAGRAM_ACTOR: apify/instagram-profile-scraper
+2025-02-13 21:09:01,213 - api.search_tasks - INFO - 从请求头获取到 API Token: apify...
+2025-02-13 21:09:01,213 - api.search_tasks - INFO - 环境变量中的 API Token: ...
+2025-02-13 21:09:01,213 - api.search_tasks - ERROR - 创建搜索任务失败: 'SearchParams' object has no attribute 'model_dump'

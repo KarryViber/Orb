@@ -1,0 +1,51 @@
+{
+  "common": {
+    "lengthLimit": "长度限制: {min}-{max} 个字符",
+    "submit": "提交",
+    "cancel": "取消",
+    "confirm": "确认",
+    "delete": "删除",
+    "edit": "编辑",
+    "create": "创建",
+    "search": "搜索",
+    "platform": "平台",
+    "description": "描述",
+    "operation": "操作",
+    "loading": "加载中..."
+  },
+  "userGroup": {
+    "loadFailed": "加载用户组失败",
+    "createGroup": "创建用户组",
+    "editGroup": "编辑用户组",
+    "deleteGroup": "删除用户组",
+    "manageUsers": "管理用户",
+    "groupName": "用户组名称",
+    "description": "描述",
+    "userCount": "用户数量",
+    "currentUsers": "当前用户",
+    "addUsers": "添加用户",
+    "searchUsers": "搜索用户",
+    "addToGroup": "添加到组",
+    "removeFromGroup": "从组中移除",
+    "searchPlaceholder": "搜索用户组名称",
+    "selectPlatform": "选择平台",
+    "deleteConfirm": "确定要删除该用户组吗？删除后无法恢复。",
+    "form": {
+      "namePlaceholder": "请输入用户组名称",
+      "descriptionPlaceholder": "请输入描述信息",
+      "platformPlaceholder": "请选择平台",
+      "nameRule": "用户组名称不能为空",
+      "platformRule": "请选择平台"
+    },
+    "addSuccess": "添加到用户组成功",
+    "addFailed": "添加到用户组失败",
+    "pleaseSelect": "请选择要添加到的用户组",
+    "pleaseSelectUsers": "请选择要添加的用户",
+    "confirmAdd": "确认添加选中的 {count} 个用户到 {groupName} 组？",
+    "noGroupSelected": "请先选择一个用户组",
+    "noUsersSelected": "请先选择要添加的用户",
+    "createSuccess": "创建用户组成功",
+    "updateSuccess": "更新用户组成功",
+    "deleteSuccess": "删除用户组成功"
+  }
+} 
