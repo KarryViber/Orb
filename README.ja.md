@@ -18,6 +18,10 @@
 
 📊 **データ駆動型意思決定** - 詳細な検索結果分析と送信効果統計を提供し、マーケティング戦略を最適化
 
+<img width="3360" height="1720" alt="CleanShot 2025-07-31 at 16 25 03@2x" src="https://github.com/user-attachments/assets/1a131a5a-80f1-4c9d-a5d4-f39ec30228da" />
+<img width="3386" height="1744" alt="CleanShot 2025-07-31 at 16 25 31@2x" src="https://github.com/user-attachments/assets/3a0ac797-8a49-4bee-84a4-657e76afb640" />
+<img width="3398" height="1736" alt="CleanShot 2025-07-31 at 16 25 46@2x" src="https://github.com/user-attachments/assets/3e74e7dc-7751-490f-94b2-6fec35aa6b03" />
+
 ### 適用シーン
 
 - **Eコマースマーケティング**: 潜在的な購入者を見つけ、製品とサービスを宣伝
