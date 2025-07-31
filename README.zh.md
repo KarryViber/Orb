@@ -18,6 +18,10 @@
 
 📊 **数据驱动决策** - 提供详细的搜索结果分析和发送效果统计，优化营销策略
 
+<img width="3360" height="1720" alt="CleanShot 2025-07-31 at 16 25 03@2x" src="https://github.com/user-attachments/assets/1a131a5a-80f1-4c9d-a5d4-f39ec30228da" />
+<img width="3386" height="1744" alt="CleanShot 2025-07-31 at 16 25 31@2x" src="https://github.com/user-attachments/assets/3a0ac797-8a49-4bee-84a4-657e76afb640" />
+<img width="3398" height="1736" alt="CleanShot 2025-07-31 at 16 25 46@2x" src="https://github.com/user-attachments/assets/3e74e7dc-7751-490f-94b2-6fec35aa6b03" />
+
 ### 适用场景
 
 - **电商营销**: 寻找潜在买家，推广产品和服务
