@@ -46,7 +46,7 @@ CREATE INDEX IF NOT EXISTS idx_facts_category ON facts(category);
 CREATE INDEX IF NOT EXISTS idx_entities_name  ON entities(name);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts
-    USING fts5(content, tags, content=facts, content_rowid=fact_id);
+    USING fts5(content, tags, content=facts, content_rowid=fact_id, tokenize='trigram');
 
 CREATE TRIGGER IF NOT EXISTS facts_ai AFTER INSERT ON facts BEGIN
     INSERT INTO facts_fts(rowid, content, tags)

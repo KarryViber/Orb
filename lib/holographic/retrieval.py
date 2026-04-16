@@ -539,6 +539,39 @@ class FactRetriever:
         scored.sort(key=lambda x: x["score"], reverse=True)
         return scored[:limit]
 
+    def _like_candidates(
+        self,
+        query: str,
+        category: str | None,
+        min_trust: float,
+        limit: int,
+    ) -> list[dict]:
+        """Fallback for queries too short for trigram FTS5 (< 3 chars)."""
+        conn = self.store._conn
+        params: list = [f"%{query}%", min_trust]
+        where = "WHERE content LIKE ? AND trust_score >= ?"
+        if category:
+            where += " AND category = ?"
+            params.append(category)
+        params.append(limit)
+
+        try:
+            rows = conn.execute(
+                f"""
+                SELECT fact_id, content, category, tags, trust_score,
+                       retrieval_count, helpful_count, created_at, updated_at,
+                       hrr_vector, 1.0 as fts_rank
+                FROM facts
+                {where}
+                ORDER BY trust_score DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+            return [dict(r) for r in rows]
+        except Exception:
+            return []
+
     def _fts_candidates(
         self,
         query: str,
@@ -550,7 +583,12 @@ class FactRetriever:
 
         Uses the store's database connection directly for FTS5 MATCH
         with rank scoring. Normalizes FTS5 rank to [0, 1] range.
+        Trigram tokenizer requires >= 3 chars; shorter queries fall back to LIKE.
         """
+        # Trigram tokenizer requires >= 3 chars for MATCH
+        if len(query.strip()) < 3:
+            return self._like_candidates(query, category, min_trust, limit)
+
         conn = self.store._conn
 
         # Build query - FTS5 rank is negative (lower = better match)

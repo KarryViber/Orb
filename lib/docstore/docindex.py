@@ -119,7 +119,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
     title,
     section,
     content,
-    tokenize = 'unicode61 remove_diacritics 2'
+    tokenize = 'trigram'
 );
 
 CREATE TABLE IF NOT EXISTS index_meta (
@@ -459,6 +459,10 @@ def delete_stale_documents(conn: sqlite3.Connection, live_paths: set[str], slug_
 
 
 def search_rows(conn: sqlite3.Connection, query: str, slug: str | None, doc_type: str | None, limit: int) -> list[dict]:
+    # Trigram tokenizer requires >= 3 chars for MATCH; fall back to LIKE for short queries
+    if len(query.strip()) < 3:
+        return _search_rows_like(conn, query, slug, doc_type, limit)
+
     filters = []
     params: list[object] = [query]
     if slug:
@@ -471,32 +475,72 @@ def search_rows(conn: sqlite3.Connection, query: str, slug: str | None, doc_type
     if filters:
         where = " AND " + " AND ".join(filters)
     params.append(limit)
-    rows = conn.execute(
-        f"""
-        SELECT
-            c.path,
-            c.slug,
-            c.doc_type,
-            d.ext,
-            c.title,
-            c.section,
-            snippet(chunks_fts, 5, '[', ']', ' … ', 18) AS snippet,
-            bm25(chunks_fts, 3.5, 2.0, 1.8, 1.8, 1.5, 1.0) * CASE c.doc_type
-                WHEN '03_delivery' THEN 1.5
-                WHEN '00_source'   THEN 1.2
-                WHEN '01_meetings' THEN 1.0
-                WHEN '02_draft'    THEN 0.6
-                ELSE 1.0
-            END AS score
-        FROM chunks_fts
-        JOIN chunks c ON c.id = chunks_fts.rowid
-        JOIN documents d ON d.id = c.doc_id
-        WHERE chunks_fts MATCH ? {where}
-        ORDER BY score
-        LIMIT ?
-        """,
-        params,
-    ).fetchall()
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT
+                c.path,
+                c.slug,
+                c.doc_type,
+                d.ext,
+                c.title,
+                c.section,
+                snippet(chunks_fts, 5, '[', ']', ' … ', 18) AS snippet,
+                bm25(chunks_fts, 3.5, 2.0, 1.8, 1.8, 1.5, 1.0) * CASE c.doc_type
+                    WHEN '03_delivery' THEN 1.5
+                    WHEN '00_source'   THEN 1.2
+                    WHEN '01_meetings' THEN 1.0
+                    WHEN '02_draft'    THEN 0.6
+                    ELSE 1.0
+                END AS score
+            FROM chunks_fts
+            JOIN chunks c ON c.id = chunks_fts.rowid
+            JOIN documents d ON d.id = c.doc_id
+            WHERE chunks_fts MATCH ? {where}
+            ORDER BY score
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+    except Exception:
+        return []
+    return [dict(row) for row in rows]
+
+
+def _search_rows_like(conn: sqlite3.Connection, query: str, slug: str | None, doc_type: str | None, limit: int) -> list[dict]:
+    """Fallback for queries too short for trigram FTS5 (< 3 chars)."""
+    filters = ["c.content LIKE ?"]
+    params: list[object] = [f"%{query}%"]
+    if slug:
+        filters.append("c.slug = ?")
+        params.append(slug)
+    if doc_type:
+        filters.append("c.doc_type = ?")
+        params.append(doc_type)
+    where = " AND ".join(filters)
+    params.append(limit)
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT
+                c.path,
+                c.slug,
+                c.doc_type,
+                d.ext,
+                c.title,
+                c.section,
+                c.content AS snippet,
+                1.0 AS score
+            FROM chunks c
+            JOIN documents d ON d.id = c.doc_id
+            WHERE {where}
+            ORDER BY c.doc_type DESC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+    except Exception:
+        return []
     return [dict(row) for row in rows]
 
 
