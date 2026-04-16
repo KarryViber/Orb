@@ -150,7 +150,7 @@ export class Scheduler {
           responded = true;
 
           if (msg.type === 'turn_complete') {
-            // 中间轮次完成 — 发送结果但保持 typing
+            // 中间轮次完成 — 发送结果，typing 由 interval 维持
             try {
               const text = msg.text?.trim();
               if (text) {
@@ -158,7 +158,6 @@ export class Scheduler {
                 for (const payload of payloads) {
                   await adapter.sendReply(channel, threadTs, payload.text, payload.blocks ? { blocks: payload.blocks } : {});
                 }
-                await adapter.setTyping(channel, threadTs, 'is thinking…').catch(() => {});
                 turnDelivered = true;
               }
             } catch (err) {

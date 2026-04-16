@@ -266,15 +266,20 @@ function runClaudeInteractive(args, initialContent, workspace) {
       lastSessionId = msg.session_id || lastSessionId;
       lastStopReason = msg.stop_reason || msg.subtype || null;
       const turnText = msg.result || turnBuffer.join('\n');
-      lastTurnText = turnText;
 
-      if (onTurnComplete) {
-        onTurnComplete({
-          text: turnText,
-          toolCount: totalToolCount,
-          lastTool,
-          stopReason: lastStopReason,
-        });
+      // 防止同一段文本重复触发（CLI 可能输出多个 result 行）
+      if (turnText && turnText !== lastTurnText) {
+        lastTurnText = turnText;
+        if (onTurnComplete) {
+          onTurnComplete({
+            text: turnText,
+            toolCount: totalToolCount,
+            lastTool,
+            stopReason: lastStopReason,
+          });
+        }
+      } else if (!lastTurnText && turnText) {
+        lastTurnText = turnText;
       }
       turnBuffer = [];
       resetIdleTimer();
