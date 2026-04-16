@@ -7,7 +7,6 @@ import { listFacts, storeLesson, storeCorrectionLesson, decayFacts, lintMemory }
 import { spawnWorker } from './spawn.js';
 const TAG = 'scheduler';
 const DRAIN_TIMEOUT = 30_000;
-const COALESCE_DEBOUNCE_MS = 1500;   // drain delay to catch late-arriving messages
 const SKILL_REVIEW_THRESHOLD = 10;   // cumulative tool uses before triggering review
 const MEMORY_SYNC_THRESHOLD = 20;    // cumulative tool uses before memory/user sync
 const MEMORY_SYNC_INTERVAL = 6 * 60 * 60 * 1000;  // min 6h between syncs per profile
@@ -47,7 +46,7 @@ export class Scheduler {
       queue.push(task);
       info(TAG, `queued msg for thread=${threadTs}, depth=${queue.length}`);
       if (queue.length === 1) {
-        await adapter.sendReply(channel, threadTs, '上一条消息处理中，后续消息会合并处理。');
+        await adapter.sendReply(channel, threadTs, '上一条消息还在处理中，完成后会按顺序回复。');
       }
       return;
     }
@@ -70,66 +69,20 @@ export class Scheduler {
   async processNextQueued(exitedThreadTs) {
     const thisQueue = this.threadQueues.get(exitedThreadTs);
     if (thisQueue && thisQueue.length > 0 && this.activeWorkers.size < this.maxWorkers) {
-      // Drain debounce: 等 1.5s 捕获晚到消息
-      await new Promise(r => setTimeout(r, COALESCE_DEBOUNCE_MS));
-
-      // 合并该 thread 所有排队消息
-      const merged = this._coalesceTasks(thisQueue.splice(0));
+      const nextTask = thisQueue.shift();
       if (thisQueue.length === 0) this.threadQueues.delete(exitedThreadTs);
-      await this._spawnWorker(merged);
+      await this._spawnWorker(nextTask);
       return;
     }
 
     for (const [threadTs, queue] of this.threadQueues) {
       if (this.activeWorkers.size >= this.maxWorkers) break;
       if (!this.activeWorkers.has(threadTs) && queue.length > 0) {
-        const merged = this._coalesceTasks(queue.splice(0));
+        const nextTask = queue.shift();
         if (queue.length === 0) this.threadQueues.delete(threadTs);
-        await this._spawnWorker(merged);
+        await this._spawnWorker(nextTask);
       }
     }
-  }
-
-  /**
-   * 合并同线程多条排队消息为单个 task。
-   *
-   * 策略：
-   * - userText: 按时序拼接，用 "---" 分隔，附序号标记
-   * - fileContent: 全部拼接（去重）
-   * - imagePaths: 合并去重
-   * - threadHistory: 取最新的（最后一条 task 的 history 最完整）
-   * - 其余字段 (threadTs, channel, userId, platform): 取第一条
-   */
-  _coalesceTasks(tasks) {
-    if (tasks.length === 1) return tasks[0];
-
-    info(TAG, `coalescing ${tasks.length} messages for thread=${tasks[0].threadTs}`);
-
-    const base = { ...tasks[0] };
-
-    // 合并 userText
-    const texts = tasks.map((t, i) => `[消息 ${i + 1}/${tasks.length}]\n${t.userText}`);
-    base.userText = texts.join('\n\n---\n\n').trim();
-
-    // 合并 fileContent
-    const fileContents = tasks.map(t => t.fileContent).filter(Boolean);
-    base.fileContent = fileContents.length > 0
-      ? [...new Set(fileContents)].join('\n\n---\n\n')
-      : null;
-
-    // 合并 imagePaths
-    const allImages = tasks.flatMap(t => t.imagePaths || []);
-    base.imagePaths = [...new Set(allImages)];
-
-    // threadHistory: 取最后一条（最新最完整）
-    for (let i = tasks.length - 1; i >= 0; i--) {
-      if (tasks[i].threadHistory) {
-        base.threadHistory = tasks[i].threadHistory;
-        break;
-      }
-    }
-
-    return base;
   }
 
   async _spawnWorker(task) {
@@ -281,17 +234,10 @@ export class Scheduler {
           if (typingInterval) clearInterval(typingInterval);
           this.activeWorkers.delete(threadTs);
 
-          // 同线程排队消息优先（含 debounce），再处理全局队列
-          const hadThreadQueue = this.threadQueues.has(threadTs) && this.threadQueues.get(threadTs).length > 0;
-          await this.processNextQueued(threadTs);
-
-          // 全局队列排水（仅在有空闲 slot 时）
-          if (!hadThreadQueue || this.activeWorkers.size < this.maxWorkers) {
-            const next = taskQueue.dequeue();
-            if (next) {
-              info(TAG, `draining queue: thread=${next.threadTs} waited=${Date.now() - next.enqueuedAt}ms`);
-              await this.submit(next);
-            }
+          const next = taskQueue.dequeue();
+          if (next) {
+            info(TAG, `draining queue: thread=${next.threadTs} waited=${Date.now() - next.enqueuedAt}ms`);
+            await this.submit(next);
           }
 
           info(TAG, `worker exited: pid=${worker.pid} code=${code} signal=${signal} responded=${responded} thread=${threadTs}`);
@@ -301,6 +247,8 @@ export class Scheduler {
             this._autoContinueCount.delete(threadTs);
             await adapter.cleanupIndicator(channel, threadTs, typingSet, '处理过程中出错，请重试。');
           }
+
+          await this.processNextQueued(threadTs);
         },
       }));
     } catch (err) {
