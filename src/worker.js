@@ -89,7 +89,7 @@ process.on('message', async (msg) => {
       '--print',
       '--output-format', 'json',
       '--max-turns', String(MAX_TURNS),
-      '--model', model || process.env.CLAUDE_MODEL || 'claude-sonnet-4-6',
+      ...(model || process.env.CLAUDE_MODEL ? ['--model', model || process.env.CLAUDE_MODEL] : []),
     ];
 
     if (sessionId) {
@@ -127,7 +127,7 @@ process.on('message', async (msg) => {
     // ── CLI args for interactive stream-json mode ──
     const streamArgs = [
       '--max-turns', String(MAX_TURNS),
-      '--model', model || process.env.CLAUDE_MODEL || 'claude-sonnet-4-6',
+      ...(model || process.env.CLAUDE_MODEL ? ['--model', model || process.env.CLAUDE_MODEL] : []),
       '--input-format', 'stream-json',
       '--output-format', 'stream-json',
       '--verbose',
