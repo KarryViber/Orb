@@ -1,0 +1,18 @@
+{
+  "adapters": {
+    "slack": {
+      "botToken": "${SLACK_BOT_TOKEN}",
+      "appToken": "${SLACK_APP_TOKEN}",
+      "signingSecret": "${SLACK_SIGNING_SECRET}"
+    }
+  },
+  "profiles": {
+    "default": {
+      "userIds": [],
+      "freeResponseChannels": [],
+      "freeResponseUsers": []
+    }
+  },
+  "claudePath": "claude",
+  "maxConcurrentWorkers": 2
+}

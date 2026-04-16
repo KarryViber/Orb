@@ -1,0 +1,620 @@
+import { WebClient } from '@slack/web-api';
+import { SocketModeClient } from '@slack/socket-mode';
+import { createReadStream } from 'node:fs';
+import { join } from 'node:path';
+import { homedir } from 'node:os';
+import { info, error as logError, warn } from '../log.js';
+import { isSafeUrl } from '../format-utils.js';
+import { buildSendPayloads } from './slack-format.js';
+import { PlatformAdapter } from './interface.js';
+import { downloadAndCacheImage, cleanImageCache, IMAGE_EXTENSIONS } from './image-cache.js';
+
+const TAG = 'slack';
+const MAX_USERNAME_CACHE = 500;
+
+// --- Slack thread URL parsing ---
+
+/**
+ * Extract channel ID and thread timestamp from Slack message URLs.
+ * Formats:
+ *   https://{workspace}.slack.com/archives/{channelId}/p{ts_no_dot}
+ *   https://{workspace}.slack.com/archives/{channelId}/p{ts_no_dot}?thread_ts={ts}&cid={channelId}
+ * Returns array of { channel, threadTs } objects.
+ */
+const SLACK_URL_RE = /https?:\/\/[a-z0-9-]+\.slack\.com\/archives\/([A-Z0-9]+)\/p(\d{10})(\d{6})(?:\?([^\s>)]*))?/g;
+
+function extractSlackThreadUrls(text) {
+  if (!text) return [];
+  const results = [];
+  let m;
+  while ((m = SLACK_URL_RE.exec(text)) !== null) {
+    const channel = m[1];
+    const messageTs = `${m[2]}.${m[3]}`;
+    const query = m[4] || '';
+
+    // Prefer thread_ts from query (points to thread parent) over p-timestamp (might be a reply)
+    let threadTs = messageTs;
+    const threadMatch = query.replace(/&amp;/g, '&').match(/thread_ts=(\d+\.\d+)/);
+    if (threadMatch) {
+      threadTs = threadMatch[1];
+    }
+
+    results.push({ channel, threadTs, messageTs });
+  }
+  SLACK_URL_RE.lastIndex = 0;
+  return results;
+}
+
+// --- Incoming file processing ---
+const TEXT_EXTENSIONS = new Set([
+  'txt', 'md', 'json', 'csv', 'tsv', 'log', 'py', 'js', 'ts', 'jsx', 'tsx',
+  'html', 'css', 'xml', 'yaml', 'yml', 'toml', 'ini', 'sh', 'bash', 'sql',
+  'rb', 'go', 'rs', 'java', 'kt', 'swift', 'c', 'cpp', 'h', 'hpp', 'cfg',
+]);
+const MAX_FILE_SIZE = 100 * 1024; // 100KB
+
+export class SlackAdapter extends PlatformAdapter {
+  constructor({ botToken, appToken, allowBots, replyBroadcast, freeResponseChannels, freeResponseUsers }) {
+    super();
+    this._botToken = botToken;
+    this._slack = new WebClient(botToken);
+    this._socket = new SocketModeClient({ appToken });
+    this._allowBots = allowBots || 'none';
+    this._replyBroadcast = replyBroadcast || false;
+    this._freeResponseChannels = freeResponseChannels || new Set();
+    this._freeResponseUsers = freeResponseUsers || new Set();
+    this._botUserId = null;
+    this._botId = null;
+
+    this._imageCacheDir = process.env.IMAGE_CACHE_DIR || join(homedir(), '.orb', 'cache', 'images');
+
+    // Dedup
+    this._seenMessages = new Map();
+    this._DEDUP_TTL = 5 * 60 * 1000;
+
+    // Thread tracking (mentioned threads + bot-participated threads)
+    this._trackedThreads = new Map();
+    this._THREAD_TTL = 24 * 60 * 60 * 1000;
+    this._MAX_TRACKED = 5000;
+
+    // Bot's own message timestamps (for auto-participation in reply threads)
+    this._botMessageTs = new Set();
+    this._MAX_BOT_TS = 5000;
+
+    // Thread context cache (60s TTL, avoids hammering Slack API)
+    this._threadCtxCache = new Map();
+    this._THREAD_CTX_TTL = 60 * 1000;
+
+    // Pending approvals
+    this._pendingApprovals = new Map();
+
+    // Callbacks (set in start())
+    this.onMessage = null;
+    this.onInteractive = null;
+  }
+
+  get botUserId() {
+    return this._botUserId;
+  }
+
+  get platform() {
+    return 'slack';
+  }
+
+  // --- Dedup ---
+
+  _isDuplicate(eventTs) {
+    const now = Date.now();
+    if (this._seenMessages.size > 2000) {
+      for (const [ts, t] of this._seenMessages) {
+        if (now - t > this._DEDUP_TTL) this._seenMessages.delete(ts);
+      }
+    }
+    if (this._seenMessages.has(eventTs)) return true;
+    this._seenMessages.set(eventTs, now);
+    return false;
+  }
+
+  // --- Thread tracking ---
+
+  _trackThread(threadTs) {
+    this._trackedThreads.set(threadTs, Date.now());
+  }
+
+  _isTrackedThread(threadTs) {
+    return this._trackedThreads.has(threadTs);
+  }
+
+  _cleanupTrackedThreads() {
+    const cutoff = Date.now() - this._THREAD_TTL;
+    for (const [ts, t] of this._trackedThreads) {
+      if (t < cutoff) this._trackedThreads.delete(ts);
+    }
+    // LRU eviction if over limit
+    if (this._trackedThreads.size > this._MAX_TRACKED) {
+      const sorted = [...this._trackedThreads.entries()].sort((a, b) => a[1] - b[1]);
+      const toRemove = sorted.slice(0, Math.floor(sorted.length / 2));
+      for (const [ts] of toRemove) this._trackedThreads.delete(ts);
+    }
+    // Evict bot message timestamps
+    if (this._botMessageTs.size > this._MAX_BOT_TS) {
+      const arr = [...this._botMessageTs];
+      arr.splice(0, Math.floor(arr.length / 2));
+      this._botMessageTs = new Set(arr);
+    }
+    // Evict expired thread context cache
+    const now = Date.now();
+    for (const [key, entry] of this._threadCtxCache) {
+      if (now - entry.fetchedAt > this._THREAD_CTX_TTL) this._threadCtxCache.delete(key);
+    }
+  }
+
+  // --- Bot message tracking (for auto-participation) ---
+
+  _trackBotMessage(ts) {
+    this._botMessageTs.add(ts);
+  }
+
+  _isBotThread(threadTs) {
+    return this._botMessageTs.has(threadTs);
+  }
+
+  // --- Thread history ---
+
+  _userNameCache = new Map();
+
+  async _resolveUserName(userId) {
+    if (!userId) return 'User';
+    if (this._userNameCache.has(userId)) return this._userNameCache.get(userId);
+
+    try {
+      const result = await this._slack.users.info({ user: userId });
+      const profile = result.user?.profile;
+      const name = profile?.display_name || profile?.real_name || userId;
+      if (this._userNameCache.size >= MAX_USERNAME_CACHE) {
+        // FIFO eviction — Map preserves insertion order
+        const firstKey = this._userNameCache.keys().next().value;
+        this._userNameCache.delete(firstKey);
+      }
+      this._userNameCache.set(userId, name);
+      return name;
+    } catch (_) {
+      return userId;
+    }
+  }
+
+  async fetchThreadHistory(threadTs, channel, { bypassCache = false } = {}) {
+    const MAX_HISTORY_MESSAGES = 30;
+    const MAX_HISTORY_CHARS = 8000;
+
+    if (!channel) return null;
+
+    // Check cache (60s TTL)
+    const cacheKey = `${channel}:${threadTs}`;
+    if (!bypassCache) {
+      const cached = this._threadCtxCache.get(cacheKey);
+      if (cached && (Date.now() - cached.fetchedAt < this._THREAD_CTX_TTL)) {
+        return cached.content;
+      }
+    }
+
+    // Fetch with retry on rate-limit (429)
+    let result;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        result = await this._slack.conversations.replies({
+          channel,
+          ts: threadTs,
+          limit: MAX_HISTORY_MESSAGES + 5,
+          inclusive: true,
+        });
+        break;
+      } catch (err) {
+        if (err.data?.error === 'ratelimited' && attempt < 2) {
+          const delay = (attempt + 1) * 1000;
+          warn(TAG, `rate-limited fetching thread ${cacheKey}, retry in ${delay}ms`);
+          await new Promise((r) => setTimeout(r, delay));
+          continue;
+        }
+        throw err;
+      }
+    }
+
+    if (!result?.messages || result.messages.length <= 1) {
+      this._threadCtxCache.set(cacheKey, { content: null, fetchedAt: Date.now() });
+      return null;
+    }
+
+    const messages = result.messages.slice(0, -1);
+
+    const lines = [];
+    let totalChars = 0;
+
+    for (const msg of messages) {
+      if (msg.bot_id && /^:[a-z_]+:/.test(msg.text || '')) continue;
+
+      let role;
+      if (msg.bot_id) {
+        role = 'Orb';
+      } else {
+        role = await this._resolveUserName(msg.user);
+      }
+
+      const text = (msg.text || '').slice(0, 2000);
+      const line = `${role}: ${text}`;
+
+      if (totalChars + line.length > MAX_HISTORY_CHARS) break;
+      lines.push(line);
+      totalChars += line.length;
+    }
+
+    const content = lines.length > 0 ? lines.join('\n') : null;
+    this._threadCtxCache.set(cacheKey, { content, fetchedAt: Date.now() });
+    return content;
+  }
+
+  // --- Incoming file processing ---
+
+  async _processIncomingFiles(files) {
+    if (!files || files.length === 0) return { text: '', imagePaths: [] };
+
+    const parts = [];
+    const imagePaths = [];
+    for (const file of files) {
+      const ext = (file.name || '').split('.').pop()?.toLowerCase() || '';
+      const isText = TEXT_EXTENSIONS.has(ext) || file.mimetype?.startsWith('text/');
+
+      if (!isText) {
+        const mimeIsImage = file.mimetype?.startsWith('image/');
+        const extIsImage = IMAGE_EXTENSIONS.has(ext);
+        if (mimeIsImage || extIsImage) {
+          if (!isSafeUrl(file.url_private)) {
+            parts.push(`[附件: ${file.name} — URL 安全检查失败]`);
+            continue;
+          }
+          try {
+            const imgPath = await downloadAndCacheImage(
+              file.url_private, this._botToken, this._imageCacheDir
+            );
+            imagePaths.push(imgPath);
+            parts.push(`[图片: ${file.name} — 已传递给模型]`);
+            info(TAG, `cached image: ${file.name} → ${imgPath}`);
+          } catch (err) {
+            parts.push(`[附件: ${file.name} — 图片处理失败: ${err.message}]`);
+          }
+        } else {
+          parts.push(`[附件: ${file.name} (${file.mimetype}, ${file.size} bytes)]`);
+        }
+        continue;
+      }
+      if (file.size > MAX_FILE_SIZE) {
+        parts.push(`[附件: ${file.name} — 超出大小限制 (${file.size} bytes, 上限 100KB)]`);
+        continue;
+      }
+      if (!isSafeUrl(file.url_private)) {
+        parts.push(`[附件: ${file.name} — URL 安全检查失败]`);
+        continue;
+      }
+      try {
+        const resp = await fetch(file.url_private, {
+          headers: { Authorization: `Bearer ${this._botToken}` },
+          redirect: 'manual',
+        });
+        if (resp.status >= 300 && resp.status < 400) {
+          const loc = resp.headers.get('location');
+          if (!loc || !isSafeUrl(loc)) {
+            parts.push(`[附件: ${file.name} — 重定向目标不安全]`);
+            continue;
+          }
+          const resp2 = await fetch(loc);
+          if (!resp2.ok) throw new Error(`HTTP ${resp2.status}`);
+          const text = await resp2.text();
+          parts.push(`--- 文件: ${file.name} ---\n${text}\n--- EOF ---`);
+          info(TAG, `ingested file: ${file.name} (${text.length} chars)`);
+          continue;
+        }
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const text = await resp.text();
+        parts.push(`--- 文件: ${file.name} ---\n${text}\n--- EOF ---`);
+        info(TAG, `ingested file: ${file.name} (${text.length} chars)`);
+      } catch (err) {
+        parts.push(`[附件: ${file.name} — 下载失败: ${err.message}]`);
+      }
+    }
+    return { text: parts.join('\n\n'), imagePaths };
+  }
+
+  // --- Approval buttons ---
+
+  _buildApprovalBlocks(prompt, approvalId) {
+    return [
+      { type: 'section', text: { type: 'mrkdwn', text: prompt } },
+      { type: 'actions', elements: [
+        { type: 'button', text: { type: 'plain_text', text: 'Allow Once', emoji: true },
+          style: 'primary', action_id: 'orb_approve_once', value: approvalId },
+        { type: 'button', text: { type: 'plain_text', text: 'Allow Session', emoji: true },
+          action_id: 'orb_approve_session', value: approvalId },
+        { type: 'button', text: { type: 'plain_text', text: 'Always Allow', emoji: true },
+          action_id: 'orb_approve_always', value: approvalId },
+        { type: 'button', text: { type: 'plain_text', text: 'Deny', emoji: true },
+          style: 'danger', action_id: 'orb_deny', value: approvalId },
+      ]},
+    ];
+  }
+
+  async sendApproval(channel, threadTs, prompt) {
+    const approvalId = `${threadTs}_${Date.now()}`;
+    const blocks = this._buildApprovalBlocks(prompt, approvalId);
+
+    const msg = await this._slack.chat.postMessage({
+      channel,
+      thread_ts: threadTs,
+      blocks,
+      text: `承認リクエスト: ${prompt.slice(0, 100)}`,
+    });
+
+    return new Promise((resolve) => {
+      const timeoutHandle = setTimeout(() => {
+        if (this._pendingApprovals.has(approvalId)) {
+          this._pendingApprovals.delete(approvalId);
+          resolve({ approved: false, reason: 'timeout' });
+        }
+      }, 10 * 60 * 1000);
+
+      this._pendingApprovals.set(approvalId, {
+        resolve,
+        channel,
+        threadTs,
+        messageTs: msg.ts,
+        timeoutHandle,
+      });
+    });
+  }
+
+  async _handleInteractive({ body, ack }) {
+    try { await ack(); } catch (_) {}
+
+    if (body.type !== 'block_actions' || !body.actions?.length) return;
+
+    const action = body.actions[0];
+    const approvalId = action.value;
+    const actionId = action.id || action.action_id;
+    const userId = body.user?.id;
+
+    if (!approvalId || !this._pendingApprovals.has(approvalId)) return;
+
+    const pending = this._pendingApprovals.get(approvalId);
+    this._pendingApprovals.delete(approvalId);
+    clearTimeout(pending.timeoutHandle); // #22: cancel timeout if user acted early
+
+    const approvalMap = {
+      orb_approve_once: { approved: true, scope: 'once', label: '✅ Allowed Once' },
+      orb_approve_session: { approved: true, scope: 'session', label: '✅ Allowed (Session)' },
+      orb_approve_always: { approved: true, scope: 'always', label: '✅ Always Allowed' },
+      orb_deny: { approved: false, scope: 'once', label: '❌ Denied' },
+    };
+    const decision = approvalMap[actionId] || { approved: false, scope: 'once', label: '❌ Denied' };
+    const { approved, scope, label } = decision;
+
+    try {
+      const originalBlocks = body.message?.blocks || [];
+      const updatedBlocks = originalBlocks
+        .filter((b) => b.type !== 'actions')
+        .concat([{ type: 'context', elements: [
+          { type: 'mrkdwn', text: `${label} by <@${userId}>` },
+        ]}]);
+
+      await this._slack.chat.update({
+        channel: pending.channel,
+        ts: pending.messageTs,
+        blocks: updatedBlocks,
+        text: label,
+      });
+    } catch (err) {
+      logError(TAG, `failed to update approval message: ${err.message}`);
+    }
+
+    pending.resolve({ approved, scope, userId });
+  }
+
+  // --- Reply / Edit helpers ---
+
+  async _postReply(channel, threadTs, text, extra = {}) {
+    const params = { channel, thread_ts: threadTs, text, ...extra };
+    if (this._replyBroadcast) params.reply_broadcast = true;
+    const result = await this._slack.chat.postMessage(params);
+    // Track bot's own messages for auto-participation
+    if (result.ts) this._trackBotMessage(threadTs);
+    return result;
+  }
+
+  async _editMessage(channel, ts, text, extra = {}) {
+    const params = { channel, ts, text, ...extra };
+    return this._slack.chat.update(params);
+  }
+
+  // --- PlatformAdapter interface ---
+
+  async sendReply(channel, threadTs, text, extra = {}) {
+    return this._postReply(channel, threadTs, text, extra);
+  }
+
+  async editMessage(channel, ts, text, extra = {}) {
+    return this._editMessage(channel, ts, text, extra);
+  }
+
+  async uploadFile(channel, threadTs, filePath, filename) {
+    try {
+      await this._slack.filesUploadV2({
+        channel_id: channel,
+        thread_ts: threadTs,
+        file: createReadStream(filePath),
+        filename: filename || filePath.split('/').pop(),
+      });
+      info(TAG, `uploaded file: ${filename || filePath}`);
+    } catch (err) {
+      logError(TAG, `file upload failed: ${err.message}`);
+      await this._postReply(channel, threadTs, `:warning: 文件上传失败: ${filename || filePath}`);
+    }
+  }
+
+  async setTyping(channel, threadTs, status) {
+    try {
+      await this._slack.apiCall('assistant.threads.setStatus', {
+        channel_id: channel,
+        thread_ts: threadTs,
+        status,
+      });
+    } catch (_) {}
+  }
+
+  buildPayloads(text) {
+    return buildSendPayloads(text);
+  }
+
+  async cleanupIndicator(channel, threadTs, typingSet, errorMsg) {
+    if (typingSet) {
+      try {
+        await this._slack.apiCall('assistant.threads.setStatus', {
+          channel_id: channel, thread_ts: threadTs, status: '',
+        });
+      } catch (_) {}
+    }
+    try {
+      await this._postReply(channel, threadTs, `:warning: ${errorMsg}`);
+    } catch (err) {
+      logError(TAG, `failed to send error msg: ${err.message}`);
+    }
+  }
+
+  async disconnect() {
+    this._socket.disconnect();
+  }
+
+  // --- Message handler ---
+
+  async _handleMessage({ event, ack }) {
+    try { await ack(); } catch (err) {
+      logError(TAG, `ack failed: ${err.message}`);
+      return;
+    }
+
+    // Bot message filtering
+    if (event.bot_id) {
+      if (event.bot_id === this._botId) return;
+      if (this._allowBots === 'none') return;
+      if (this._allowBots === 'mentions' && !event.text?.includes(`<@${this._botUserId}>`)) return;
+    }
+    if (event.subtype && event.subtype !== 'file_share') return;
+
+    const eventTs = event.event_ts || event.ts;
+    if (this._isDuplicate(eventTs)) {
+      info(TAG, `dedup: skipping already-seen event ${eventTs}`);
+      return;
+    }
+
+    // Detect DM: both 1:1 (im) and group DM (mpim)
+    const channelType = event.channel_type || (event.channel?.startsWith('D') ? 'im' : '');
+    const isDM = channelType === 'im' || channelType === 'mpim';
+    const isMention = event.text?.includes(`<@${this._botUserId}>`);
+    const threadTs = event.thread_ts || event.ts;
+    const tracked = this._isTrackedThread(threadTs);
+    const isBotThread = event.thread_ts && this._isBotThread(event.thread_ts);
+
+    const isFreeResponse = this._freeResponseChannels.has(event.channel) && this._freeResponseUsers.has(event.user);
+    if (!isDM && !isMention && !tracked && !isBotThread && !isFreeResponse) return;
+    if (isMention || isDM || isFreeResponse) this._trackThread(threadTs);
+
+    const userText = (event.text || '')
+      .replace(new RegExp(`<@${this._botUserId}>`, 'g'), '')
+      .trim();
+
+    if (!userText && (!event.files || event.files.length === 0)) return;
+
+    const channel = event.channel;
+    const userId = event.user;
+
+    // Process incoming file attachments
+    let fileContent = '';
+    let imagePaths = [];
+    if (event.files && event.files.length > 0) {
+      const result = await this._processIncomingFiles(event.files);
+      fileContent = result.text;
+      imagePaths = result.imagePaths;
+      info(TAG, `processed ${event.files.length} incoming file(s), ${imagePaths.length} image(s)`);
+    }
+
+    // Resolve Slack thread URLs → fetch referenced conversation context
+    let linkedContext = '';
+    const linkedUrls = extractSlackThreadUrls(userText);
+    if (linkedUrls.length > 0) {
+      const seen = new Set();
+      for (const { channel: linkCh, threadTs: linkTs } of linkedUrls) {
+        const key = `${linkCh}:${linkTs}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        try {
+          const history = await this.fetchThreadHistory(linkTs, linkCh);
+          if (history) {
+            linkedContext += `\n--- 引用对话 (${linkCh}/${linkTs}) ---\n${history}\n--- END ---\n`;
+            info(TAG, `fetched linked thread: ${linkCh}/${linkTs}`);
+          }
+        } catch (err) {
+          logError(TAG, `failed to fetch linked thread ${linkCh}/${linkTs}: ${err.message}`);
+        }
+      }
+    }
+
+    info(TAG, `msg: ch=${channel} thread=${threadTs} user=${userId} text="${(userText || '[files only]').slice(0, 80)}"`);
+
+    const task = { userText, fileContent: fileContent + linkedContext, imagePaths, threadTs, channel, userId, platform: 'slack', threadHistory: null };
+
+    // Fetch thread history (only for thread replies, not new conversations)
+    if (event.thread_ts) {
+      try {
+        task.threadHistory = await this.fetchThreadHistory(threadTs, channel);
+      } catch (err) {
+        logError(TAG, `failed to fetch thread history: ${err.message}`);
+      }
+    }
+
+    if (this.onMessage) {
+      this.onMessage(task);
+    }
+  }
+
+  // --- Start ---
+
+  async start(onMessage, onInteractive) {
+    this.onMessage = onMessage;
+    this.onInteractive = onInteractive;
+
+    const auth = await this._slack.auth.test();
+    this._botUserId = auth.user_id;
+    this._botId = auth.bot_id;
+    info(TAG, `booted as @${auth.user} (${this._botUserId}, bot=${this._botId})`);
+
+    this._socket.on('message', (evt) => this._handleMessage(evt));
+    this._socket.on('interactive', (evt) => this._handleInteractive(evt));
+
+    this._socket.on('disconnect', (err) => {
+      warn(TAG, `socket disconnected: ${err || 'unknown'}`);
+    });
+    this._socket.on('error', (err) => {
+      logError(TAG, `socket error: ${err?.message || err}`);
+    });
+    this._socket.on('reconnecting', () => {
+      info(TAG, 'socket reconnecting...');
+    });
+
+    await this._socket.start();
+    info(TAG, `socket connected, reply_broadcast=${this._replyBroadcast}`);
+
+    // Periodic cleanup every 30 min
+    setInterval(() => {
+      this._cleanupTrackedThreads();
+      cleanImageCache(this._imageCacheDir).catch(() => {});
+      info(TAG, `cleanup: trackedThreads=${this._trackedThreads.size} seenMessages=${this._seenMessages.size}`);
+    }, 30 * 60 * 1000);
+  }
+}

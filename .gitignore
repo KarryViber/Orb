@@ -1,0 +1,37 @@
+# Environment
+.env
+
+# Actual config & start script (users create from examples)
+config.json
+start.sh
+
+# Dependencies
+node_modules/
+
+# Personal profiles (only example/ is tracked)
+profiles/karry/
+profiles/eting/
+
+# Data (per-profile runtime data)
+profiles/*/data/
+
+# Workspace contents (user-generated)
+profiles/*/workspace/*
+!profiles/*/workspace/CLAUDE.md
+
+# Python
+__pycache__/
+*.pyc
+profiles/*/venvs/
+
+# System
+.DS_Store
+*.log
+logs/
+*.db
+*.db-wal
+*.db-shm
+*.bak
+
+# IDE
+.claude/

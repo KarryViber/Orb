@@ -1,0 +1,23 @@
+{
+  "name": "orb",
+  "version": "0.1.0",
+  "description": "Multi-profile AI agent framework — receive messages via Slack, fork Claude Code CLI to execute tasks",
+  "type": "module",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "node src/main.js",
+    "dev": "node --watch src/main.js"
+  },
+  "keywords": ["ai-agent", "claude", "slack-bot", "multi-profile", "claude-code"],
+  "author": "Kailiang Zhang",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@slack/socket-mode": "^2.0.0",
+    "@slack/web-api": "^7.0.0",
+    "dotenv": "^16.4.0",
+    "proper-lockfile": "^4.1.2"
+  }
+}
