@@ -221,7 +221,7 @@ function runClaude(args, stdinData, workspace) {
   });
 }
 
-const IDLE_TIMEOUT = 30_000; // 30s idle → close stdin → CLI exits
+const IDLE_TIMEOUT = 5_000; // 5s idle → close stdin → CLI exits
 
 function runClaudeInteractive(args, initialContent, workspace) {
   const child = spawn(CLAUDE_PATH, args, {

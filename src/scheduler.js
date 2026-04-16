@@ -113,7 +113,7 @@ export class Scheduler {
     // Typing refresh interval — kept alive until first response or exit
     const typingInterval = typingSet ? setInterval(async () => {
       try { await adapter.setTyping(channel, threadTs, 'is thinking…'); } catch (_) {}
-    }, 30_000) : null;
+    }, 10_000) : null;
 
     let responded = false;
     let turnDelivered = false;
