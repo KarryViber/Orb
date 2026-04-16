@@ -1,77 +1,77 @@
 # Orb — Multi-profile AI Agent Framework
 
-通过 Slack（未来支持 Discord/WeChat）接收消息，fork Claude Code CLI 执行任务。
+Receive messages via Slack (Discord/WeChat planned), fork Claude Code CLI to execute tasks.
 
 ## Architecture
 
 ```
 src/
-  main.js              — 入口，adapter 初始化，信号处理
-  scheduler.js         — worker 生命周期，任务队列，调度
-  config.js            — config.json 加载，profile 路由
-  worker.js            — fork 子进程，调用 Claude CLI
-  cron.js              — Cron 定時任務（60s tick、job 持久化、schedule 解析）
-  context.js           — prompt 分層組装（soul → user → directives → memory → thread → message）
-  session.js           — thread↔session 持久化（per-profile 隔離）
-  memory.js            — Holographic 記憶検索 + 対話存儲（Python bridge 経由）
-  format-utils.js      — 平台无关文本工具（sanitize、split）
-  log.js               — console + file 双写，50MB 自動轮转
-  queue.js             — 全局任务 FIFO 队列
+  main.js              — Entry point, adapter init, signal handling
+  scheduler.js         — Worker lifecycle, task queue, scheduling
+  config.js            — config.json loading, profile routing
+  worker.js            — Fork child process, invoke Claude CLI
+  cron.js              — Cron scheduled tasks (60s tick, job persistence, schedule parsing)
+  context.js           — Layered prompt assembly (soul → user → directives → memory → thread → message)
+  session.js           — thread↔session persistence (per-profile isolation)
+  memory.js            — Holographic memory retrieval + conversation storage (via Python bridge)
+  format-utils.js      — Platform-agnostic text utilities (sanitize, split)
+  log.js               — Console + file dual-write, 50MB auto-rotation
+  queue.js             — Global task FIFO queue
   adapters/
-    interface.js       — PlatformAdapter 抽象基类
-    slack.js           — Slack Socket Mode 实現
-    slack-format.js    — Markdown→mrkdwn，Block Kit 构建
+    interface.js       — PlatformAdapter abstract base class
+    slack.js           — Slack Socket Mode implementation
+    slack-format.js    — Markdown→mrkdwn, Block Kit builder
 ```
 
 ## Key Paths
 
-- `profiles/{name}/soul/`      — 人格/协作边界/用户档案（per-profile，运行时只读）
-- `profiles/{name}/skills/`    — Skill 文件（CC 原生 agent 格式，context.js 扫描注入索引）
-- `profiles/{name}/scripts/`   — 用户工具脚本（x-twitter, plaud, finance, lark 等）
-- `profiles/{name}/workspace/` — Claude CLI 工作目录
-- `profiles/{name}/data/`      — sessions.json + memory.db + doc-index.db + cron-jobs.json + MEMORY.md（gitignored）
-- `lib/holographic/`           — Holographic 記憶エンジン（Python、Hermes 由来）
-- `lib/docstore/`              — DocStore 文件索引（FTS5、Python、Hermes 由来）
-- `config.json`                — profile 路由 + adapter 配置
+- `profiles/{name}/soul/`      — Persona / collaboration boundaries / user profile (per-profile, read-only at runtime)
+- `profiles/{name}/skills/`    — Skill files (Claude Code native agent format, scanned and indexed by context.js)
+- `profiles/{name}/scripts/`   — User utility scripts
+- `profiles/{name}/workspace/` — Claude CLI working directory
+- `profiles/{name}/data/`      — sessions.json + memory.db + doc-index.db + cron-jobs.json + MEMORY.md (gitignored)
+- `lib/holographic/`           — Holographic memory engine (Python)
+- `lib/docstore/`              — DocStore file index (FTS5, Python)
+- `config.json`                — Profile routing + adapter configuration
 
 ## Prompt Architecture
 
-Worker 调用 Claude CLI 时分两路注入：
-- `--system-prompt`: Soul + User + MEMORY.md + Skills + Framework Directives（稳定内容，利于 prompt cache）
-- `-p` (stdin): Holographic Recall + Docs + Thread History + Message（動態内容）
+Worker invokes Claude CLI with two injection paths:
+- `--system-prompt`: Soul + User + MEMORY.md + Skills + Framework Directives (stable content, prompt-cache friendly)
+- `-p` (stdin): Holographic Recall + Docs + Thread History + Message (dynamic content)
 
-Soul 文件: SOUL.md（人格 + 协作边界）+ USER.md（用户档案）。workspace/CLAUDE.md 由 CLI 从 cwd 自动读取（运行时约束 + 执行纪律）。USER.md 由 scheduler 自动从 holographic preference facts 同步更新。MEMORY.md 在 data/ 下，agent 主动写入 + scheduler 定期从高 trust facts 合并。Framework directives（记忆策略等）硬编码在 context.js 中，条件注入。
+Soul files: SOUL.md (persona + collaboration boundaries) + USER.md (user profile). workspace/CLAUDE.md is auto-read by CLI from cwd (runtime constraints + execution discipline). USER.md is auto-synced by scheduler from holographic preference facts. MEMORY.md lives in data/, written by the agent + periodically merged from high-trust facts by scheduler. Framework directives (memory strategy, etc.) are hardcoded in context.js and conditionally injected.
 
 ## Config
 
-`config.json` 支持 `${ENV_VAR}` 插值。SIGHUP 信号触发热加载。
+`config.json` supports `${ENV_VAR}` interpolation. SIGHUP triggers hot-reload.
 
 ## Dev
 
 ```bash
-npm run dev          # --watch 模式
-npm start            # 生産启动（launchd 管理）
+npm run dev          # --watch mode
+npm start            # Production start (managed by launchd)
 ```
 
 ## Conventions
 
-- ESM (type: module), Node >= 18, 纯 JS
-- worker 是一次性 fork，执行完 exit
-- 不要修改运行中 Orb 的核心文件（main/scheduler/worker/adapters）— 通过 spec 文件让外部 session 执行
+- ESM (type: module), Node >= 18, pure JS
+- Workers are one-shot forks — execute and exit, never reused
+- Do not modify core files of a running Orb instance (main/scheduler/worker/adapters) — use spec files for external sessions to execute
 
 ## Cron
 
-Jobs 存储在 `profiles/{name}/data/cron-jobs.json`。CronScheduler 每 60s tick 一次，检查 due jobs 并 fork worker 执行。
+Jobs stored in `profiles/{name}/data/cron-jobs.json`. CronScheduler ticks every 60s, checks due jobs and forks workers to execute.
 
-Job 格式：
+Job format:
 ```json
 {
   "id": "abc123",
   "name": "Daily Report",
-  "prompt": "生成日报...",
+  "prompt": "Generate daily report...",
   "schedule": { "kind": "cron", "expr": "0 9 * * *", "display": "0 9 * * *" },
   "deliver": { "platform": "slack", "channel": "C01234", "threadTs": null },
-  "profileName": "{your-profile}",
+  "profileName": "default",
   "enabled": true,
   "repeat": { "times": null, "completed": 0 },
   "nextRunAt": "2026-04-15T09:00:00+09:00",
@@ -79,45 +79,45 @@ Job 格式：
 }
 ```
 
-Schedule 类型：`"0 9 * * *"` (cron)、`"every 30m"` (interval)、`"2h"` / ISO (one-shot)。
-Agent 通过直接读写 cron-jobs.json 管理任务（Claude CLI 原生文件操作）。
+Schedule types: `"0 9 * * *"` (cron), `"every 30m"` (interval), `"2h"` / ISO (one-shot).
+Agents manage tasks by directly reading/writing cron-jobs.json (Claude CLI native file operations).
 
 ---
 
-## Architecture Constraints（架构硬约束）
+## Architecture Constraints
 
-以下规则是架构演进中确立的不变量，任何修改源码的 session 必须遵守。
+The following rules are invariants established during architecture evolution. Any session modifying source code must comply.
 
-### 文件职责分层
+### File Responsibility Layers
 
-| 文件 | 读取者 | 职责 | 维护频率 |
-|------|--------|------|---------|
-| `~/Orb/CLAUDE.md`（本文件） | 外部 Claude Code session（改源码时） | 开发者指南 + 架构约束 | 架构变更时 |
-| `profiles/{name}/workspace/CLAUDE.md` | Orb worker（Claude CLI 的 cwd） | Agent 运行时约束 + 执行纪律 | 基本不动 |
-| `profiles/{name}/soul/SOUL.md` | Orb worker（context.js 读取） | 人格 + 协作边界 | 日常维护 |
-| `profiles/{name}/soul/USER.md` | Orb worker（context.js 读取） | 用户档案 | 自动同步 |
+| File | Reader | Responsibility | Maintenance frequency |
+|------|--------|----------------|----------------------|
+| `~/Orb/CLAUDE.md` (this file) | External Claude Code sessions (when modifying source) | Developer guide + architecture constraints | On architecture changes |
+| `profiles/{name}/workspace/CLAUDE.md` | Orb worker (Claude CLI's cwd) | Agent runtime constraints + execution discipline | Rarely changes |
+| `profiles/{name}/soul/SOUL.md` | Orb worker (read by context.js) | Persona + collaboration boundaries | Regular maintenance |
+| `profiles/{name}/soul/USER.md` | Orb worker (read by context.js) | User profile | Auto-synced |
 
-两层职责分离 + 框架内置 directives：soul = 身份 + 决策原则，workspace CLAUDE.md = 操作约束，framework directives = context.js 硬编码的运维机制（条件注入）。
+Two-layer separation + framework built-in directives: soul = identity + decision principles, workspace CLAUDE.md = operational constraints, framework directives = hardcoded operational mechanisms in context.js (conditionally injected).
 
-### Profile 隔离
+### Profile Isolation
 
-- 每个 profile 拥有独立的 `soul/`、`skills/`、`scripts/`、`workspace/`、`data/` 目录
-- `config.json` 中 `userIds` 映射决定用户归属哪个 profile
-- `default` profile 是兜底，未映射用户走这里
-- session 数据按 `{platform}:{threadTs}` 键隔离，存储在各自 `data/sessions.json`
-- 新增用户 = 新建 profile 目录 + config.json 加映射，不改源码
+- Each profile owns independent `soul/`, `skills/`, `scripts/`, `workspace/`, `data/` directories
+- `userIds` mapping in `config.json` determines which profile a user belongs to
+- `default` profile is the fallback for unmapped users
+- Session data is isolated by `{platform}:{threadTs}` key, stored in each profile's `data/sessions.json`
+- Adding a user = create profile directory + add mapping in config.json, no source code changes
 
-### 平台抽象
+### Platform Abstraction
 
-- `adapters/interface.js` 定义 `PlatformAdapter` 抽象基类
-- 每个平台一个 adapter（slack.js），实现 `start/disconnect/sendReply/editMessage/uploadFile/setTyping/sendApproval/buildPayloads/fetchThreadHistory`
-- 平台专用格式化放 `adapters/{platform}-format.js`，通用工具放 `format-utils.js`
-- `scheduler.js` 只通过 adapter 接口操作平台，不直接 import 平台 SDK
-- 新增平台 = 新建 adapter + format 文件 + config.json 加配置，不改 scheduler/worker/context
+- `adapters/interface.js` defines the `PlatformAdapter` abstract base class
+- One adapter per platform (slack.js), implementing `start/disconnect/sendReply/editMessage/uploadFile/setTyping/sendApproval/buildPayloads/fetchThreadHistory`
+- Platform-specific formatting in `adapters/{platform}-format.js`, shared utilities in `format-utils.js`
+- `scheduler.js` operates platforms only through the adapter interface, never importing platform SDKs directly
+- Adding a platform = new adapter + format file + config.json entry, no changes to scheduler/worker/context
 
-### Worker IPC 协议
+### Worker IPC Protocol
 
-Scheduler ↔ Worker 通信通过 Node IPC（process.send/on('message')）：
+Scheduler ↔ Worker communication via Node IPC (process.send/on('message')):
 
 ```
 Scheduler → Worker:
@@ -132,11 +132,11 @@ Worker → Scheduler:
   { type: 'approval', prompt }
 ```
 
-新增消息类型需同步更新 worker.js 顶部注释和 scheduler.js handler。
+Adding new message types requires updating both the worker.js header comment and the scheduler.js handler.
 
-### 不可变约束
+### Immutable Constraints
 
-- **Claude Code CLI 是唯一的 agent runtime**，不接入其他 LLM SDK
-- **worker 是一次性进程**，执行完 exit，不复用
-- **Orb 运行时不能修改自己的源码**，通过 spec 文件让外部 session 执行
-- **config.json 是唯一的路由配置源**，不在代码中硬编码 userId/profile 映射
+- **Claude Code CLI is the only agent runtime** — no other LLM SDKs
+- **Workers are one-shot processes** — execute and exit, never reused
+- **Orb runtime must not modify its own source code** — use spec files for external sessions to execute
+- **config.json is the sole routing configuration source** — no hardcoded userId/profile mappings in code
