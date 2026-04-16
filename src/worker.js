@@ -12,6 +12,7 @@ import { storeConversation } from './memory.js';
  * Scheduler -> Worker:
  *   { type: 'task', userText, fileContent, imagePaths, threadTs, channel, userId, platform, threadHistory, profile, model }
  *   { type: 'approval_result', approved, scope, userId }
+ *   { type: 'inject', userText, fileContent?, imagePaths? }
  *
  * Worker -> Scheduler:
  *   { type: 'result', text, toolCount }
@@ -19,16 +20,27 @@ import { storeConversation } from './memory.js';
  *   { type: 'update', text, messageTs }
  *   { type: 'file', filePath, filename }
  *   { type: 'approval', prompt }
+ *   { type: 'turn_complete', text, toolCount, lastTool, stopReason }
  */
 
 const CLAUDE_PATH = process.env.CLAUDE_PATH || 'claude';
 const MAX_TURNS = parseInt(process.env.MAX_TURNS, 10) || 50;
 
 let _approvalResolve = null;
+let _activeCli = null;   // reference to active interactive CLI session
 
 process.on('message', async (msg) => {
   if (msg.type === 'approval_result') {
     if (_approvalResolve) _approvalResolve(msg);
+    return;
+  }
+  if (msg.type === 'inject') {
+    if (_activeCli) {
+      _activeCli.inject(msg.userText, msg.fileContent);
+      console.log(`[worker] injected: "${(msg.userText || '').slice(0, 60)}"`);
+    } else {
+      console.warn('[worker] inject received but no active CLI');
+    }
     return;
   }
   if (msg.type !== 'task') return;
@@ -107,52 +119,59 @@ process.on('message', async (msg) => {
       }
     }
 
-    let result;
-    if (hasImages) {
-      // Use stream-json input to pass images natively
-      // Remove --print and --output-format from base args (incompatible with stream-json)
-      const streamArgs = args.filter(a => a !== '--print' && a !== '--output-format' && a !== 'json');
-      streamArgs.push('--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose');
-      const userContent = [
-        ...imageBlocks,
-        { type: 'text', text: prompt.userPrompt || String(prompt) },
-      ];
-      const streamMsg = JSON.stringify({ type: 'user', message: { role: 'user', content: userContent } });
-      console.log(`[worker] calling claude (stream-json with ${imageBlocks.length} image(s))`);
-      result = await runClaudeStream(streamArgs, streamMsg, WORKSPACE);
-    } else {
-      args.push('-p', '-');
-      const stdinData = prompt.userPrompt || prompt;
-      console.log(`[worker] calling claude: ${CLAUDE_PATH} ${args.join(' ').slice(0, 100)}...`);
-      try {
-        result = await runClaude(args, stdinData, WORKSPACE);
-      } catch (err) {
-        if (sessionId && err.message.includes('No conversation found')) {
-          console.warn(`[worker] session ${sessionId} expired, retrying without --resume`);
-          const freshArgs = args.filter(a => a !== '--resume' && a !== sessionId);
-          result = await runClaude(freshArgs, stdinData, WORKSPACE);
-        } else {
-          throw err;
-        }
+    // ── Build initial content (unified stream-json format) ──
+    const initialContent = [];
+    if (hasImages) initialContent.push(...imageBlocks);
+    initialContent.push({ type: 'text', text: prompt.userPrompt || String(prompt) });
+
+    // ── CLI args for interactive stream-json mode ──
+    const streamArgs = [
+      '--max-turns', String(MAX_TURNS),
+      '--model', model || process.env.CLAUDE_MODEL || 'claude-sonnet-4-6',
+      '--input-format', 'stream-json',
+      '--output-format', 'stream-json',
+      '--verbose',
+    ];
+
+    if (sessionId) {
+      streamArgs.push('--resume', sessionId);
+    } else if (prompt.systemPrompt) {
+      streamArgs.push('--system-prompt', prompt.systemPrompt);
+    }
+
+    console.log(`[worker] starting interactive CLI session`);
+    const cli = runClaudeInteractive(streamArgs, initialContent, WORKSPACE);
+    _activeCli = cli;
+
+    // Each turn completed → send to scheduler for delivery
+    cli.setOnTurnComplete(async (turn) => {
+      if (turn.text?.trim()) {
+        await ipcSend({ type: 'turn_complete', text: turn.text, toolCount: turn.toolCount, lastTool: turn.lastTool, stopReason: turn.stopReason });
       }
+    });
+
+    // Wait for CLI to exit (idle timeout or stdin.end)
+    const exitResult = await cli.exitPromise;
+    _activeCli = null;
+
+    console.log(`[worker] CLI exited: code=${exitResult.code} tools=${exitResult.toolCount}`);
+
+    // Session persistence
+    if (exitResult.sessionId) {
+      await updateSession(dataDir, sessionKey, { sessionId: exitResult.sessionId, userId });
     }
-    if (result.exitError) {
-      console.warn(`[worker] claude exited with error but produced output: ${result.exitError.message}`);
-    }
-    console.log(`[worker] claude returned: stdout=${result.stdout.length} chars, stderr=${result.stderr.length} chars`);
 
-
-    const newSessionId = extractSessionId(result.stdout);
-    if (newSessionId) {
-      await updateSession(dataDir, sessionKey, { sessionId: newSessionId, userId });
-    }
-
-    const { text: responseText, toolCount, lastTool, stopReason } = parseClaudeOutput(result.stdout);
-
-    await ipcSend({ type: 'result', text: responseText, toolCount, lastTool, stopReason });
+    // Send final result (last turn's output)
+    await ipcSend({
+      type: 'result',
+      text: exitResult.lastTurnText || '',
+      toolCount: exitResult.toolCount,
+      lastTool: exitResult.lastTool,
+      stopReason: exitResult.stopReason,
+    });
 
     const memDbPath = join(dataDir, 'memory.db');
-    storeConversation({ userText, responseText, threadTs, userId, dbPath: memDbPath }).catch(() => {});
+    storeConversation({ userText, responseText: exitResult.lastTurnText || '', threadTs, userId, dbPath: memDbPath }).catch(() => {});
 
   } catch (err) {
     await ipcSend({
@@ -163,7 +182,8 @@ process.on('message', async (msg) => {
     }).catch(() => {});
   }
 
-  // Defer exit to ensure IPC message is delivered to parent
+  // Worker exits after CLI closes — no explicit process.exit needed
+  // (CLI idle timeout → stdin.end → child close → exitPromise resolves → IPC sent → exit)
   setImmediate(() => process.exit(0));
 });
 
@@ -201,55 +221,124 @@ function runClaude(args, stdinData, workspace) {
   });
 }
 
-function runClaudeStream(args, streamMsg, workspace) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(CLAUDE_PATH, args, {
-      cwd: workspace,
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
+const IDLE_TIMEOUT = 30_000; // 30s idle → close stdin → CLI exits
 
-    const outChunks = [];
-    const errChunks = [];
-    child.stdout.on('data', (d) => outChunks.push(d));
-    child.stderr.on('data', (d) => errChunks.push(d));
+function runClaudeInteractive(args, initialContent, workspace) {
+  const child = spawn(CLAUDE_PATH, args, {
+    cwd: workspace,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
 
-    child.on('error', reject);
+  let idleTimer = null;
+  let turnBuffer = [];
+  let totalToolCount = 0;
+  let lastTool = null;
+  let lastStopReason = null;
+  let lastSessionId = null;
+  let lastTurnText = '';
+  let onTurnComplete = null;
+  let closed = false;
+
+  // ── stdout: incremental NDJSON parse ──
+  let stdoutBuf = '';
+  child.stdout.on('data', (chunk) => {
+    stdoutBuf += chunk.toString();
+    const lines = stdoutBuf.split('\n');
+    stdoutBuf = lines.pop(); // keep incomplete line
+
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        const parsed = JSON.parse(line);
+        handleStreamMsg(parsed);
+      } catch {}
+    }
+  });
+
+  function handleStreamMsg(msg) {
+    if (msg.type === 'assistant' && msg.message?.content) {
+      for (const block of msg.message.content) {
+        if (block.type === 'text') turnBuffer.push(block.text);
+        if (block.type === 'tool_use') { totalToolCount++; lastTool = block.name || null; }
+      }
+    }
+    if (msg.type === 'result') {
+      lastSessionId = msg.session_id || lastSessionId;
+      lastStopReason = msg.stop_reason || msg.subtype || null;
+      const turnText = msg.result || turnBuffer.join('\n');
+      lastTurnText = turnText;
+
+      if (onTurnComplete) {
+        onTurnComplete({
+          text: turnText,
+          toolCount: totalToolCount,
+          lastTool,
+          stopReason: lastStopReason,
+        });
+      }
+      turnBuffer = [];
+      resetIdleTimer();
+    }
+  }
+
+  function resetIdleTimer() {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      console.log('[worker] idle timeout, closing CLI stdin');
+      close();
+    }, IDLE_TIMEOUT);
+  }
+
+  function inject(userText, fileContent) {
+    if (closed) return false;
+    let text = userText || '';
+    if (fileContent) text += `\n\n---\n\n## 附件\n${fileContent}`;
+    const content = [{ type: 'text', text }];
+    const msg = JSON.stringify({ type: 'user', message: { role: 'user', content } });
+    child.stdin.write(msg + '\n');
+    // Reset idle timer — new message means stay alive
+    resetIdleTimer();
+    return true;
+  }
+
+  function close() {
+    if (closed) return;
+    closed = true;
+    if (idleTimer) clearTimeout(idleTimer);
+    try { child.stdin.end(); } catch {}
+  }
+
+  const errChunks = [];
+  child.stderr.on('data', (d) => errChunks.push(d));
+
+  const exitPromise = new Promise((resolve) => {
     child.on('close', (code) => {
-      const stdout = Buffer.concat(outChunks).toString();
-      const stderr = Buffer.concat(errChunks).toString();
-
-      // Parse stream-json output: extract result text from NDJSON lines
-      let resultText = '';
-      let sessionId = null;
-      for (const line of stdout.split('\n')) {
-        if (!line.trim()) continue;
-        try {
-          const msg = JSON.parse(line);
-          if (msg.type === 'result' && msg.result) {
-            resultText = msg.result;
-            sessionId = msg.session_id;
-          } else if (msg.type === 'assistant' && msg.message?.content) {
-            for (const block of msg.message.content) {
-              if (block.type === 'text') resultText += block.text;
-            }
-          }
-        } catch {}
-      }
-
-      // Convert to same format as runClaude output for parseClaudeOutput compatibility
-      const fakeJson = JSON.stringify({ type: 'result', result: resultText || '(无回复)', session_id: sessionId });
-      if (code !== 0 && !resultText) {
-        reject(new Error(`Claude CLI exit ${code}\n${stderr}`));
-      } else {
-        resolve({ stdout: fakeJson, stderr, exitError: code !== 0 ? new Error(`exit ${code}`) : undefined });
-      }
-    });
-
-    // Send stream-json message then close stdin once flushed to kernel buffer
-    child.stdin.write(streamMsg + '\n', () => {
-      child.stdin.end();
+      closed = true;
+      if (idleTimer) clearTimeout(idleTimer);
+      resolve({
+        code,
+        stderr: Buffer.concat(errChunks).toString(),
+        sessionId: lastSessionId,
+        toolCount: totalToolCount,
+        lastTool,
+        stopReason: lastStopReason,
+        lastTurnText,
+      });
     });
   });
+
+  // Send initial message (do NOT close stdin)
+  const initMsg = JSON.stringify({ type: 'user', message: { role: 'user', content: initialContent } });
+  child.stdin.write(initMsg + '\n');
+  resetIdleTimer();
+
+  return {
+    inject,
+    close,
+    exitPromise,
+    child,
+    setOnTurnComplete: (fn) => { onTurnComplete = fn; },
+  };
 }
 
 function parseClaudeOutput(stdout) {

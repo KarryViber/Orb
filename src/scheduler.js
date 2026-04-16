@@ -41,14 +41,17 @@ export class Scheduler {
     const adapter = this._getAdapter(platform);
 
     if (this.activeWorkers.has(threadTs)) {
-      if (!this.threadQueues.has(threadTs)) this.threadQueues.set(threadTs, []);
-      const queue = this.threadQueues.get(threadTs);
-      queue.push(task);
-      info(TAG, `queued msg for thread=${threadTs}, depth=${queue.length}`);
-      if (queue.length === 1) {
-        await adapter.sendReply(channel, threadTs, '上一条消息还在处理中，完成后会按顺序回复。');
+      const worker = this.activeWorkers.get(threadTs);
+      try {
+        worker.send({ type: 'inject', userText: task.userText, fileContent: task.fileContent, imagePaths: task.imagePaths });
+        info(TAG, `injected into active worker: thread=${threadTs}`);
+        return;
+      } catch (e) {
+        info(TAG, `inject failed, queuing: ${e.message}`);
+        if (!this.threadQueues.has(threadTs)) this.threadQueues.set(threadTs, []);
+        this.threadQueues.get(threadTs).push(task);
+        return;
       }
-      return;
     }
 
     if (this.activeWorkers.size >= this.maxWorkers) {
@@ -144,9 +147,20 @@ export class Scheduler {
           info(TAG, `worker response: type=${msg.type} thread=${threadTs} textLen=${msg.text?.length || 0}`);
           responded = true;
 
-          if (typingSet) {
-            if (typingInterval) clearInterval(typingInterval);
-            try { await adapter.setTyping(channel, threadTs, ''); } catch (_) {}
+          if (msg.type === 'turn_complete') {
+            // 中间轮次完成 — 发送结果但保持 typing
+            try {
+              const text = msg.text?.trim();
+              if (text) {
+                const payloads = adapter.buildPayloads(text);
+                for (const payload of payloads) {
+                  await adapter.sendReply(channel, threadTs, payload.text, payload.blocks ? { blocks: payload.blocks } : {});
+                }
+              }
+            } catch (err) {
+              logError(TAG, `failed to send turn_complete: ${err.message}`);
+            }
+            return;
           }
 
           if (msg.type === 'result') {
@@ -232,6 +246,9 @@ export class Scheduler {
         },
         onExit: async (code, signal) => {
           if (typingInterval) clearInterval(typingInterval);
+          if (typingSet) {
+            try { await adapter.setTyping(channel, threadTs, ''); } catch (_) {}
+          }
           this.activeWorkers.delete(threadTs);
 
           const next = taskQueue.dequeue();
