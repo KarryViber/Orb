@@ -1,6 +1,10 @@
-# Orb
+<p align="center">
+  <img src=".github/orb-logo.png" alt="Orb" width="160" />
+</p>
 
-A self-evolving AI agent framework that wraps [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI with persistent memory, multi-profile isolation, and messaging platform integration.
+<h1 align="center">Orb</h1>
+
+<p align="center">A self-evolving AI agent framework that wraps <a href="https://docs.anthropic.com/en/docs/claude-code">Claude Code</a> CLI with persistent memory, multi-profile isolation, and messaging platform integration.</p>
 
 > **Why Claude Code?** Orb doesn't reimplement an agent runtime — it orchestrates Claude Code CLI as-is. Every Claude Code update (new models, tools, capabilities) flows into Orb automatically. Zero migration cost.
 
