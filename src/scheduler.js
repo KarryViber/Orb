@@ -154,11 +154,11 @@ export class Scheduler {
             try {
               const text = msg.text?.trim();
               if (text) {
+                turnDelivered = true;
                 const payloads = adapter.buildPayloads(text);
                 for (const payload of payloads) {
                   await adapter.sendReply(channel, threadTs, payload.text, payload.blocks ? { blocks: payload.blocks } : {});
                 }
-                turnDelivered = true;
               }
             } catch (err) {
               logError(TAG, `failed to send turn_complete: ${err.message}`);
