@@ -45,6 +45,7 @@ export class Scheduler {
       try {
         worker.send({ type: 'inject', userText: task.userText, fileContent: task.fileContent, imagePaths: task.imagePaths });
         info(TAG, `injected into active worker: thread=${threadTs}`);
+        await adapter.setTyping(channel, threadTs, 'is thinking…').catch(() => {});
         return;
       } catch (e) {
         info(TAG, `inject failed, queuing: ${e.message}`);
@@ -115,6 +116,7 @@ export class Scheduler {
     }, 30_000) : null;
 
     let responded = false;
+    let turnDelivered = false;
     let worker; // declared for closure access in approval_result send
 
     try {
@@ -156,6 +158,8 @@ export class Scheduler {
                 for (const payload of payloads) {
                   await adapter.sendReply(channel, threadTs, payload.text, payload.blocks ? { blocks: payload.blocks } : {});
                 }
+                await adapter.setTyping(channel, threadTs, 'is thinking…').catch(() => {});
+                turnDelivered = true;
               }
             } catch (err) {
               logError(TAG, `failed to send turn_complete: ${err.message}`);
@@ -180,10 +184,14 @@ export class Scheduler {
               } else {
                 this._autoContinueCount.delete(threadTs);
               }
-              const payloads = adapter.buildPayloads(text || '⚠️ 多次续接仍未生成回复，任务可能需要拆分。请用更小的指令重试。');
-              info(TAG, `sending ${payloads.length} payload(s) to thread=${threadTs}`);
-              for (const payload of payloads) {
-                await adapter.sendReply(channel, threadTs, payload.text, payload.blocks ? { blocks: payload.blocks } : {});
+              if (!turnDelivered) {
+                const payloads = adapter.buildPayloads(text || '⚠️ 多次续接仍未生成回复，任务可能需要拆分。请用更小的指令重试。');
+                info(TAG, `sending ${payloads.length} payload(s) to thread=${threadTs}`);
+                for (const payload of payloads) {
+                  await adapter.sendReply(channel, threadTs, payload.text, payload.blocks ? { blocks: payload.blocks } : {});
+                }
+              } else {
+                turnDelivered = false;
               }
               if (text) {
                 const errorPatterns = /(?:error|failed|permission denied|ENOENT|not found|timed?\s*out|EACCES)/i;
