@@ -12,6 +12,41 @@ const MEMORY_SYNC_THRESHOLD = 20;    // cumulative tool uses before memory/user 
 const MEMORY_SYNC_INTERVAL = 6 * 60 * 60 * 1000;  // min 6h between syncs per profile
 const MAX_AUTO_CONTINUE = 2;  // max auto-retries on empty result (context overflow)
 
+// --- Effort escalation keywords ---
+// 命中任一关键词且消息长度 > 20 字 → 升到 xhigh
+const ESCALATE_KEYWORDS = [
+  '复盘',
+  '深入分析',
+  '深度分析',
+  '深度思考',
+  '审计',
+  '架构设计',
+  '方案设计',
+  '重构方案',
+  '代码审查',
+  '战略判断',
+];
+
+// 英文 review 单独处理（太常见，需要更严格的上下文）
+const ENGLISH_REVIEW_PATTERNS = [
+  /\breview\s+一下\b/i,
+  /\b帮\s*(我\s*)?review\b/i,
+  /\b做个\s*review\b/i,
+  /\breview\s+(这段|这个|下面|代码|PR)\b/i,
+  /\b深度\s*review\b/i,
+];
+
+function shouldEscalateEffort(text) {
+  if (!text || text.length < 20) return false;
+  for (const kw of ESCALATE_KEYWORDS) {
+    if (text.includes(kw)) return true;
+  }
+  for (const re of ENGLISH_REVIEW_PATTERNS) {
+    if (re.test(text)) return true;
+  }
+  return false;
+}
+
 export class Scheduler {
   constructor({ maxWorkers, timeoutMs, getProfile }) {
     this.maxWorkers = maxWorkers || 3;
@@ -118,6 +153,15 @@ export class Scheduler {
       effectiveEffort = effortMatch[1].toLowerCase();
       effectiveText = effectiveText.slice(effortMatch[0].length);
     }
+
+    // 关键词自动升 xhigh（若未手动指定 effort）
+    if (!effectiveEffort && shouldEscalateEffort(effectiveText)) {
+      effectiveEffort = 'xhigh';
+      info(TAG, `effort escalated to xhigh by keyword match`);
+    }
+
+    // 默认 low（若前面都没设）
+    if (!effectiveEffort) effectiveEffort = 'low';
 
     let typingSet = false;
     try {
