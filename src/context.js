@@ -126,7 +126,7 @@ Save durable facts proactively — don't wait for "remember this":
  *   4. Thread   — conversation history (now passed in, not fetched here)
  *   5. Message  — user message + file attachments
  */
-export async function buildPrompt({ userText, fileContent, threadTs, userId, channel, soulDir, scriptsDir, threadHistory, dataDir }) {
+export async function buildPrompt({ userText, fileContent, threadTs, userId, channel, soulDir, scriptsDir, threadHistory, dataDir, mode, priorConversation }) {
   const systemParts = [];
   const userParts = [];
 
@@ -213,6 +213,15 @@ export async function buildPrompt({ userText, fileContent, threadTs, userId, cha
       .map((d) => `- [${d.slug}/${d.doc_type}] ${d.title} §${d.section}\n  ${d.snippet || d.content || ''}`)
       .join('\n');
     userParts.push(`## 相关文档\n${docBlock}`);
+  }
+
+  // Skill-review mode: inject the just-completed turn as explicit context,
+  // since the synthetic skill-review-* threadTs has no real thread history.
+  if (mode === 'skill-review' && Array.isArray(priorConversation) && priorConversation.length > 0) {
+    const priorText = priorConversation
+      .map((m) => `${m.role || 'unknown'}: ${m.content || ''}`)
+      .join('\n\n');
+    userParts.push(`## 待审查会话\n${priorText}\n## 审查会话结束`);
   }
 
   // Layer 4: Thread history (now passed in from adapter, not fetched here)

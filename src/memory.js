@@ -23,6 +23,12 @@ const MEMORY_ENABLED = process.env.MEMORY_ENABLED !== 'false';
 const DOC_INDEX_ENABLED = process.env.DOC_INDEX_ENABLED !== 'false';
 const DEFAULT_DOC_DB = process.env.DOC_INDEX_DB || '';  // explicit env override; profile dataDir preferred
 
+// Recall tuning — override via .env, no code change needed.
+// See spec architecture-hardening.md #30 for the parameter matrix.
+const MEMORY_RECALL_LIMIT = parseInt(process.env.ORB_MEMORY_RECALL_LIMIT || '10', 10);
+const MEMORY_MIN_TRUST = parseFloat(process.env.ORB_MEMORY_MIN_TRUST || '0.3');
+const DOC_RECALL_LIMIT = parseInt(process.env.ORB_DOC_RECALL_LIMIT || '8', 10);
+
 // ── Holographic bridge (JSON args) ──
 
 function holographicBridge(dbPath, command, args = {}) {
@@ -95,7 +101,11 @@ export async function recallMemory(query, userId, dbPath) {
   if (!MEMORY_ENABLED || !query || !dbPath) return [];
   try {
     const db = dbPath;
-    const results = await holographicBridge(db, 'search', { query, limit: 5 });
+    const results = await holographicBridge(db, 'search', {
+      query,
+      limit: MEMORY_RECALL_LIMIT,
+      min_trust: MEMORY_MIN_TRUST,
+    });
     if (Array.isArray(results)) return results;
     return [];
   } catch {
@@ -110,11 +120,11 @@ export async function recallMemory(query, userId, dbPath) {
  * @param {string|null} [slug] - Optional project slug to scope search to a single project
  */
 export async function searchDocs(query, dataDir, slug = null) {
-  if (!DOC_INDEX_ENABLED || !query) return [];
+  if (!DOC_INDEX_ENABLED || !query || DOC_RECALL_LIMIT <= 0) return [];
   try {
     const db = (dataDir ? join(dataDir, 'doc-index.db') : '') || DEFAULT_DOC_DB;
     if (!db) return [];
-    const extraArgs = ['--limit', '5'];
+    const extraArgs = ['--limit', String(DOC_RECALL_LIMIT)];
     if (slug) extraArgs.push('--slug', slug);
     const results = await docstoreBridge(db, 'search', query, ...extraArgs);
     if (Array.isArray(results)) return results;
@@ -143,8 +153,13 @@ function extractFacts(userText, responseText) {
         } catch { resolve([]); }
       },
     );
-    child.stdin.write(JSON.stringify({ user: u, response: r }));
-    child.stdin.end();
+    // Guard against EPIPE when the Python child dies before write completes —
+    // would otherwise crash the whole worker process.
+    child.stdin.on('error', () => resolve([]));
+    child.stdin.write(JSON.stringify({ user: u, response: r }), (err) => {
+      if (err) resolve([]);
+      else child.stdin.end();
+    });
   });
 }
 
@@ -227,8 +242,11 @@ export async function storeLesson({ userText, errorText, responseText, threadTs,
           try { resolve(JSON.parse(stdout.trim())); } catch { resolve([]); }
         },
       );
-      child.stdin.write(ctx);
-      child.stdin.end();
+      child.stdin.on('error', () => resolve([]));
+      child.stdin.write(ctx, (err) => {
+        if (err) resolve([]);
+        else child.stdin.end();
+      });
     });
 
     const tags = ['lesson', userId, threadTs].filter(Boolean).join(',');
@@ -277,8 +295,11 @@ export async function storeCorrectionLesson({ userText, responseText, threadHist
           try { resolve(JSON.parse(stdout.trim())); } catch { resolve([]); }
         },
       );
-      child.stdin.write(ctx);
-      child.stdin.end();
+      child.stdin.on('error', () => resolve([]));
+      child.stdin.write(ctx, (err) => {
+        if (err) resolve([]);
+        else child.stdin.end();
+      });
     });
 
     const tags = ['lesson', 'correction', userId, threadTs].filter(Boolean).join(',');

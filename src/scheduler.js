@@ -309,7 +309,7 @@ export class Scheduler {
               await adapter.sendReply(channel, threadTs, ':warning: 回复发送失败。').catch(() => {});
             }
             if (msg.toolCount > 0) {
-              try { this._checkSkillReview(profile.name, msg.toolCount, task); } catch (_) {}
+              try { this._checkSkillReview(profile.name, msg.toolCount, task, text); } catch (_) {}
               try { this._checkMemorySync(profile.name, msg.toolCount, task); } catch (_) {}
             }
           } else if (msg.type === 'error') {
@@ -380,7 +380,7 @@ export class Scheduler {
 
   // --- Skill auto-extraction ---
 
-  _checkSkillReview(profileName, toolCount, task) {
+  _checkSkillReview(profileName, toolCount, task, resultText) {
     if (!toolCount || toolCount === 0) return;
 
     const prev = this._skillToolCounts.get(profileName) || 0;
@@ -390,7 +390,12 @@ export class Scheduler {
     if (next >= SKILL_REVIEW_THRESHOLD) {
       info(TAG, `skill review threshold reached: profile=${profileName} tools=${next}`);
       this._skillToolCounts.set(profileName, 0);
-      this._spawnSkillReview(task);
+      // Package the just-completed turn as priorConversation so the review
+      // worker has actual context to extract skills from.
+      const priorMessages = [];
+      if (task?.userText) priorMessages.push({ role: 'user', content: String(task.userText) });
+      if (resultText) priorMessages.push({ role: 'assistant', content: String(resultText) });
+      this._spawnSkillReview(task, priorMessages);
     }
   }
 
@@ -410,7 +415,7 @@ export class Scheduler {
     } catch { return []; }
   }
 
-  _spawnSkillReview(task) {
+  _spawnSkillReview(task, priorMessages = []) {
     const { userId, platform } = task;
     const profile = this.getProfile(userId);
     const agentsDir = join(profile.soulDir, '..', 'skills');
@@ -488,6 +493,8 @@ export class Scheduler {
         threadHistory: null,
         model: 'haiku',
         effort: 'low',
+        mode: 'skill-review',
+        priorConversation: priorMessages,
         profile: {
           name: profile.name,
           soulDir: profile.soulDir,
@@ -505,6 +512,7 @@ export class Scheduler {
       },
     }));
     this._backgroundWorkers.add(worker);
+    info(TAG, `skill review dispatched: profile=${profile.name} priorMessages=${priorMessages.length}`);
   }
 
   // --- Memory + User profile sync ---

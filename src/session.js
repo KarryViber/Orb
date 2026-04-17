@@ -29,19 +29,18 @@ function save(dataDir, sessions) {
 
 /**
  * Run a read-modify-write operation under a file lock.
- * Falls back to unlocked write if locking fails (e.g. stale lock).
+ * Throws if the lock cannot be acquired — callers must be prepared to handle
+ * a dropped write. Fallback-to-unlocked is NOT safe: updateSession is
+ * read-modify-write; two concurrent unlocked writers silently overwrite fields.
  */
 async function withLock(dataDir, fn) {
   const file = ensureFile(dataDir);
   let release;
   try {
-    release = await lockfile.lock(file, { retries: { retries: 3, minTimeout: 50, maxTimeout: 300 } });
+    release = await lockfile.lock(file, { retries: { retries: 5, minTimeout: 50, maxTimeout: 500 } });
   } catch (lockErr) {
-    // Lock failed — log warning but still execute (better than dropping the write)
-    // This is acceptable because session writes are idempotent (last writer wins)
-    warn('session', `lock failed (${lockErr?.message || 'unknown'}), proceeding unlocked`);
-    fn();
-    return;
+    warn('session', `lock failed after retries (${lockErr?.message || 'unknown'}), skipping write`);
+    throw new Error('session lock unavailable');
   }
   try {
     fn();

@@ -10,7 +10,12 @@ import { storeConversation } from './memory.js';
  * Worker IPC Protocol
  *
  * Scheduler -> Worker:
- *   { type: 'task', userText, fileContent, imagePaths, threadTs, channel, userId, platform, threadHistory, profile, model, effort }
+ *   { type: 'task', userText, fileContent, imagePaths, threadTs, channel,
+ *                   userId, platform, threadHistory, profile, model, effort,
+ *                   mode?, priorConversation? }
+ *     - mode: 'skill-review' enters a dedicated branch that requires
+ *       priorConversation; context.js injects it as "## 待审查会话".
+ *     - priorConversation: [{role: 'user'|'assistant', content: string}, ...]
  *   { type: 'approval_result', approved, scope, userId }
  *   { type: 'inject', userText, fileContent?, imagePaths? }
  *
@@ -45,7 +50,19 @@ process.on('message', async (msg) => {
   }
   if (msg.type !== 'task') return;
 
-  let { userText, fileContent, imagePaths, threadTs, channel, userId, platform, profile, threadHistory, model, effort } = msg;
+  let { userText, fileContent, imagePaths, threadTs, channel, userId, platform, profile, threadHistory, model, effort, mode, priorConversation } = msg;
+
+  // Fail-fast: skill-review mode without context produces "no skill" noise.
+  // Without real content to review the worker is just burning tokens on nothing.
+  if (mode === 'skill-review') {
+    const hasCtx = Array.isArray(priorConversation) && priorConversation.length > 0;
+    if (!hasCtx) {
+      console.error('[worker] skill-review invoked without priorConversation, skipping');
+      try { process.send({ type: 'result', text: '[skipped: no context]', toolCount: 0 }); } catch {}
+      setImmediate(() => process.exit(0));
+      return;
+    }
+  }
 
   // IPC profile path validation — prevent path traversal
   if (profile?.workspaceDir && profile?.dataDir) {
@@ -81,6 +98,8 @@ process.on('message', async (msg) => {
       scriptsDir: profile?.scriptsDir,
       threadHistory,
       dataDir,
+      mode,
+      priorConversation,
     });
     const promptLen = (prompt.systemPrompt?.length || 0) + (prompt.userPrompt?.length || prompt.length || 0);
     console.log(`[worker] prompt built (${promptLen} chars), session=${sessionId || 'new'}`);
@@ -140,6 +159,7 @@ process.on('message', async (msg) => {
       streamArgs.push('--system-prompt', prompt.systemPrompt);
     }
 
+    console.log(`[worker] cli args: ${streamArgs.join(' ')}`);
     console.log(`[worker] starting interactive CLI session`);
     const cli = runClaudeInteractive(streamArgs, initialContent, WORKSPACE);
     _activeCli = cli;

@@ -45,6 +45,39 @@ function extractSlackThreadUrls(text) {
   return results;
 }
 
+// --- Block Kit text extraction ---
+
+/**
+ * Extract readable text from a Block Kit `blocks` array.
+ *
+ * Orb's cron outputs (夜间反思 / 盘前快检 / 日报 etc.) are all Block Kit —
+ * `msg.text` is just a short header, the real content lives in section/header/
+ * context blocks. Without this, fetchThreadHistory only sees the header and
+ * the worker loses all context when the user replies in the thread.
+ */
+function extractBlockKitText(blocks) {
+  if (!Array.isArray(blocks)) return '';
+  const parts = [];
+  for (const block of blocks) {
+    if (block.type === 'header' && block.text?.text) {
+      parts.push(block.text.text);
+    } else if (block.type === 'section') {
+      if (block.text?.text) parts.push(block.text.text);
+      if (Array.isArray(block.fields)) {
+        for (const f of block.fields) {
+          if (f?.text) parts.push(f.text);
+        }
+      }
+    } else if (block.type === 'context' && Array.isArray(block.elements)) {
+      for (const el of block.elements) {
+        if (el?.text) parts.push(el.text);
+      }
+    }
+    // divider / image / actions ignored
+  }
+  return parts.join('\n');
+}
+
 // --- Incoming file processing ---
 const TEXT_EXTENSIONS = new Set([
   'txt', 'md', 'json', 'csv', 'tsv', 'log', 'py', 'js', 'ts', 'jsx', 'tsx',
@@ -115,8 +148,18 @@ export class SlackAdapter extends PlatformAdapter {
   _isDuplicate(eventTs) {
     const now = Date.now();
     if (this._seenMessages.size > 2000) {
+      // Step 1: drop anything past TTL
       for (const [ts, t] of this._seenMessages) {
         if (now - t > this._DEDUP_TTL) this._seenMessages.delete(ts);
+      }
+      // Step 2: still over? force-evict the 500 oldest. Otherwise under a
+      // sustained high-QPS burst (whole map inside TTL window) the Map grows
+      // unbounded.
+      if (this._seenMessages.size > 2000) {
+        const sorted = [...this._seenMessages.entries()].sort((a, b) => a[1] - b[1]);
+        for (const [ts] of sorted.slice(0, 500)) {
+          this._seenMessages.delete(ts);
+        }
       }
     }
     if (this._seenMessages.has(eventTs)) return true;
@@ -259,7 +302,15 @@ export class SlackAdapter extends PlatformAdapter {
         role = await this._resolveUserName(msg.user);
       }
 
-      const text = (msg.text || '').slice(0, 2000);
+      // Always-try + take-max: if msg has blocks, extract text from them and
+      // use whichever is longer (msg.text vs block-kit text). Avoids a length
+      // threshold which is fragile with mixed CJK/emoji cron headers.
+      let text = msg.text || '';
+      if (Array.isArray(msg.blocks) && msg.blocks.length > 0) {
+        const blockText = extractBlockKitText(msg.blocks);
+        if (blockText.length > text.length) text = blockText;
+      }
+      text = text.slice(0, 2000);
       const line = `${role}: ${text}`;
 
       if (totalChars + line.length > MAX_HISTORY_CHARS) break;
