@@ -81,6 +81,13 @@ _UNHELPFUL_DELTA = -0.10
 _TRUST_MIN       =  0.0
 _TRUST_MAX       =  1.0
 
+# Confidence → trust_score mapping (write-time, frozen thereafter).
+_CONFIDENCE_TRUST = {
+    "confirmed":   0.9,
+    "default":     0.5,
+    "speculative": 0.2,
+}
+
 # Entity extraction patterns
 _RE_CAPITALIZED  = re.compile(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b')
 _RE_DOUBLE_QUOTE = re.compile(r'"([^"]+)"')
@@ -128,12 +135,25 @@ class MemoryStore:
         """Create tables, indexes, and triggers if they do not exist. Enable WAL mode."""
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(_SCHEMA)
-        # Migrate: add hrr_vector column if missing (safe for existing databases)
+        # Migrate: add columns if missing (safe for existing databases)
         columns = {row[1] for row in self._conn.execute("PRAGMA table_info(facts)").fetchall()}
         if "hrr_vector" not in columns:
             self._conn.execute("ALTER TABLE facts ADD COLUMN hrr_vector BLOB")
         if "source" not in columns:
             self._conn.execute("ALTER TABLE facts ADD COLUMN source TEXT DEFAULT 'unknown'")
+        # Graphiti-style tombstone columns (additive, rollback-safe)
+        if "invalid_at" not in columns:
+            self._conn.execute("ALTER TABLE facts ADD COLUMN invalid_at TIMESTAMP")
+        if "superseded_by" not in columns:
+            self._conn.execute(
+                "ALTER TABLE facts ADD COLUMN superseded_by INTEGER REFERENCES facts(fact_id)"
+            )
+        if "trust_frozen" not in columns:
+            self._conn.execute("ALTER TABLE facts ADD COLUMN trust_frozen INTEGER DEFAULT 0")
+        # Partial index: only live (non-tombstoned) facts, speeds up the default query path.
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_facts_valid ON facts(invalid_at) WHERE invalid_at IS NULL"
+        )
         self._conn.commit()
 
     # ------------------------------------------------------------------
@@ -146,30 +166,36 @@ class MemoryStore:
         category: str = "general",
         tags: str = "",
         source: str = "unknown",
+        confidence: str = "default",
     ) -> int:
         """Insert a fact and return its fact_id.
 
         Deduplicates by content (UNIQUE constraint). On duplicate, returns
         the existing fact_id without modifying the row. Extracts entities from
         the content and links them to the fact.
+
+        confidence ∈ {"confirmed", "default", "speculative"} → maps to trust_score
+        (0.9 / 0.5 / 0.2) and locks trust_frozen=1 so subsequent reads won't decay.
         """
         with self._lock:
             content = content.strip()
             if not content:
                 raise ValueError("content must not be empty")
 
+            trust_score = _CONFIDENCE_TRUST.get(confidence, self.default_trust)
+
             try:
                 cur = self._conn.execute(
                     """
-                    INSERT INTO facts (content, category, tags, trust_score, source)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO facts (content, category, tags, trust_score, source, trust_frozen)
+                    VALUES (?, ?, ?, ?, ?, 1)
                     """,
-                    (content, category, tags, self.default_trust, source),
+                    (content, category, tags, trust_score, source),
                 )
                 self._conn.commit()
                 fact_id: int = cur.lastrowid  # type: ignore[assignment]
             except sqlite3.IntegrityError:
-                # Duplicate content — return existing id
+                # Duplicate content — return existing id (live or tombstoned alike)
                 row = self._conn.execute(
                     "SELECT fact_id FROM facts WHERE content = ?", (content,)
                 ).fetchone()
@@ -192,11 +218,13 @@ class MemoryStore:
         category: str | None = None,
         min_trust: float = 0.3,
         limit: int = 10,
+        include_invalidated: bool = False,
     ) -> list[dict]:
         """Full-text search over facts using FTS5.
 
         Returns a list of fact dicts ordered by FTS5 rank, then trust_score
         descending. Also increments retrieval_count for matched facts.
+        Tombstoned facts (invalid_at IS NOT NULL) are excluded by default.
         """
         with self._lock:
             query = query.strip()
@@ -208,6 +236,7 @@ class MemoryStore:
             if category is not None:
                 category_clause = "AND f.category = ?"
                 params.append(category)
+            invalid_clause = "" if include_invalidated else "AND f.invalid_at IS NULL"
             params.append(limit)
 
             sql = f"""
@@ -219,6 +248,7 @@ class MemoryStore:
                 WHERE facts_fts MATCH ?
                   AND f.trust_score >= ?
                   {category_clause}
+                  {invalid_clause}
                 ORDER BY fts.rank, f.trust_score DESC
                 LIMIT ?
             """
@@ -301,8 +331,41 @@ class MemoryStore:
 
             return True
 
-    def remove_fact(self, fact_id: int) -> bool:
-        """Delete a fact and its entity links. Returns True if the row existed."""
+    def tombstone_fact(self, fact_id: int, superseded_by: int | None = None) -> bool:
+        """Soft-delete (tombstone): mark invalid_at, optionally link supersedor.
+
+        Tombstoned facts survive in the DB (for audit / superseded_by graph traversal)
+        but are excluded from search / list by default. Rebuilds the HRR bank so the
+        fact stops contributing to category-level similarity search.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT fact_id, category, invalid_at FROM facts WHERE fact_id = ?", (fact_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            if row["invalid_at"] is not None and superseded_by is None:
+                return True  # already tombstoned, nothing to do
+
+            self._conn.execute(
+                """
+                UPDATE facts
+                SET invalid_at = COALESCE(invalid_at, CURRENT_TIMESTAMP),
+                    superseded_by = COALESCE(?, superseded_by),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE fact_id = ?
+                """,
+                (superseded_by, fact_id),
+            )
+            self._conn.commit()
+            self._rebuild_bank(row["category"])
+            return True
+
+    def purge_fact(self, fact_id: int) -> bool:
+        """Hard-delete (admin/migration only). Default flow should use tombstone_fact.
+
+        Removes the fact + its entity links permanently. Returns True if the row existed.
+        """
         with self._lock:
             row = self._conn.execute(
                 "SELECT fact_id, category FROM facts WHERE fact_id = ?", (fact_id,)
@@ -318,17 +381,66 @@ class MemoryStore:
             self._rebuild_bank(row["category"])
             return True
 
+    # Backwards-compat shim: retain old name for any callers we haven't migrated yet.
+    # New code should call tombstone_fact (default) or purge_fact (admin).
+    remove_fact = tombstone_fact
+
+    def purge_transient(
+        self,
+        categories: tuple[str, ...] = ("transient_state", "session_context"),
+        max_age_days: int = 7,
+    ) -> int:
+        """Hard-delete transient-category facts older than max_age_days.
+
+        Transient categories (e.g. current session window, ephemeral UI state)
+        are the only place where real deletion — not tombstoning — is correct.
+        Returns count of rows deleted.
+        """
+        with self._lock:
+            if not categories:
+                return 0
+            placeholders = ",".join("?" * len(categories))
+            params: list = list(categories)
+            params.append(max_age_days)
+
+            # Select first so we can rebuild affected banks after deletion.
+            affected = self._conn.execute(
+                f"""
+                SELECT fact_id, category FROM facts
+                WHERE category IN ({placeholders})
+                  AND (julianday('now') - julianday(created_at)) > ?
+                """,
+                params,
+            ).fetchall()
+            if not affected:
+                return 0
+
+            ids = [r["fact_id"] for r in affected]
+            cats = {r["category"] for r in affected}
+            id_placeholders = ",".join("?" * len(ids))
+            self._conn.execute(
+                f"DELETE FROM fact_entities WHERE fact_id IN ({id_placeholders})", ids
+            )
+            self._conn.execute(
+                f"DELETE FROM facts WHERE fact_id IN ({id_placeholders})", ids
+            )
+            self._conn.commit()
+            for c in cats:
+                self._rebuild_bank(c)
+            return len(ids)
+
     def list_facts(
         self,
         category: str | None = None,
         min_trust: float = 0.0,
         limit: int = 50,
         offset: int = 0,
+        include_invalidated: bool = False,
     ) -> list[dict]:
         """Browse facts ordered by trust_score descending.
 
         Optionally filter by category and minimum trust score.
-        Supports pagination via offset.
+        Supports pagination via offset. Tombstoned facts excluded by default.
         """
         with self._lock:
             params: list = [min_trust]
@@ -336,6 +448,7 @@ class MemoryStore:
             if category is not None:
                 category_clause = "AND category = ?"
                 params.append(category)
+            invalid_clause = "" if include_invalidated else "AND invalid_at IS NULL"
             params.append(limit)
             params.append(offset)
 
@@ -345,6 +458,7 @@ class MemoryStore:
                 FROM facts
                 WHERE trust_score >= ?
                   {category_clause}
+                  {invalid_clause}
                 ORDER BY trust_score DESC
                 LIMIT ?
                 OFFSET ?
@@ -505,7 +619,10 @@ class MemoryStore:
 
             bank_name = f"cat:{category}"
             rows = self._conn.execute(
-                "SELECT hrr_vector FROM facts WHERE category = ? AND hrr_vector IS NOT NULL",
+                """
+                SELECT hrr_vector FROM facts
+                WHERE category = ? AND hrr_vector IS NOT NULL AND invalid_at IS NULL
+                """,
                 (category,),
             ).fetchall()
 

@@ -99,6 +99,20 @@ def assess_importance(user_text: str, category: str) -> str:
     return "low"
 
 
+def _confidence_for(category: str, importance: str) -> str:
+    """Map (category, importance) → confidence tier consumed by store.add_fact.
+
+    confirmed   → explicit user instruction/preference/decision (trust 0.9, frozen)
+    default     → ordinary extracted knowledge/entity/event (trust 0.5)
+    speculative → regex-derived entities or low-importance conversation (trust 0.2)
+    """
+    if category in ("instruction", "preference", "decision") and importance == "high":
+        return "confirmed"
+    if importance == "low":
+        return "speculative"
+    return "default"
+
+
 def extract_facts(user_text: str, response_text: str) -> list[dict]:
     """Extract structured facts from a conversation turn."""
     if should_skip(user_text, response_text):
@@ -115,6 +129,7 @@ def extract_facts(user_text: str, response_text: str) -> list[dict]:
             "content": f"User: {user_text.strip()}",
             "category": user_category,
             "importance": "high",
+            "confidence": _confidence_for(user_category, "high"),
         })
 
     # Build a condensed summary of the exchange
@@ -159,6 +174,7 @@ def extract_facts(user_text: str, response_text: str) -> list[dict]:
             "content": content,
             "category": category,
             "importance": importance,
+            "confidence": _confidence_for(category, importance),
         })
 
     # Extract any explicit entities mentioned
@@ -178,6 +194,7 @@ def extract_facts(user_text: str, response_text: str) -> list[dict]:
                     "content": f"Entity: {entity}",
                     "category": "entity",
                     "importance": "low",
+                    "confidence": _confidence_for("entity", "low"),
                 })
 
     return facts

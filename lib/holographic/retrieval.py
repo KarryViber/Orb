@@ -129,7 +129,7 @@ class FactRetriever:
         """
         conn = self.store._conn
 
-        where_clauses = ["trust_score >= ?"]
+        where_clauses = ["trust_score >= ?", "invalid_at IS NULL"]
         params: list = [min_trust]
 
         if thread_ts:
@@ -213,7 +213,7 @@ class FactRetriever:
                 )
 
         # Score against individual fact vectors directly
-        where = "WHERE hrr_vector IS NOT NULL"
+        where = "WHERE hrr_vector IS NOT NULL AND invalid_at IS NULL"
         params: list = []
         if category:
             where += " AND category = ?"
@@ -273,7 +273,7 @@ class FactRetriever:
         entity_vec = hrr.encode_atom(entity.lower(), self.hrr_dim)
 
         # Get all facts with vectors
-        where = "WHERE hrr_vector IS NOT NULL"
+        where = "WHERE hrr_vector IS NOT NULL AND invalid_at IS NULL"
         params: list = []
         if category:
             where += " AND category = ?"
@@ -352,7 +352,7 @@ class FactRetriever:
             entity_residuals.append(probe_key)
 
         # Get all facts with vectors
-        where = "WHERE hrr_vector IS NOT NULL"
+        where = "WHERE hrr_vector IS NOT NULL AND invalid_at IS NULL"
         params: list = []
         if category:
             where += " AND category = ?"
@@ -417,7 +417,7 @@ class FactRetriever:
         conn = self.store._conn
 
         # Get all facts with vectors and their linked entities
-        where = "WHERE f.hrr_vector IS NOT NULL"
+        where = "WHERE f.hrr_vector IS NOT NULL AND f.invalid_at IS NULL"
         params: list = []
         if category:
             where += " AND f.category = ?"
@@ -511,7 +511,7 @@ class FactRetriever:
         """Score facts by similarity to a target vector."""
         conn = self.store._conn
 
-        where = "WHERE hrr_vector IS NOT NULL"
+        where = "WHERE hrr_vector IS NOT NULL AND invalid_at IS NULL"
         params: list = []
         if category:
             where += " AND category = ?"
@@ -549,7 +549,7 @@ class FactRetriever:
         """Fallback for queries too short for trigram FTS5 (< 3 chars)."""
         conn = self.store._conn
         params: list = [f"%{query}%", min_trust]
-        where = "WHERE content LIKE ? AND trust_score >= ?"
+        where = "WHERE content LIKE ? AND trust_score >= ? AND invalid_at IS NULL"
         if category:
             where += " AND category = ?"
             params.append(category)
@@ -603,6 +603,7 @@ class FactRetriever:
 
         where_clauses.append("f.trust_score >= ?")
         params.append(min_trust)
+        where_clauses.append("f.invalid_at IS NULL")
 
         where_sql = " AND ".join(where_clauses)
 

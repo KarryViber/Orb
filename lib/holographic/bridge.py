@@ -6,21 +6,40 @@ Usage:
     python3 bridge.py <db_path> <command> [json_args]
 
 Commands:
-    search         {"query": "...", "category": null, "min_trust": 0.3, "limit": 5}
-    session_search {"query": "", "thread_ts": "...", "user_id": "...", "limit": 20}
-    add            {"content": "...", "category": "general", "tags": ""}
-    probe    {"entity": "...", "category": null, "limit": 10}
-    related  {"entity": "...", "category": null, "limit": 10}
-    reason   {"entities": ["a","b"], "category": null, "limit": 10}
-    contradict {"category": null, "threshold": 0.3, "limit": 10}
-    feedback {"fact_id": 1, "helpful": true}
-    remove   {"fact_id": 1}
-    list     {"category": null, "min_trust": 0.0, "limit": 50}
+    search          {"query": "...", "category": null, "min_trust": 0.3, "limit": 5}
+    session_search  {"query": "", "thread_ts": "...", "user_id": "...", "limit": 20}
+    add             {"content": "...", "category": "general", "tags": "",
+                     "confidence": "default", "skip_arbitrate": false}
+    probe           {"entity": "...", "category": null, "limit": 10}
+    related         {"entity": "...", "category": null, "limit": 10}
+    reason          {"entities": ["a","b"], "category": null, "limit": 10}
+    contradict      {"category": null, "threshold": 0.3, "limit": 10}
+    feedback        {"fact_id": 1, "helpful": true}
+    remove          {"fact_id": 1}                    — default = tombstone (soft)
+    tombstone       {"fact_id": 1, "superseded_by": null}
+    purge           {"fact_id": 1}                    — admin/migration hard-delete
+    purge_transient {"categories": [...], "max_age_days": 7}
+    list            {"category": null, "min_trust": 0.0, "limit": 50}
+    arbitrate       {"content": "...", "neighbors": [...]}  — debug, returns decision only
+    batch           {"operations": [...]}
 
 Output: JSON to stdout. Exit 0 on success, 1 on error.
+
+Arbitration (write-time LLM curation):
+  On `add`, bridge searches for up to 3 FTS5 near-neighbors (trust > 0.3).
+  If neighbors exist, it calls `claude -p` (Haiku, 5s timeout) to decide
+  ADD / UPDATE / DELETE / NONE. Any failure degrades to ADD (fail-open).
+
+  Environment toggles:
+    MEMORY_ARBITRATE=false        disable arbitration entirely
+    MEMORY_ARBITRATE_MODEL=haiku  model for claude -p (haiku/sonnet/opus)
+    MEMORY_ARBITRATE_TIMEOUT_SEC=5  subprocess timeout
 """
 
 import json
+import os
+import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -30,6 +49,186 @@ sys.path.insert(0, str(Path(__file__).parent))
 from store import MemoryStore
 from retrieval import FactRetriever
 
+
+# ── Arbitration via Claude CLI subprocess ─────────────────────────────
+
+_ARBITRATE_ENABLED = os.environ.get("MEMORY_ARBITRATE", "true").lower() != "false"
+_ARBITRATE_MODEL = os.environ.get("MEMORY_ARBITRATE_MODEL", "haiku")
+_ARBITRATE_TIMEOUT = float(os.environ.get("MEMORY_ARBITRATE_TIMEOUT_SEC", "15.0"))
+_ARBITRATE_SYSTEM = (
+    "You are a memory curator. Reply with a single-line JSON object only. "
+    "No prose, no markdown fences."
+)
+
+
+def arbitrate(content: str, neighbors: list[dict]) -> dict:
+    """Ask Haiku to decide ADD/UPDATE/DELETE/NONE given a new fact + neighbors.
+
+    Returns: {"action": "ADD|UPDATE|DELETE|NONE", "target_id": int|None, "reason": "..."}
+    Fails open: any subprocess / parse error → {"action": "ADD", "reason": "..."}.
+    """
+    if not _ARBITRATE_ENABLED or not neighbors:
+        return {"action": "ADD", "target_id": None, "reason": "arbitrate-skipped"}
+
+    nbr_lines = []
+    for n in neighbors:
+        nbr_lines.append(
+            f"  [id={n.get('fact_id')}] {str(n.get('content', ''))[:300]} "
+            f"(trust={float(n.get('trust_score', 0) or 0):.2f})"
+        )
+
+    prompt = (
+        f"NEW FACT:\n  {content}\n\n"
+        "EXISTING NEIGHBORS:\n" + "\n".join(nbr_lines) + "\n\n"
+        "Decide one of:\n"
+        "  ADD — genuinely new, no real conflict\n"
+        "  UPDATE — new supersedes a specific neighbor (requires target_id)\n"
+        "  DELETE — new says a neighbor is wrong; drop it (requires target_id)\n"
+        "  NONE — new is duplicate or strictly weaker than a neighbor\n\n"
+        'Reply JSON only: {"action":"ADD","target_id":null,"reason":"..."}'
+    )
+
+    try:
+        result = subprocess.run(
+            [
+                "claude", "-p", prompt,
+                "--model", _ARBITRATE_MODEL,
+                "--output-format", "json",
+                "--system-prompt", _ARBITRATE_SYSTEM,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_ARBITRATE_TIMEOUT,
+            cwd="/tmp",  # don't pick up project CLAUDE.md / skills
+        )
+    except subprocess.TimeoutExpired:
+        return {"action": "ADD", "target_id": None, "reason": "arbitrate-timeout"}
+    except FileNotFoundError:
+        return {"action": "ADD", "target_id": None, "reason": "claude-cli-missing"}
+    except Exception as e:
+        return {"action": "ADD", "target_id": None, "reason": f"subprocess-err-{type(e).__name__}"}
+
+    if result.returncode != 0:
+        return {"action": "ADD", "target_id": None, "reason": f"cli-returncode-{result.returncode}"}
+
+    try:
+        envelope = json.loads(result.stdout)
+        text = (envelope.get("result") or "").strip()
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+        decision = json.loads(text)
+    except Exception:
+        return {"action": "ADD", "target_id": None, "reason": "arbitrate-bad-json"}
+
+    action = (decision.get("action") or "").upper()
+    if action not in {"ADD", "UPDATE", "DELETE", "NONE"}:
+        return {"action": "ADD", "target_id": None, "reason": f"arbitrate-invalid-action-{action}"}
+
+    # Haiku sometimes returns target_id as a numeric string — coerce.
+    raw_target = decision.get("target_id")
+    target_id: int | None = None
+    if isinstance(raw_target, int):
+        target_id = raw_target
+    elif isinstance(raw_target, str) and raw_target.strip().isdigit():
+        target_id = int(raw_target.strip())
+
+    if action in {"UPDATE", "DELETE"} and target_id is None:
+        return {"action": "ADD", "target_id": None, "reason": "arbitrate-missing-target"}
+
+    return {
+        "action": action,
+        "target_id": target_id,
+        "reason": str(decision.get("reason", "")),
+    }
+
+
+# ── Add path: search neighbors → arbitrate → apply ───────────────────
+
+def apply_fact_write(
+    store: MemoryStore,
+    retriever: FactRetriever,
+    content: str,
+    category: str,
+    tags: str,
+    source: str,
+    confidence: str,
+    skip_arbitrate: bool,
+) -> dict:
+    """One-shot fact write with arbitration.
+
+    Returns a rich result dict with:
+      action: ADD|UPDATE|DELETE|NONE
+      fact_id: int|None
+      tombstoned: int (present if UPDATE or DELETE)
+      reason: str
+    """
+    content = (content or "").strip()
+    if not content:
+        return {"error": "empty content"}
+
+    neighbors: list[dict] = []
+    if not skip_arbitrate and _ARBITRATE_ENABLED:
+        try:
+            # FTS5 treats the raw sentence as implicit AND — misses near-neighbors
+            # that differ by any token. OR-join meaningful tokens (≥2 chars,
+            # alphanumeric or CJK) for semantic-ish matching.
+            tokens = re.findall(r"[\w\u4e00-\u9fff]{2,}", content)[:10]
+            if tokens:
+                fts_query = " OR ".join(tokens)
+                neighbors = retriever.search(
+                    query=fts_query, category=None, min_trust=0.3, limit=3
+                )
+        except Exception:
+            neighbors = []
+        # Drop exact self-matches (defensive; add_fact dedupes by content anyway)
+        neighbors = [n for n in neighbors if n.get("content") != content]
+
+    decision = (
+        arbitrate(content, neighbors) if neighbors else
+        {"action": "ADD", "target_id": None, "reason": "no-neighbors"}
+    )
+    action = decision["action"]
+
+    if action == "NONE":
+        return {
+            "fact_id": None, "action": "NONE",
+            "reason": decision.get("reason"),
+        }
+
+    if action == "DELETE":
+        target = decision["target_id"]
+        ok = store.tombstone_fact(target)
+        return {
+            "fact_id": None, "action": "DELETE",
+            "tombstoned": target if ok else None,
+            "reason": decision.get("reason"),
+        }
+
+    if action == "UPDATE":
+        target = decision["target_id"]
+        fact_id = store.add_fact(
+            content=content, category=category, tags=tags,
+            source=source, confidence=confidence,
+        )
+        store.tombstone_fact(target, superseded_by=fact_id)
+        return {
+            "fact_id": fact_id, "action": "UPDATE",
+            "tombstoned": target,
+            "reason": decision.get("reason"),
+        }
+
+    # ADD (default + fallback)
+    fact_id = store.add_fact(
+        content=content, category=category, tags=tags,
+        source=source, confidence=confidence,
+    )
+    return {
+        "fact_id": fact_id, "action": "ADD",
+        "reason": decision.get("reason", ""),
+    }
+
+
+# ── Command dispatch ─────────────────────────────────────────────────
 
 def main():
     if len(sys.argv) < 3:
@@ -42,7 +241,8 @@ def main():
 
     try:
         store = MemoryStore(db_path=db_path)
-        retriever = FactRetriever(store, temporal_decay_half_life=90)
+        # temporal_decay_half_life=0 — decay is disabled project-wide
+        retriever = FactRetriever(store, temporal_decay_half_life=0)
 
         if command == "search":
             result = retriever.search(
@@ -52,13 +252,15 @@ def main():
                 limit=args.get("limit", 5),
             )
         elif command == "add":
-            fact_id = store.add_fact(
+            result = apply_fact_write(
+                store, retriever,
                 content=args["content"],
                 category=args.get("category", "general"),
                 tags=args.get("tags", ""),
                 source=args.get("source", "unknown"),
+                confidence=args.get("confidence", "default"),
+                skip_arbitrate=args.get("skip_arbitrate", False),
             )
-            result = {"fact_id": fact_id}
         elif command == "session_search":
             result = retriever.session_search(
                 query=args.get("query", ""),
@@ -97,24 +299,44 @@ def main():
                 helpful=args["helpful"],
             )
         elif command == "remove":
-            ok = store.remove_fact(fact_id=args["fact_id"])
-            result = {"removed": ok}
+            # Default soft-delete — backwards-compat name, now tombstones.
+            ok = store.tombstone_fact(args["fact_id"])
+            result = {"tombstoned": ok}
+        elif command == "tombstone":
+            ok = store.tombstone_fact(
+                args["fact_id"],
+                superseded_by=args.get("superseded_by"),
+            )
+            result = {"tombstoned": ok}
+        elif command == "purge":
+            ok = store.purge_fact(args["fact_id"])
+            result = {"purged": ok}
+        elif command == "purge_transient":
+            n = store.purge_transient(
+                categories=tuple(args.get("categories", ["transient_state", "session_context"])),
+                max_age_days=args.get("max_age_days", 7),
+            )
+            result = {"purged": n}
+        elif command == "arbitrate":
+            result = arbitrate(args["content"], args.get("neighbors", []))
         elif command == "batch":
             results = []
             for op in args.get("operations", []):
                 cmd = op["command"]
                 op_args = op.get("args", {})
                 if cmd == "add":
-                    fact_id = store.add_fact(
+                    results.append(apply_fact_write(
+                        store, retriever,
                         content=op_args["content"],
                         category=op_args.get("category", "general"),
                         tags=op_args.get("tags", ""),
                         source=op_args.get("source", "unknown"),
-                    )
-                    results.append({"fact_id": fact_id})
+                        confidence=op_args.get("confidence", "default"),
+                        skip_arbitrate=op_args.get("skip_arbitrate", False),
+                    ))
                 elif cmd == "remove":
-                    ok = store.remove_fact(fact_id=op_args["fact_id"])
-                    results.append({"removed": ok})
+                    ok = store.tombstone_fact(op_args["fact_id"])
+                    results.append({"tombstoned": ok})
                 else:
                     results.append({"error": f"Unsupported batch command: {cmd}"})
             result = results

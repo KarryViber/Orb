@@ -182,13 +182,16 @@ export async function storeConversation({ userText, responseText, threadTs, user
     const facts = await extractFacts(userText, responseText);
 
     if (facts.length > 0) {
-      // Batch all adds into a single Python subprocess call
+      // Batch all adds into a single Python subprocess call.
+      // Confidence from extract.py drives write-time trust in store.add_fact
+      // (confirmed=0.9 / default=0.5 / speculative=0.2, then trust_frozen=1).
       const operations = facts.map((fact) => ({
         command: 'add',
         args: {
           content: fact.content,
           category: fact.category || 'conversation',
           tags,
+          confidence: fact.confidence || 'default',
         },
       }));
       await holographicBatchBridge(db, operations).catch(() => {});
@@ -300,57 +303,21 @@ export async function storeCorrectionLesson({ userText, responseText, threadHist
   } catch { /* degrade gracefully */ }
 }
 
-const DECAY_POLICIES = {
-  lesson:       { maxAgeDays: 37,  minTrust: 0.2  },
-  conversation: { maxAgeDays: 30,  minTrust: 0.1  },
-  decision:     { maxAgeDays: 60,  minTrust: 0.15 },
-  entity:       { maxAgeDays: 60,  minTrust: 0.15 },
-  event:        { maxAgeDays: 60,  minTrust: 0.15 },
-  knowledge:    { maxAgeDays: 90,  minTrust: 0.1  },
-  preference:   { maxAgeDays: 90,  minTrust: 0.1  },
-  instruction:  { maxAgeDays: 90,  minTrust: 0.1  },
-  reference:    { maxAgeDays: 120, minTrust: 0.1  },
-  environment:  { maxAgeDays: 120, minTrust: 0.1  },
-};
-const DEFAULT_DECAY_POLICY = { maxAgeDays: 60, minTrust: 0.15 };
-
 /**
- * Decay stale facts across all categories.
- * Each category has its own retention policy (DECAY_POLICIES).
+ * Purge transient-category facts older than max_age_days.
+ * These are the only facts we hard-delete — durable facts go through tombstone
+ * via bridge's arbitration / feedback paths instead.
  */
-export async function decayFacts(dbPath) {
-  if (!MEMORY_ENABLED || !dbPath) return;
+export async function purgeTransient(dbPath, { categories, maxAgeDays = 7 } = {}) {
+  if (!MEMORY_ENABLED || !dbPath) return { purged: 0 };
   try {
-    const PAGE = 500;
-    let offset = 0;
-    const allToRemove = [];
-    const now = Date.now();
-
-    // Paginate to handle DBs > 500 facts (#19)
-    while (true) {
-      const facts = await holographicBridge(dbPath, 'list', {
-        min_trust: 0.0,
-        limit: PAGE,
-        offset,
-      });
-      if (!Array.isArray(facts) || facts.length === 0) break;
-
-      for (const fact of facts) {
-        const policy = DECAY_POLICIES[fact.category] || DEFAULT_DECAY_POLICY;
-        const age = (now - new Date(fact.created_at || 0).getTime()) / (1000 * 60 * 60 * 24);
-        if (age > policy.maxAgeDays && (fact.trust_score || 0.5) < policy.minTrust) {
-          allToRemove.push({ command: 'remove', args: { fact_id: fact.fact_id } });
-        }
-      }
-
-      if (facts.length < PAGE) break;
-      offset += PAGE;
-    }
-
-    if (allToRemove.length > 0) {
-      await holographicBatchBridge(dbPath, allToRemove).catch(() => {});
-    }
-  } catch { /* degrade gracefully */ }
+    const args = { max_age_days: maxAgeDays };
+    if (categories) args.categories = categories;
+    const result = await holographicBridge(dbPath, 'purge_transient', args);
+    return result || { purged: 0 };
+  } catch {
+    return { purged: 0 };
+  }
 }
 
 /**

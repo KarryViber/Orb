@@ -3,7 +3,7 @@ import { readdirSync, readFileSync, existsSync, statSync, unlinkSync } from 'nod
 import { info, error as logError, warn } from './log.js';
 import { taskQueue } from './queue.js';
 import { sanitizeErrorText } from './format-utils.js';
-import { listFacts, storeLesson, storeCorrectionLesson, decayFacts, lintMemory } from './memory.js';
+import { listFacts, storeLesson, storeCorrectionLesson, purgeTransient, lintMemory } from './memory.js';
 import { spawnWorker } from './spawn.js';
 const TAG = 'scheduler';
 const DRAIN_TIMEOUT = 30_000;
@@ -538,8 +538,12 @@ export class Scheduler {
     // Pre-fetch high-trust facts from holographic
     const dbPath = join(profile.dataDir, 'memory.db');
 
-    // 顺带清理过期低 trust facts（分层衰减策略）
-    await decayFacts(dbPath).catch(() => {});
+    // 清理瞬时类别（transient_state / session_context）超过 7 天的老 fact
+    // 其它类别走墓碑路径（tombstone）而非时间衰减，见 bridge.py arbitration
+    const transientReport = await purgeTransient(dbPath, { maxAgeDays: 7 }).catch(() => ({ purged: 0 }));
+    if (transientReport.purged > 0) {
+      info(TAG, `purged ${transientReport.purged} transient fact(s)`);
+    }
     // 健康检查：清理孤儿和重复 facts
     const lintReport = await lintMemory(dbPath, { fix: true }).catch(() => ({}));
     if (lintReport.actions_taken?.length > 0) {
