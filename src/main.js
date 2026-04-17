@@ -127,6 +127,7 @@ async function start() {
               userId: null,
               platform: 'cron',
               model: job.model || null,
+              effort: job.effort || null,
               profile: {
                 name: job.profileName,
                 soulDir: profilePaths.soulDir,

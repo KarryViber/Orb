@@ -74,10 +74,24 @@ Job format:
   "profileName": "default",
   "enabled": true,
   "repeat": { "times": null, "completed": 0 },
+  "model": "haiku",
+  "effort": "low",
   "nextRunAt": "2026-04-15T09:00:00+09:00",
   "lastRunAt": null, "lastStatus": null, "lastError": null
 }
 ```
+
+Optional fields:
+- `"model"`: `"haiku"` | `"sonnet"` | `"opus"` (default: system default, usually opus)
+- `"effort"`: `"low"` | `"medium"` | `"high"` | `"xhigh"` | `"max"` (Opus defaults xhigh)
+
+Token tier guidelines:
+| Task type | model | effort |
+|-----------|-------|--------|
+| Script-driven / templated output | `haiku` | `low` |
+| Summary / aggregation | `sonnet` | `medium` |
+| Knowledge distillation / decision review | `sonnet` | `high` |
+| Deep analysis / client-facing (rarely cron) | `opus` | `xhigh` |
 
 Schedule types: `"0 9 * * *"` (cron), `"every 30m"` (interval), `"2h"` / ISO (one-shot).
 Agents manage tasks by directly reading/writing cron-jobs.json (Claude CLI native file operations).

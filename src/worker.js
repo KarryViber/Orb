@@ -10,7 +10,7 @@ import { storeConversation } from './memory.js';
  * Worker IPC Protocol
  *
  * Scheduler -> Worker:
- *   { type: 'task', userText, fileContent, imagePaths, threadTs, channel, userId, platform, threadHistory, profile, model }
+ *   { type: 'task', userText, fileContent, imagePaths, threadTs, channel, userId, platform, threadHistory, profile, model, effort }
  *   { type: 'approval_result', approved, scope, userId }
  *   { type: 'inject', userText, fileContent?, imagePaths? }
  *
@@ -45,7 +45,7 @@ process.on('message', async (msg) => {
   }
   if (msg.type !== 'task') return;
 
-  let { userText, fileContent, imagePaths, threadTs, channel, userId, platform, profile, threadHistory, model } = msg;
+  let { userText, fileContent, imagePaths, threadTs, channel, userId, platform, profile, threadHistory, model, effort } = msg;
 
   // IPC profile path validation — prevent path traversal
   if (profile?.workspaceDir && profile?.dataDir) {
@@ -128,6 +128,7 @@ process.on('message', async (msg) => {
     const streamArgs = [
       '--max-turns', String(MAX_TURNS),
       ...(model || process.env.CLAUDE_MODEL ? ['--model', model || process.env.CLAUDE_MODEL] : []),
+      ...(effort || process.env.CLAUDE_EFFORT ? ['--effort', effort || process.env.CLAUDE_EFFORT] : []),
       '--input-format', 'stream-json',
       '--output-format', 'stream-json',
       '--verbose',

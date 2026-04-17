@@ -104,6 +104,21 @@ export class Scheduler {
     }
     info(TAG, `profile resolved: user=${userId} → ${profile.name} (${profile.workspaceDir})`);
 
+    // 消息前缀解析模型 / effort（可选覆盖）
+    let effectiveModel = null;
+    let effectiveEffort = null;
+    let effectiveText = userText || '';
+    const modelMatch = effectiveText.match(/^\[(haiku|sonnet|opus)\]\s+/i);
+    if (modelMatch) {
+      effectiveModel = modelMatch[1].toLowerCase();
+      effectiveText = effectiveText.slice(modelMatch[0].length);
+    }
+    const effortMatch = effectiveText.match(/^\[effort:(low|medium|high|xhigh|max)\]\s+/i);
+    if (effortMatch) {
+      effectiveEffort = effortMatch[1].toLowerCase();
+      effectiveText = effectiveText.slice(effortMatch[0].length);
+    }
+
     let typingSet = false;
     try {
       await adapter.setTyping(channel, threadTs, 'is thinking…');
@@ -123,7 +138,7 @@ export class Scheduler {
       ({ worker } = spawnWorker({
         task: {
           type: 'task',
-          userText,
+          userText: effectiveText,
           fileContent,
           imagePaths: imagePaths || [],
           threadTs,
@@ -131,6 +146,8 @@ export class Scheduler {
           userId,
           platform,
           threadHistory: task.threadHistory,
+          model: effectiveModel,
+          effort: effectiveEffort,
           profile: {
             name: profile.name,
             soulDir: profile.soulDir,
@@ -398,6 +415,8 @@ export class Scheduler {
         userId: null,
         platform: 'system',
         threadHistory: null,
+        model: 'haiku',
+        effort: 'low',
         profile: {
           name: profile.name,
           soulDir: profile.soulDir,
@@ -553,6 +572,8 @@ export class Scheduler {
         userId: null,
         platform: 'system',
         threadHistory: null,
+        model: 'haiku',
+        effort: 'low',
         profile: {
           name: profile.name,
           soulDir: profile.soulDir,
