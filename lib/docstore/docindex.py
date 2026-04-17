@@ -36,18 +36,46 @@ else:
     PROJECTS_ROOT = Path(_projects_root)
     REGISTRY_PATH = PROJECTS_ROOT / "registry.md"
 
+# DOC_ROOT enables the wide-scan mode (work/). When unset, falls back to
+# legacy behavior scanning only PROJECTS_ROOT/*/{00_source,...}.
+_doc_root = _os.environ.get("DOC_ROOT", "")
+DOC_ROOT = Path(_doc_root) if _doc_root else None
+
 _doc_index_db = _os.environ.get("DOC_INDEX_DB", "")
 DEFAULT_DB_PATH = Path(_doc_index_db) if _doc_index_db else None
 MAX_CHUNK_CHARS = 1200
 MIN_CHUNK_CHARS = 300
 OVERLAP_CHARS = 180
 
+# Legacy mode: per-project fixed subdirs with per-subdir allowed suffixes.
 INCLUDE_DIR_EXTS = {
     "00_source": {".md", ".docx", ".pdf"},
     "01_meetings": {".md", ".docx", ".pdf"},
     "02_draft": {".md", ".docx", ".pdf"},
     "03_delivery": {".md", ".docx", ".pdf"},
 }
+
+# Wide-scan mode: uniform allowed suffixes across the whole tree.
+ALLOWED_SUFFIXES = {".md", ".docx", ".pdf"}
+
+# Directory segment names that exclude the entire subtree in wide-scan mode.
+# Draft-family dirs are excluded to reduce noise in agent retrieval.
+EXCLUDE_DIR_SEGMENTS = {
+    "02_draft",
+    "01_briefs",
+    "02_drafts",
+    "03_publish_packets",
+    "receipts",
+    "slides",
+    "node_modules",
+    ".git",
+    ".obsidian",
+    "brand-kit",
+    "__pycache__",
+}
+
+# Known doc_type segments inside a project directory.
+KNOWN_PROJECT_DOC_TYPES = {"00_source", "01_meetings", "03_delivery"}
 
 EXCLUDE_SUFFIXES = {
     ".drawio",
@@ -76,8 +104,10 @@ EXCLUDE_PATH_SUBSTRINGS = (
 # Higher multiplier = more negative = ranked higher.
 DOC_TYPE_BOOST = {
     "03_delivery": 1.5,   # 最高优先：确定性交付物
+    "published": 1.3,     # articles/04_published / 05_archive
     "00_source": 1.2,     # 高优先：客户原件
     "01_meetings": 1.0,   # 正常：会议纪要
+    "reference": 1.0,     # partners/psr/杂项正式材料
     "02_draft": 0.6,      # 降权：编辑中草稿
 }
 
@@ -209,10 +239,80 @@ def should_index(path: Path, doc_type: str) -> bool:
     return suffix in allowed
 
 
+def derive_ids_wide(
+    rel_parts: tuple[str, ...],
+    dir_to_slug: dict[str, str],
+) -> tuple[str, str, str] | None:
+    """Map a path (relative to DOC_ROOT) to (slug, project_dir, doc_type).
+
+    Returns None if the file should not be indexed (top-level or unknown area).
+    """
+    if not rel_parts or len(rel_parts) < 2:
+        return None
+    top = rel_parts[0]
+    if top == "dyna" and len(rel_parts) >= 3:
+        domain = rel_parts[1]
+        if domain == "projects" and len(rel_parts) >= 4:
+            proj = rel_parts[2]
+            slug = dir_to_slug.get(proj, proj)
+            seg = rel_parts[3]
+            doc_type = seg if seg in KNOWN_PROJECT_DOC_TYPES else "reference"
+            return slug, proj, doc_type
+        if domain == "partners" and len(rel_parts) >= 4:
+            partner = rel_parts[2]
+            return f"partners-{partner}", f"partners/{partner}", "reference"
+        if domain == "psr":
+            return "psr", "psr", "reference"
+        # dyna top-level files (INDEX.md, lark-group-index.md)
+        return "dyna", "dyna", "reference"
+    if top == "articles" and len(rel_parts) >= 3:
+        section = rel_parts[1]
+        if section in {"04_published", "05_archive"}:
+            return "articles", "articles", "published"
+        # 01_briefs/02_drafts/03_publish_packets 已被 EXCLUDE_DIR_SEGMENTS 挡掉
+        return None
+    return None
+
+
+def should_index_wide(path: Path) -> bool:
+    if path.name in EXCLUDE_NAME_SET:
+        return False
+    parts = path.parts
+    if any(part in EXCLUDE_DIR_SEGMENTS for part in parts):
+        return False
+    if any(part in EXCLUDE_PATH_PARTS for part in parts):
+        return False
+    posix = path.as_posix()
+    if any(fragment in posix for fragment in EXCLUDE_PATH_SUBSTRINGS):
+        return False
+    suffix = path.suffix.lower()
+    if suffix in EXCLUDE_SUFFIXES:
+        return False
+    return suffix in ALLOWED_SUFFIXES
+
+
 def iter_candidate_files(slug_filter: str | None = None) -> Iterable[CandidateFile]:
+    dir_to_slug = load_registry_dir_slug_map()
+
+    if DOC_ROOT and DOC_ROOT.exists():
+        for path in sorted(DOC_ROOT.rglob("*")):
+            if not path.is_file():
+                continue
+            if not should_index_wide(path):
+                continue
+            rel = path.relative_to(DOC_ROOT).parts
+            ids = derive_ids_wide(rel, dir_to_slug)
+            if not ids:
+                continue
+            slug, project_dir, doc_type = ids
+            if slug_filter and slug != slug_filter:
+                continue
+            yield CandidateFile(path=path, slug=slug, project_dir=project_dir, doc_type=doc_type)
+        return
+
+    # Legacy mode: PROJECTS_ROOT/*/docType/**
     if not PROJECTS_ROOT or not PROJECTS_ROOT.exists():
         return
-    dir_to_slug = load_registry_dir_slug_map()
     for project_dir in sorted(PROJECTS_ROOT.iterdir()):
         if not project_dir.is_dir() or project_dir.name.startswith("."):
             continue
@@ -488,8 +588,10 @@ def search_rows(conn: sqlite3.Connection, query: str, slug: str | None, doc_type
                 snippet(chunks_fts, 5, '[', ']', ' … ', 18) AS snippet,
                 bm25(chunks_fts, 3.5, 2.0, 1.8, 1.8, 1.5, 1.0) * CASE c.doc_type
                     WHEN '03_delivery' THEN 1.5
+                    WHEN 'published'   THEN 1.3
                     WHEN '00_source'   THEN 1.2
                     WHEN '01_meetings' THEN 1.0
+                    WHEN 'reference'   THEN 1.0
                     WHEN '02_draft'    THEN 0.6
                     ELSE 1.0
                 END AS score
@@ -583,7 +685,7 @@ def command_update(args: argparse.Namespace) -> int:
             )
         conn.execute(
             "INSERT INTO index_meta(key, value) VALUES('projects_root', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (str(PROJECTS_ROOT),),
+            (str(DOC_ROOT or PROJECTS_ROOT),),
         )
         conn.commit()
 
