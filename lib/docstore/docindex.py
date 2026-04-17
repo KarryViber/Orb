@@ -93,11 +93,18 @@ EXCLUDE_SUFFIXES = {
     ".py",
 }
 
-EXCLUDE_NAME_SET = {".DS_Store"}
-EXCLUDE_PATH_PARTS = {"slides", "node_modules", ".git", ".obsidian", "brand-kit"}
+EXCLUDE_NAME_SET = {
+    ".DS_Store",
+    "CLAUDE.md",          # agent 指示文件，非业务资料
+    "INDEX.md",            # 目录索引，非业务资料
+    "INDEX_TEMPLATE.md",   # 模板占位
+    "registry.md",         # slug 映射表
+}
+EXCLUDE_PATH_PARTS = {"slides", "node_modules", ".git", ".obsidian", "brand-kit", ".pytest_cache"}
 EXCLUDE_PATH_SUBSTRINGS = (
     "/archived/",
     "_archived_",
+    "/voice-booking-demo/code/",  # 代码仓内的 README/prompts 非业务文档
 )
 
 # doc_type ranking boost: multiplied with bm25 (negative scores).
@@ -276,6 +283,8 @@ def derive_ids_wide(
 
 def should_index_wide(path: Path) -> bool:
     if path.name in EXCLUDE_NAME_SET:
+        return False
+    if path.name.startswith("~$"):  # Office lock files
         return False
     parts = path.parts
     if any(part in EXCLUDE_DIR_SEGMENTS for part in parts):
