@@ -62,12 +62,14 @@ Orb sits between your messaging platform and Claude Code. It adds what Claude Co
 
 A local, embedding-free memory system built on [Holographic Reduced Representations](https://en.wikipedia.org/wiki/Holographic_reduced_representation) (HRR) + SQLite FTS5.
 
-- **No external APIs** — all memory operations run locally. No data leaves your machine.
+- **Local-first storage** — all facts live in a local SQLite DB; retrieval runs on-device. The only outbound call is a small Haiku arbitration per write, routed through the same Claude Code CLI the agent itself uses (no extra SDK, no separate API key).
 - **Three retrieval modes**: keyword (FTS5/BM25), token overlap (Jaccard), and algebraic (HRR phase vectors) — combined via hybrid scoring
 - **Automatic fact extraction** — conversations are decomposed into categorized facts (preferences, decisions, knowledge, lessons)
-- **Trust-scored decay** — facts decay over time by category. Lessons persist (90-day half-life); conversations fade (30-day). Frequently retrieved facts get trust boosts.
-- **Self-healing** — daily memory-lint detects orphaned facts, duplicates, and weak lessons. Auto-fix removes noise without manual intervention.
-- **Contradiction detection** — flags facts with high entity overlap but low content similarity
+- **Write-time LLM arbitration** — on each new fact, top-3 near-neighbors are retrieved and a Haiku call decides `ADD` / `UPDATE` / `DELETE` / `NONE` (inspired by [mem0](https://github.com/mem0ai/mem0)). Conflicts are resolved at write time, not by time-based decay.
+- **Bi-temporal tombstones** — superseded facts are never hard-deleted; they get `invalid_at` + `superseded_by` pointers (inspired by [Graphiti](https://github.com/getzep/graphiti)). Reads filter to valid facts by default; audit queries can surface history.
+- **Frozen trust scores** — trust is set once at write time from extractor confidence (`confirmed` / `default` / `speculative`), then only moved by explicit user feedback. No exponential decay to quietly erase rarely-retrieved-but-true facts (birthdays, preferences).
+- **Transient-only hard delete** — only ephemeral categories (`session_context`, `transient_state`) are purged by age (7-day default). Durable knowledge is kept forever behind tombstones.
+- **Self-healing** — daily memory-lint detects orphaned facts and duplicates. Fail-open arbitration: if the CLI call errors or times out (5s), the fact is stored as `ADD` rather than dropped — memory never blocks the hot path.
 
 ### Self-Evolution
 
@@ -78,7 +80,7 @@ Orb learns from every interaction and refines itself automatically:
 3. **Correction capture** — user corrections → preference facts with asymmetric trust scoring (penalties > rewards)
 4. **Memory sync** (every 6h) — high-trust facts → consolidated into `MEMORY.md` (durable agent memory)
 5. **User profile sync** — preference facts → auto-merged into `USER.md` (the agent's understanding of you)
-6. **Decay & cleanup** — exponential trust decay + orphan removal + duplicate detection
+6. **Conflict resolution** — new facts trigger a Haiku arbitration against near-neighbors; contradictions tombstone older facts instead of silently coexisting
 
 The result: the agent gets better at working with you over time, without you explicitly teaching it.
 
@@ -224,7 +226,7 @@ Best practices:
 Contributions welcome. Key areas:
 
 - **New adapters** — Discord, Telegram, LINE, etc.
-- **Memory improvements** — better extraction, smarter decay
+- **Memory improvements** — better extraction, richer arbitration prompts, smarter near-neighbor selection
 - **Documentation** — guides, examples, translations
 
 ## License
