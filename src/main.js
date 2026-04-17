@@ -68,6 +68,8 @@ async function start() {
 
       scheduler.addAdapter(name, adapter);
 
+      adapter.onReaction = (task) => scheduler.submit(task);
+
       await adapter.start(
         (task) => scheduler.submit(task),
         null,

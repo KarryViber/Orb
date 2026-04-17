@@ -81,6 +81,10 @@ export class SlackAdapter extends PlatformAdapter {
     this._botMessageTs = new Set();
     this._MAX_BOT_TS = 5000;
 
+    // Bot's own individual reply timestamps (for reaction rerun validation)
+    this._botReplyTs = new Set();
+    this._MAX_BOT_REPLY_TS = 5000;
+
     // Thread context cache (60s TTL, avoids hammering Slack API)
     this._threadCtxCache = new Map();
     this._THREAD_CTX_TTL = 60 * 1000;
@@ -88,9 +92,14 @@ export class SlackAdapter extends PlatformAdapter {
     // Pending approvals
     this._pendingApprovals = new Map();
 
+    // Reaction dedupe (30s per ts+reaction, avoids add/remove/add loops)
+    this._reactionDedupCache = new Map();
+    this._REACTION_DEDUP_TTL = 30 * 1000;
+
     // Callbacks (set in start())
     this.onMessage = null;
     this.onInteractive = null;
+    this.onReaction = null;
   }
 
   get botUserId() {
@@ -142,10 +151,20 @@ export class SlackAdapter extends PlatformAdapter {
       arr.splice(0, Math.floor(arr.length / 2));
       this._botMessageTs = new Set(arr);
     }
+    // Evict bot reply timestamps (reaction rerun validation)
+    if (this._botReplyTs.size > this._MAX_BOT_REPLY_TS) {
+      const arr = [...this._botReplyTs];
+      arr.splice(0, Math.floor(arr.length / 2));
+      this._botReplyTs = new Set(arr);
+    }
     // Evict expired thread context cache
     const now = Date.now();
     for (const [key, entry] of this._threadCtxCache) {
       if (now - entry.fetchedAt > this._THREAD_CTX_TTL) this._threadCtxCache.delete(key);
+    }
+    // Evict expired reaction dedupe entries
+    for (const [key, t] of this._reactionDedupCache) {
+      if (now - t > this._REACTION_DEDUP_TTL) this._reactionDedupCache.delete(key);
     }
   }
 
@@ -424,7 +443,10 @@ export class SlackAdapter extends PlatformAdapter {
     if (this._replyBroadcast) params.reply_broadcast = true;
     const result = await this._slack.chat.postMessage(params);
     // Track bot's own messages for auto-participation
-    if (result.ts) this._trackBotMessage(threadTs);
+    if (result.ts) {
+      this._trackBotMessage(threadTs);
+      this._botReplyTs.add(result.ts);
+    }
     return result;
   }
 
@@ -583,6 +605,99 @@ export class SlackAdapter extends PlatformAdapter {
     }
   }
 
+  // --- Reaction handler (🔥 → rerun at xhigh) ---
+
+  async _handleReaction({ event, ack }) {
+    try { await ack(); } catch (_) {}
+
+    if (!event) return;
+    if (event.reaction !== 'fire') return;
+    if (event.item?.type !== 'message') return;
+
+    const { channel, ts: targetTs } = event.item;
+    if (!channel || !targetTs) return;
+
+    // Only bot's own replies are eligible
+    if (!this._botReplyTs.has(targetTs)) {
+      info(TAG, `ignored fire reaction on non-bot message: ${targetTs}`);
+      return;
+    }
+
+    // Dedupe: same ts+reaction within 30s ignored (handles rapid add/remove/add)
+    const dedupKey = `${targetTs}:${event.reaction}`;
+    const now = Date.now();
+    const last = this._reactionDedupCache.get(dedupKey);
+    if (last && now - last < this._REACTION_DEDUP_TTL) {
+      info(TAG, `reaction dedupe: ${dedupKey} (last=${now - last}ms ago)`);
+      return;
+    }
+    this._reactionDedupCache.set(dedupKey, now);
+
+    const thread = await this._fetchThreadForReaction(channel, targetTs);
+    if (!thread) {
+      warn(TAG, `no preceding user message for reaction on ${targetTs}`);
+      return;
+    }
+    const { threadTs, userText, userId } = thread;
+
+    info(TAG, `fire reaction → rerun: thread=${threadTs} target=${targetTs} user=${userId}`);
+
+    if (this.onReaction) {
+      this.onReaction({
+        platform: 'slack',
+        channel,
+        threadTs,
+        targetMessageTs: targetTs,
+        userText: `[effort:xhigh] ${userText}`,
+        userId,
+        threadHistory: null,
+        rerun: true,
+      });
+    }
+  }
+
+  async _fetchThreadForReaction(channel, botMessageTs) {
+    try {
+      // Step 1: fetch the reacted message to discover thread_ts
+      const msgResp = await this._slack.conversations.replies({
+        channel,
+        ts: botMessageTs,
+        limit: 1,
+        inclusive: true,
+      });
+      const botMsg = msgResp.messages?.[0];
+      if (!botMsg) return null;
+      const threadTs = botMsg.thread_ts || botMessageTs;
+
+      // Step 2: fetch full thread, walk backwards from bot msg to nearest user msg
+      const threadResp = await this._slack.conversations.replies({
+        channel,
+        ts: threadTs,
+        limit: 100,
+        inclusive: true,
+      });
+      const messages = threadResp.messages || [];
+
+      const idx = messages.findIndex((m) => m.ts === botMessageTs);
+      if (idx < 0) return null;
+
+      for (let i = idx - 1; i >= 0; i--) {
+        const m = messages[i];
+        if (m.user && m.user !== this._botUserId && !m.bot_id) {
+          return {
+            threadTs,
+            userText: m.text || '',
+            userId: m.user,
+          };
+        }
+      }
+      return null;
+    } catch (err) {
+      logError(TAG, `_fetchThreadForReaction: ${err.message}`);
+      return null;
+    }
+  }
+
   // --- Start ---
 
   async start(onMessage, onInteractive) {
@@ -596,6 +711,7 @@ export class SlackAdapter extends PlatformAdapter {
 
     this._socket.on('message', (evt) => this._handleMessage(evt));
     this._socket.on('interactive', (evt) => this._handleInteractive(evt));
+    this._socket.on('reaction_added', (evt) => this._handleReaction(evt));
 
     this._socket.on('disconnect', (err) => {
       warn(TAG, `socket disconnected: ${err || 'unknown'}`);

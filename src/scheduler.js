@@ -75,6 +75,20 @@ export class Scheduler {
     const { threadTs, channel, platform } = task;
     const adapter = this._getAdapter(platform);
 
+    // Rerun (🔥 reaction): bypass inject, spawn fresh worker. If a worker is
+    // already active on this thread, queue the rerun so it runs after it exits.
+    if (task.rerun) {
+      info(TAG, `rerun submitted: thread=${threadTs} target=${task.targetMessageTs}`);
+      if (this.activeWorkers.has(threadTs)) {
+        info(TAG, `rerun queued: active worker on thread=${threadTs}`);
+        if (!this.threadQueues.has(threadTs)) this.threadQueues.set(threadTs, []);
+        this.threadQueues.get(threadTs).push(task);
+        return;
+      }
+      await this._spawnWorker(task);
+      return;
+    }
+
     if (this.activeWorkers.has(threadTs)) {
       const worker = this.activeWorkers.get(threadTs);
       try {
@@ -178,6 +192,19 @@ export class Scheduler {
     let turnDelivered = false;
     let worker; // declared for closure access in approval_result send
 
+    // Rerun via 🔥 reaction: first emitted payload edits targetMessageTs,
+    // subsequent payloads append as normal replies.
+    let pendingEdit = task.targetMessageTs || null;
+    const emitPayload = async (payload) => {
+      const extra = payload.blocks ? { blocks: payload.blocks } : {};
+      if (pendingEdit) {
+        await adapter.editMessage(channel, pendingEdit, payload.text, extra);
+        pendingEdit = null;
+      } else {
+        await adapter.sendReply(channel, threadTs, payload.text, extra);
+      }
+    };
+
     try {
       ({ worker } = spawnWorker({
         task: {
@@ -218,7 +245,7 @@ export class Scheduler {
                 turnDelivered = true;
                 const payloads = adapter.buildPayloads(text);
                 for (const payload of payloads) {
-                  await adapter.sendReply(channel, threadTs, payload.text, payload.blocks ? { blocks: payload.blocks } : {});
+                  await emitPayload(payload);
                 }
               }
             } catch (err) {
@@ -248,7 +275,7 @@ export class Scheduler {
                 const payloads = adapter.buildPayloads(text || '⚠️ 多次续接仍未生成回复，任务可能需要拆分。请用更小的指令重试。');
                 info(TAG, `sending ${payloads.length} payload(s) to thread=${threadTs}`);
                 for (const payload of payloads) {
-                  await adapter.sendReply(channel, threadTs, payload.text, payload.blocks ? { blocks: payload.blocks } : {});
+                  await emitPayload(payload);
                 }
               } else {
                 turnDelivered = false;
