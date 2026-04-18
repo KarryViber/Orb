@@ -64,6 +64,8 @@ async function start() {
         replyBroadcast: adapterConfig.replyBroadcast || false,
         freeResponseChannels: new Set(adapterConfig.freeResponseChannels || []),
         freeResponseUsers: new Set(adapterConfig.freeResponseUsers || []),
+        dmRouting: adapterConfig.dmRouting || null,
+        getProfilePaths: getProfile,
       });
 
       scheduler.addAdapter(name, adapter);
