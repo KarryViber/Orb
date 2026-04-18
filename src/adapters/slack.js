@@ -1,6 +1,6 @@
 import { WebClient } from '@slack/web-api';
 import { SocketModeClient } from '@slack/socket-mode';
-import { createReadStream } from 'node:fs';
+import { createReadStream, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { info, error as logError, warn } from '../log.js';
@@ -78,6 +78,27 @@ function extractBlockKitText(blocks) {
   return parts.join('\n');
 }
 
+// Compile a regex from config. Returns null on invalid input rather than
+// throwing, so a bad rule disables just that rule instead of crashing routing.
+// Accepts leading `(?i)` / `(?im)` inline flag prefix (PCRE-style, common in
+// human-authored configs) and rewrites it to JS RegExp flags.
+function safeRegex(pattern, flags = '') {
+  if (pattern == null) return null;
+  try {
+    let p = String(pattern);
+    let f = String(flags || '');
+    const m = p.match(/^\(\?([a-z]+)\)/);
+    if (m) {
+      const inline = m[1].toLowerCase();
+      for (const ch of inline) if (!f.includes(ch) && 'gimsuy'.includes(ch)) f += ch;
+      p = p.slice(m[0].length);
+    }
+    return new RegExp(p, f);
+  } catch {
+    return null;
+  }
+}
+
 // --- Incoming file processing ---
 const TEXT_EXTENSIONS = new Set([
   'txt', 'md', 'json', 'csv', 'tsv', 'log', 'py', 'js', 'ts', 'jsx', 'tsx',
@@ -87,7 +108,7 @@ const TEXT_EXTENSIONS = new Set([
 const MAX_FILE_SIZE = 100 * 1024; // 100KB
 
 export class SlackAdapter extends PlatformAdapter {
-  constructor({ botToken, appToken, allowBots, replyBroadcast, freeResponseChannels, freeResponseUsers }) {
+  constructor({ botToken, appToken, allowBots, replyBroadcast, freeResponseChannels, freeResponseUsers, dmRouting, getProfilePaths }) {
     super();
     this._botToken = botToken;
     this._slack = new WebClient(botToken);
@@ -96,6 +117,8 @@ export class SlackAdapter extends PlatformAdapter {
     this._replyBroadcast = replyBroadcast || false;
     this._freeResponseChannels = freeResponseChannels || new Set();
     this._freeResponseUsers = freeResponseUsers || new Set();
+    this._dmRouting = dmRouting || null;
+    this._getProfilePaths = getProfilePaths || null;
     this._botUserId = null;
     this._botId = null;
 
@@ -318,7 +341,40 @@ export class SlackAdapter extends PlatformAdapter {
       totalChars += line.length;
     }
 
-    const content = lines.length > 0 ? lines.join('\n') : null;
+    const PHASE_RE = /\[phase:([a-z-]+)\]/i;
+    const segments = [];
+    let current = { phase: 'legacy', msgs: [] };
+
+    for (const line of lines) {
+      if (line.startsWith('Orb: ')) {
+        const m = line.match(PHASE_RE);
+        if (m) {
+          if (current.msgs.length > 0) segments.push(current);
+          current = { phase: m[1].toLowerCase(), msgs: [line] };
+          continue;
+        }
+      }
+      current.msgs.push(line);
+    }
+    if (current.msgs.length > 0) segments.push(current);
+
+    const folded = [];
+    for (let i = 0; i < segments.length; i++) {
+      const seg = segments[i];
+      const isLast = i === segments.length - 1;
+      if (isLast || seg.phase === 'legacy' || seg.msgs.length <= 2) {
+        folded.push(...seg.msgs);
+      } else {
+        const first = seg.msgs[0];
+        const last = seg.msgs[seg.msgs.length - 1];
+        const middle = seg.msgs.length - 2;
+        folded.push(first);
+        if (middle > 0) folded.push(`… (折叠 ${middle} 条 · phase:${seg.phase}) …`);
+        folded.push(last);
+      }
+    }
+
+    const content = folded.length > 0 ? folded.join('\n') : null;
     this._threadCtxCache.set(cacheKey, { content, fetchedAt: Date.now() });
     return content;
   }
@@ -564,6 +620,177 @@ export class SlackAdapter extends PlatformAdapter {
     this._socket.disconnect();
   }
 
+  // --- DM content-based routing (v2) ---
+  //
+  // Routes 1:1 DM messages to target channels based on rules in
+  // config.adapters.slack.dmRouting. On match:
+  //   1. Posts main card to target channel
+  //   2. Posts thread bootstrap with Karry's original DM text
+  //   3. Synthesizes a task so the scheduler forks a worker in the target thread
+  //   4. DM stays silent (iron rule from v1 spec)
+  // Returns true if routed (caller should skip normal worker dispatch).
+
+  _matchDMRule(rule, text, files) {
+    const m = rule.match || {};
+
+    if (m.hasFile) {
+      if (!files || files.length === 0) return null;
+      const fileRe = m.filenamePattern ? safeRegex(m.filenamePattern) : null;
+      const wantType = m.filetype ? String(m.filetype).toLowerCase() : null;
+      for (const f of files) {
+        const name = f.name || '';
+        const ext = (name.split('.').pop() || '').toLowerCase();
+        const ftype = (f.filetype || '').toLowerCase();
+        if (wantType && ext !== wantType && ftype !== wantType) continue;
+        if (fileRe && !fileRe.test(name)) continue;
+        return {
+          file: f,
+          filename: name,
+          preview: name,
+          original_text: text || '',
+        };
+      }
+      return null;
+    }
+
+    if (m.urlPattern) {
+      const re = safeRegex(m.urlPattern);
+      if (!re) return null;
+      const found = text ? text.match(re) : null;
+      if (!found) return null;
+      return {
+        urlMatched: found[0],
+        preview: this._makePreview(found[0]),
+        original_text: text || '',
+      };
+    }
+
+    return null;
+  }
+
+  _makePreview(s, max = 40) {
+    if (!s) return '';
+    if (s.length <= max) return s;
+    return s.slice(0, max) + '…';
+  }
+
+  _interpRuleTemplate(template, ctx) {
+    return String(template || '').replace(/\{(\w+)\}/g, (_, key) => {
+      const v = ctx[key];
+      return v == null ? '' : String(v);
+    });
+  }
+
+  async _downloadDMFile(file, event, userId) {
+    if (!file?.url_private) throw new Error('no url_private');
+    if (!isSafeUrl(file.url_private)) throw new Error('unsafe URL');
+
+    let inboxDir;
+    if (this._getProfilePaths && userId) {
+      const paths = this._getProfilePaths(userId);
+      inboxDir = join(paths.workspaceDir, 'work', 'inbox');
+    } else {
+      inboxDir = join(homedir(), '.orb', 'dm-inbox');
+    }
+    mkdirSync(inboxDir, { recursive: true });
+
+    const safeName = (file.name || 'file.bin').replace(/[\/\\]/g, '_');
+    const ts = event.ts || String(Date.now());
+    const dest = join(inboxDir, `${ts}_${safeName}`);
+
+    const resp = await fetch(file.url_private, {
+      headers: { Authorization: `Bearer ${this._botToken}` },
+      redirect: 'manual',
+    });
+    if (resp.status >= 300 && resp.status < 400) {
+      const loc = resp.headers.get('location');
+      if (!loc || !isSafeUrl(loc)) throw new Error('unsafe redirect');
+      const resp2 = await fetch(loc);
+      if (!resp2.ok) throw new Error(`HTTP ${resp2.status}`);
+      writeFileSync(dest, Buffer.from(await resp2.arrayBuffer()));
+      return dest;
+    }
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    writeFileSync(dest, Buffer.from(await resp.arrayBuffer()));
+    return dest;
+  }
+
+  async _routeDMMessage(event) {
+    const cfg = this._dmRouting;
+    if (!cfg?.enabled) return { routed: false };
+
+    const rules = Array.isArray(cfg.rules) ? cfg.rules : [];
+    const text = event.text || '';
+    const files = event.files || [];
+
+    let matched = null;
+    for (const rule of rules) {
+      const ctx = this._matchDMRule(rule, text, files);
+      if (ctx) { matched = { rule, ctx }; break; }
+    }
+
+    if (!matched) {
+      return { routed: false, fallback: cfg.dmFallback || 'worker' };
+    }
+
+    const { rule, ctx } = matched;
+
+    try {
+      if (ctx.file) {
+        try {
+          ctx.localPath = await this._downloadDMFile(ctx.file, event, event.user);
+          info(TAG, `DM file downloaded: ${ctx.localPath}`);
+        } catch (err) {
+          warn(TAG, `DM file download failed for rule=${rule.name}: ${err.message}`);
+          ctx.localPath = null;
+        }
+      }
+
+      const mainText = this._interpRuleTemplate(rule.target.mainTemplate, ctx);
+      const mainMsg = await this._slack.chat.postMessage({
+        channel: rule.target.channel,
+        text: mainText,
+        unfurl_links: false,
+      });
+      if (!mainMsg.ts) throw new Error('postMessage returned no ts');
+      this._trackBotMessage(mainMsg.ts);
+      this._trackThread(mainMsg.ts);
+
+      let threadText = this._interpRuleTemplate(rule.target.threadBootstrap, ctx);
+      if (ctx.file) {
+        threadText += ctx.localPath
+          ? `\n\n[附件已下载到: ${ctx.localPath}]`
+          : `\n\n[附件下载失败，请手动从 Slack 获取：${ctx.file.name}]`;
+      }
+
+      await this._slack.chat.postMessage({
+        channel: rule.target.channel,
+        thread_ts: mainMsg.ts,
+        text: threadText,
+      });
+
+      if (this.onMessage) {
+        const task = {
+          userText: threadText,
+          fileContent: '',
+          imagePaths: [],
+          threadTs: mainMsg.ts,
+          channel: rule.target.channel,
+          userId: event.user,
+          platform: 'slack',
+          threadHistory: null,
+        };
+        this.onMessage(task);
+      }
+
+      info(TAG, `DM routed: rule=${rule.name} source_dm=${event.ts} → ${rule.target.channel}/${mainMsg.ts}`);
+      return { routed: true };
+    } catch (err) {
+      logError(TAG, `DM routing failed (rule=${rule.name}): ${err.message}`);
+      return { routed: false, fallback: cfg.dmFallback || 'worker' };
+    }
+  }
+
   // --- Message handler ---
 
   async _handleMessage({ event, ack }) {
@@ -593,6 +820,18 @@ export class SlackAdapter extends PlatformAdapter {
     const threadTs = event.thread_ts || event.ts;
     const tracked = this._isTrackedThread(threadTs);
     const isBotThread = event.thread_ts && this._isBotThread(event.thread_ts);
+
+    // DM content-based routing (v2) — only for 1:1 DMs, not thread replies
+    // (thread follow-ups should go through the existing worker path).
+    if (isDM && channelType === 'im' && !event.thread_ts && this._dmRouting?.enabled) {
+      const outcome = await this._routeDMMessage(event);
+      if (outcome.routed) return;
+      if (outcome.fallback === 'silent') {
+        info(TAG, `DM unmatched, silent fallback: user=${event.user} ts=${event.ts}`);
+        return;
+      }
+      // fallback === 'worker' → fall through to normal handling
+    }
 
     const isFreeResponse = this._freeResponseChannels.has(event.channel) && this._freeResponseUsers.has(event.user);
     if (!isDM && !isMention && !tracked && !isBotThread && !isFreeResponse) return;
