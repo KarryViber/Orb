@@ -56,7 +56,7 @@ npm start            # Production start (managed by launchd)
 ## Conventions
 
 - ESM (type: module), Node >= 18, pure JS
-- Workers are one-shot forks — execute and exit, never reused
+- Workers are short-lived per-thread processes — forked on first message, reused for follow-up messages in the same thread via `inject` IPC, exit on idle timeout, never reused across threads
 - Do not modify core files of a running Orb instance (main/scheduler/worker/adapters) — use spec files for external sessions to execute
 
 ## Cron
@@ -115,10 +115,10 @@ Two-layer separation + framework built-in directives: soul = identity + decision
 
 ### Profile Isolation
 
-- Each profile owns independent `soul/`, `skills/`, `scripts/`, `workspace/`, `data/` directories
-- `userIds` mapping in `config.json` determines which profile a user belongs to
-- `default` profile is the fallback for unmapped users
+- Each profile uses independent `soul/`, `skills/`, `scripts/`, `workspace/`, `data/` paths under `profiles/{name}/`
+- `userIds` mapping in `config.json` determines which profile a user belongs to; unmapped `userId`s are rejected (no `default` fallback)
 - Session data is isolated by `{platform}:{threadTs}` key, stored in each profile's `data/sessions.json`
+- Runtime root/path validation currently hard-checks `workspace/` and `data/`; `soul/` and `scripts/` are resolved per-profile but not enforced by the same guard
 - Adding a user = create profile directory + add mapping in config.json, no source code changes
 
 ### Platform Abstraction
@@ -133,24 +133,23 @@ Two-layer separation + framework built-in directives: soul = identity + decision
 
 Scheduler ↔ Worker communication via Node IPC (process.send/on('message')):
 
-```
-Scheduler → Worker:
-  { type: 'task', userText, fileContent, threadTs, channel, userId, platform, threadHistory, profile }
-  { type: 'approval_result', approved, scope, userId }
+| Direction | Type | Payload | Notes |
+|-----------|------|---------|-------|
+| Scheduler → Worker | `task` | `{ type: 'task', userText, fileContent, imagePaths, threadTs, channel, userId, platform, threadHistory, profile, model, effort, mode?, priorConversation? }` | Initial task for a thread. `mode: 'skill-review'` requires `priorConversation`, which `context.js` injects as review context. |
+| Scheduler → Worker | `approval_result` | `{ type: 'approval_result', approved, scope, userId }` | Resumes a blocked approval request inside the active worker. |
+| Scheduler → Worker | `inject` | `{ type: 'inject', userText, fileContent?, imagePaths? }` | Injects a follow-up user message into the active same-thread Claude CLI session without spawning a new worker. |
+| Worker → Scheduler | `result` | `{ type: 'result', text, toolCount, lastTool?, stopReason? }` | Final payload emitted when the worker is about to exit. |
+| Worker → Scheduler | `error` | `{ type: 'error', error, errorContext? }` | Terminal failure payload. |
+| Worker → Scheduler | `update` | `{ type: 'update', text, messageTs }` | Streaming/progress update for in-thread delivery. |
+| Worker → Scheduler | `file` | `{ type: 'file', filePath, filename }` | Requests adapter-side file upload. |
+| Worker → Scheduler | `approval` | `{ type: 'approval', prompt }` | Requests user approval through the adapter. |
+| Worker → Scheduler | `turn_complete` | `{ type: 'turn_complete', text, toolCount, lastTool, stopReason }` | Signals that one Claude turn finished; scheduler can deliver it while keeping the worker alive for future `inject` messages. |
 
-Worker → Scheduler:
-  { type: 'result', text }
-  { type: 'error', error }
-  { type: 'update', text, messageTs }
-  { type: 'file', filePath, filename }
-  { type: 'approval', prompt }
-```
-
-Adding new message types requires updating both the worker.js header comment and the scheduler.js handler.
+Adding or changing message types/payload fields requires updating `worker.js` header comment, `scheduler.js` handler, and this section together.
 
 ### Immutable Constraints
 
 - **Claude Code CLI is the only agent runtime** — no other LLM SDKs
-- **Workers are one-shot processes** — execute and exit, never reused
+- **Workers are short-lived per-thread processes** — fork on first message, accept same-thread `inject` follow-ups, exit on idle timeout, never reused across threads
 - **Orb runtime must not modify its own source code** — use spec files for external sessions to execute
 - **config.json is the sole routing configuration source** — no hardcoded userId/profile mappings in code
