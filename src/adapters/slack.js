@@ -620,13 +620,14 @@ export class SlackAdapter extends PlatformAdapter {
     this._socket.disconnect();
   }
 
-  // --- DM content-based routing (v2) ---
+  // --- DM content-based routing (v2.1) ---
   //
   // Routes 1:1 DM messages to target channels based on rules in
   // config.adapters.slack.dmRouting. On match:
-  //   1. Posts main card to target channel
-  //   2. Posts thread bootstrap with Karry's original DM text
-  //   3. Synthesizes a task so the scheduler forks a worker in the target thread
+  //   1. Posts main card (short header) to target channel — only visible message
+  //   2. Synthesizes a task whose userText is the interpolated workerPrompt
+  //      (NOT posted to Slack — passed straight to worker)
+  //   3. Worker produces the 3-section Block Kit approval card as its first output
   //   4. DM stays silent (iron rule from v1 spec)
   // Returns true if routed (caller should skip normal worker dispatch).
 
@@ -658,14 +659,32 @@ export class SlackAdapter extends PlatformAdapter {
       if (!re) return null;
       const found = text ? text.match(re) : null;
       if (!found) return null;
+      const url = found[0];
       return {
-        urlMatched: found[0],
-        preview: this._makePreview(found[0]),
+        urlMatched: url,
+        url_matched: url,
+        preview: this._makePreview(url),
+        repo_slug: this._extractRepoSlug(url),
         original_text: text || '',
       };
     }
 
     return null;
+  }
+
+  _extractRepoSlug(url) {
+    if (!url) return '';
+    const m = String(url).match(/github\.com\/([^/\s]+)\/([^/\s?#]+)/);
+    if (!m) return '';
+    const owner = m[1];
+    const name = m[2].replace(/\.git$/, '');
+    return `${owner}/${name}`;
+  }
+
+  _dateMMDD(d = new Date()) {
+    const mm = String(d.getMonth() + 1).padStart(2, '0');
+    const dd = String(d.getDate()).padStart(2, '0');
+    return `${mm}/${dd}`;
   }
 
   _makePreview(s, max = 40) {
@@ -746,6 +765,8 @@ export class SlackAdapter extends PlatformAdapter {
         }
       }
 
+      ctx.date_mmdd = this._dateMMDD();
+
       const mainText = this._interpRuleTemplate(rule.target.mainTemplate, ctx);
       const mainMsg = await this._slack.chat.postMessage({
         channel: rule.target.channel,
@@ -756,22 +777,17 @@ export class SlackAdapter extends PlatformAdapter {
       this._trackBotMessage(mainMsg.ts);
       this._trackThread(mainMsg.ts);
 
-      let threadText = this._interpRuleTemplate(rule.target.threadBootstrap, ctx);
+      const tpl = rule.target.workerPrompt || rule.target.threadBootstrap || '';
+      let workerPrompt = this._interpRuleTemplate(tpl, ctx);
       if (ctx.file) {
-        threadText += ctx.localPath
+        workerPrompt += ctx.localPath
           ? `\n\n[附件已下载到: ${ctx.localPath}]`
           : `\n\n[附件下载失败，请手动从 Slack 获取：${ctx.file.name}]`;
       }
 
-      await this._slack.chat.postMessage({
-        channel: rule.target.channel,
-        thread_ts: mainMsg.ts,
-        text: threadText,
-      });
-
       if (this.onMessage) {
         const task = {
-          userText: threadText,
+          userText: workerPrompt,
           fileContent: '',
           imagePaths: [],
           threadTs: mainMsg.ts,
