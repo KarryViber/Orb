@@ -186,7 +186,7 @@ export class Scheduler {
     // Typing refresh interval — kept alive until first response or exit
     const typingInterval = typingSet ? setInterval(async () => {
       try { await adapter.setTyping(channel, threadTs, 'is thinking…'); } catch (_) {}
-    }, 10_000) : null;
+    }, 5_000) : null;
 
     let responded = false;
     let turnDelivered = false;
@@ -533,143 +533,25 @@ export class Scheduler {
     this._spawnMemorySync(task);
   }
 
+  // Memory housekeeping: purge transient facts, lint memory.db, GC image cache.
+  // MEMORY.md / USER.md distillation is retired — CLI-native auto-memory
+  // (~/.claude/projects/{cwd}/memory/) handles persistent preference tracking.
   async _spawnMemorySync(task) {
-    const { userId, platform } = task;
+    const { userId } = task;
     const profile = this.getProfile(userId);
-    const memoryMdPath = join(profile.dataDir, 'MEMORY.md');
-    const userMdPath = join(profile.soulDir, 'USER.md');
-
-    // Pre-fetch high-trust facts from holographic
     const dbPath = join(profile.dataDir, 'memory.db');
 
-    // 清理瞬时类别（transient_state / session_context）超过 7 天的老 fact
-    // 其它类别走墓碑路径（tombstone）而非时间衰减，见 bridge.py arbitration
     const transientReport = await purgeTransient(dbPath, { maxAgeDays: 7 }).catch(() => ({ purged: 0 }));
     if (transientReport.purged > 0) {
       info(TAG, `purged ${transientReport.purged} transient fact(s)`);
     }
-    // 健康检查：清理孤儿和重复 facts
+
     const lintReport = await lintMemory(dbPath, { fix: true }).catch(() => ({}));
     if (lintReport.actions_taken?.length > 0) {
-      info(TAG, `lesson lint: ${lintReport.actions_taken.length} actions — ${lintReport.actions_taken.join(', ')}`);
+      info(TAG, `memory lint: ${lintReport.actions_taken.length} actions — ${lintReport.actions_taken.join(', ')}`);
     }
 
-    let allFacts = [];
-    let prefFacts = [];
-    try {
-      [allFacts, prefFacts] = await Promise.all([
-        listFacts(dbPath, { minTrust: 0.5, limit: 50 }),
-        listFacts(dbPath, { category: 'preference', minTrust: 0.3, limit: 30 }),
-      ]);
-    } catch (err) {
-      logError(TAG, `memory sync: failed to fetch facts: ${err.message}`);
-      return;
-    }
-
-    if (allFacts.length === 0 && prefFacts.length === 0) {
-      info(TAG, 'memory sync: no facts to sync, skipping');
-      return;
-    }
-
-    // Read current files
-    let currentMemory = '';
-    let currentUser = '';
-    try { currentMemory = readFileSync(memoryMdPath, 'utf8'); } catch {}
-    try { currentUser = readFileSync(userMdPath, 'utf8'); } catch {}
-
-    const factsBlock = allFacts.map(f =>
-      `[${f.category || 'general'}|trust:${(f.trust_score ?? 0).toFixed(2)}] ${f.content}`
-    ).join('\n');
-
-    const prefBlock = prefFacts.map(f =>
-      `[trust:${(f.trust_score ?? 0).toFixed(2)}] ${f.content}`
-    ).join('\n');
-
-    const syncPrompt = [
-      'You are a memory consolidation agent. Two tasks:',
-      '',
-      '## Task 1: Update MEMORY.md',
-      `File: ${memoryMdPath}`,
-      'Current content:',
-      '```',
-      currentMemory || '(empty)',
-      '```',
-      '',
-      'High-trust facts from holographic memory:',
-      '```',
-      factsBlock || '(none)',
-      '```',
-      '',
-      'Rules:',
-      '- Each entry is a DIGEST, not raw text. Max ~100 chars per entry.',
-      '  Good: "- User prefers markdown list format for MEMORY.md"',
-      '  Bad:  "- User said \'嗯，更markdown一点吧\' and Orb changed the format from § to markdown lists"',
-      '- Details stay in holographic memory. MEMORY.md only keeps the conclusion/pointer.',
-      '- Remove outdated/contradicted entries (superseded by newer facts)',
-      '- Format: markdown list (- per entry), use ## headings to group by category',
-      '- Keep total under 2000 chars',
-      '- Preserve: durable preferences, environment facts, key decisions, lessons learned',
-      '- Skip: one-off results, temporary plans, trivial exchanges, implementation details',
-      '',
-      '## Task 2: Update USER.md',
-      `File: ${userMdPath}`,
-      'Current content:',
-      '```',
-      currentUser || '(empty)',
-      '```',
-      '',
-      'Preference/instruction facts:',
-      '```',
-      prefBlock || '(none)',
-      '```',
-      '',
-      'Rules:',
-      '- Merge confirmed user preferences and corrections into USER.md',
-      '- Keep the existing structure/sections, add or update entries',
-      '- Only modify sections relevant to the new facts',
-      '- Do NOT remove existing content unless directly contradicted',
-      '',
-      'Write both files. If no meaningful changes needed for either, skip that file.',
-    ].join('\n');
-
-    if (this._backgroundWorkers.size >= this._maxBackgroundWorkers) {
-      info(TAG, 'background worker limit reached, skipping memory sync');
-      return;
-    }
-
-    // Piggyback image GC on memory sync cadence
     cleanupImages(profile.workspaceDir);
-
-    let worker;
-    ({ worker } = spawnWorker({
-      task: {
-        type: 'task',
-        userText: syncPrompt,
-        fileContent: '',
-        threadTs: `memory-sync-${Date.now()}`,
-        channel: null,
-        userId: null,
-        platform: 'system',
-        threadHistory: null,
-        model: 'haiku',
-        effort: 'low',
-        profile: {
-          name: profile.name,
-          soulDir: profile.soulDir,
-          scriptsDir: profile.scriptsDir,
-          workspaceDir: profile.workspaceDir,
-          dataDir: profile.dataDir,
-        },
-      },
-      timeout: 120_000,
-      label: `memory-sync:${profile.name}`,
-      onMessage: () => {},
-      onExit: (code) => {
-        this._backgroundWorkers.delete(worker);
-        info(TAG, `memory sync worker exited: code=${code} profile=${profile.name}`);
-      },
-    }));
-    this._backgroundWorkers.add(worker);
   }
 
   shutdown(signal) {
