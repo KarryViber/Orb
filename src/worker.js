@@ -132,7 +132,7 @@ process.on('message', async (msg) => {
     if (sessionId) {
       streamArgs.push('--resume', sessionId);
     } else if (prompt.systemPrompt) {
-      streamArgs.push('--system-prompt', prompt.systemPrompt);
+      streamArgs.push('--append-system-prompt', prompt.systemPrompt);
     }
 
     console.log(`[worker] cli args: ${streamArgs.join(' ')}`);
