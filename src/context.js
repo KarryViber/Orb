@@ -1,4 +1,4 @@
-import { readFileSync, existsSync, readdirSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { recallMemory, searchDocs } from './memory.js';
@@ -152,29 +152,9 @@ export async function buildPrompt({ userText, fileContent, threadTs, userId, cha
     } catch { /* missing or unreadable — skip */ }
   }
 
-  // Layer 2c: Skills index (scan profiles/{name}/skills/*.md, inject name+description)
-  const skillsDir = join(dir, '..', 'skills');
-  try {
-    if (existsSync(skillsDir)) {
-      const skillFiles = readdirSync(skillsDir).filter(f => f.endsWith('.md'));
-      if (skillFiles.length > 0) {
-        const skillIndex = skillFiles.map(f => {
-          try {
-            const content = readFileSync(join(skillsDir, f), 'utf8');
-            const nameMatch = content.match(/^name:\s*(.+)$/m);
-            const descMatch = content.match(/^description:\s*(.+)$/m);
-            const name = nameMatch?.[1]?.trim() || f.replace('.md', '');
-            const desc = descMatch?.[1]?.trim() || '';
-            return `- **${name}**: ${desc} [${f}]`;
-          } catch { return null; }
-        }).filter(Boolean);
-        if (skillIndex.length > 0) {
-          systemParts.push(`## Available Skills\n${skillIndex.join('\n')}\n\nSkill files are at: ${skillsDir}/\nRead the full file when you need the detailed steps.`);
-        }
-      }
-    }
-  } catch { /* no skills — fine */ }
-
+  // Skills: now CLI-native. Auto-discovered from {cwd}/.claude/skills/*/SKILL.md
+  // per-profile isolation via worker cwd = profiles/{name}/workspace/.
+  //
   // Layer 2d: Scripts path (so agent knows where user scripts live)
   if (scriptsDir && existsSync(scriptsDir)) {
     systemParts.push(`## Scripts\nUser scripts are at: ${scriptsDir}/`);
