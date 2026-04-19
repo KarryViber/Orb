@@ -133,24 +133,14 @@ export async function buildPrompt({ userText, fileContent, threadTs, userId, cha
   const dir = soulDir;
   if (!dir) throw new Error('context.js: profile.dataDir missing — upstream bug');
 
-  // Layer 1: Soul (stable → system)
-  const soul = loadSoul(dir, 'SOUL.md');
-  if (soul) systemParts.push(soul);
-
-  // Layer 2: User context (stable → system)
+  // Soul: merged into {cwd}/CLAUDE.md, CLI auto-loads natively.
+  // USER.md: still loaded (auto-synced by scheduler from holographic facts).
   const userProfile = loadSoul(dir, 'USER.md');
   if (userProfile) systemParts.push(userProfile);
 
-  // Layer 2b: Built-in memory — agent-maintained durable facts (fresh read, not cached)
-  if (dataDir) {
-    const memoryMdPath = join(dataDir, 'MEMORY.md');
-    try {
-      if (existsSync(memoryMdPath)) {
-        const memoryMd = readFileSync(memoryMdPath, 'utf-8').trim();
-        if (memoryMd) systemParts.push(memoryMd);
-      }
-    } catch { /* missing or unreadable — skip */ }
-  }
+  // MEMORY.md: CLI-native auto-memory at ~/.claude/projects/{cwd}/memory/MEMORY.md
+  // is auto-injected by CLI. Orb's profiles/{name}/data/MEMORY.md is legacy,
+  // no longer injected here (scheduler sync worker still writes it for now).
 
   // Skills: now CLI-native. Auto-discovered from {cwd}/.claude/skills/*/SKILL.md
   // per-profile isolation via worker cwd = profiles/{name}/workspace/.
