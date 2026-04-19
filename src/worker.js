@@ -85,7 +85,6 @@ process.on('message', async (msg) => {
     }
     const prompt = await buildPrompt({
       userText, fileContent, threadTs, userId, channel,
-      soulDir: profile?.soulDir,
       scriptsDir: profile?.scriptsDir,
       threadHistory,
       dataDir,

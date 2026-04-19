@@ -4,7 +4,6 @@ import { WeChatAdapter } from './adapters/wechat.js';
 import { Scheduler } from './scheduler.js';
 import { CronScheduler } from './cron.js';
 import { loadConfig, resolveProfile, resolveProfilePaths } from './config.js';
-import { invalidateSoulCache } from './context.js';
 import { cleanupSessions } from './session.js';
 import { info, error as logError } from './log.js';
 import { spawnWorker } from './spawn.js';
@@ -134,7 +133,6 @@ async function start() {
               effort: job.effort || null,
               profile: {
                 name: job.profileName,
-                soulDir: profilePaths.soulDir,
                 workspaceDir: profilePaths.workspaceDir,
                 dataDir: profilePaths.dataDir,
                 scriptsDir: profilePaths.scriptsDir,
@@ -177,12 +175,11 @@ async function start() {
   process.on('SIGINT', () => { cronScheduler.stop(); scheduler.shutdown('SIGINT'); });
 
   process.on('SIGHUP', () => {
-    info(TAG, 'SIGHUP received, reloading config + soul cache...');
+    info(TAG, 'SIGHUP received, reloading config...');
     try {
       const reloaded = loadConfig(true);
-      invalidateSoulCache();
       cronScheduler.setProfileNames(Object.keys(reloaded.profiles));
-      info(TAG, 'config + soul cache reloaded');
+      info(TAG, 'config reloaded');
     } catch (err) {
       logError(TAG, `SIGHUP reload failed, keeping current config: ${err.message}`);
     }

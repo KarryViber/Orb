@@ -211,7 +211,7 @@ function graceMs(schedule) {
 export class CronScheduler {
   /**
    * @param {object} opts
-   * @param {Function} opts.getProfilePaths - (profileName) => { dataDir, soulDir, workspaceDir }
+   * @param {Function} opts.getProfilePaths - (profileName) => { dataDir, workspaceDir, scriptsDir }
    * @param {Function} opts.spawnCronWorker - (job, profilePaths) => Promise<string> (response text)
    * @param {Function} opts.deliverResult - (job, text) => Promise<void>
    */

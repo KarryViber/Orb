@@ -222,7 +222,6 @@ export class Scheduler {
           effort: effectiveEffort,
           profile: {
             name: profile.name,
-            soulDir: profile.soulDir,
             scriptsDir: profile.scriptsDir,
             workspaceDir: profile.workspaceDir,
             dataDir: profile.dataDir,
@@ -414,7 +413,7 @@ export class Scheduler {
   _spawnSkillReview(task, priorMessages = []) {
     const { userId, platform } = task;
     const profile = this.getProfile(userId);
-    const agentsDir = join(profile.soulDir, '..', 'skills');
+    const agentsDir = join(profile.workspaceDir, '.claude', 'skills');
 
     // Pre-scan existing skills for iteration context
     const existing = this._scanExistingSkills(agentsDir);
@@ -493,7 +492,6 @@ export class Scheduler {
         priorConversation: priorMessages,
         profile: {
           name: profile.name,
-          soulDir: profile.soulDir,
           scriptsDir: profile.scriptsDir,
           workspaceDir: profile.workspaceDir,
           dataDir: profile.dataDir,
