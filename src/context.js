@@ -88,43 +88,24 @@ function inferSlugFromThread(threadHistory) {
   return matched.size === 1 ? [...matched][0] : null;
 }
 
-// Cache soul files per directory (cleared on SIGHUP via invalidateSoulCache)
-const soulCache = new Map();
-
-export function invalidateSoulCache() {
-  soulCache.clear();
-}
-
-function loadSoul(soulDir, filename) {
-  const key = `${soulDir}:${filename}`;
-  if (soulCache.has(key)) return soulCache.get(key);
-  try {
-    const content = readFileSync(join(soulDir, filename), 'utf-8');
-    soulCache.set(key, content);
-    return content;
-  } catch {
-    return '';
-  }
-}
-
-// ── Framework Directives (hardcoded, not file-based) ──
-
-const MEMORY_GUIDANCE = `\
-Save durable facts proactively — don't wait for "remember this":
-- User corrections, explicit preferences, environment facts, key decisions.
-- Skip: one-off task results, temporary plans, assistant's own actions.
-- Priority: reduce future corrections > signal over noise > lasting over ephemeral.`;
+// Soul cache retired: Soul/USER.md/MEMORY.md now CLI-native via CLAUDE.md auto-discovery.
+// Kept as no-op to avoid breaking main.js SIGHUP handler import.
+export function invalidateSoulCache() { /* no-op */ }
 
 /**
- * Build the full prompt injected into Claude CLI.
+ * Build the prompt injected into Claude CLI.
  *
- * Layers:
- *   1. Soul    — identity, behavior rules, collaboration boundaries
- *   2. User    — user profile + inject context
- *   3a. Memory  — Holographic conversation recall
- *   3b. Docs    — DocStore file knowledge recall
- *   4. Thread   — conversation history (now passed in, not fetched here)
- *   5. Message  — user message + file attachments
+ * System prompt is now minimal — CLI auto-loads CLAUDE.md / skills / agents /
+ * auto-memory natively via --append-system-prompt. Orb only adds the pieces
+ * CLI doesn't have: Scripts pointer, Holographic recall, DocStore recall,
+ * Thread history, Skill-review context.
+ *
+ * User prompt layers:
+ *   1. Holographic memory recall (cross-thread)
+ *   2. DocStore recall (file knowledge)
+ *   3. Skill-review prior conversation (conditional)
+ *   4. Thread history (from adapter)
+ *   5. Thread metadata + file attachments + user message
  */
 export async function buildPrompt({ userText, fileContent, threadTs, userId, channel, soulDir, scriptsDir, threadHistory, dataDir, mode, priorConversation }) {
   const systemParts = [];
@@ -133,14 +114,11 @@ export async function buildPrompt({ userText, fileContent, threadTs, userId, cha
   const dir = soulDir;
   if (!dir) throw new Error('context.js: profile.dataDir missing — upstream bug');
 
-  // Soul: merged into {cwd}/CLAUDE.md, CLI auto-loads natively.
-  // USER.md: still loaded (auto-synced by scheduler from holographic facts).
-  const userProfile = loadSoul(dir, 'USER.md');
-  if (userProfile) systemParts.push(userProfile);
-
-  // MEMORY.md: CLI-native auto-memory at ~/.claude/projects/{cwd}/memory/MEMORY.md
-  // is auto-injected by CLI. Orb's profiles/{name}/data/MEMORY.md is legacy,
-  // no longer injected here (scheduler sync worker still writes it for now).
+  // Soul, USER.md, and MEMORY.md all moved to CLI-native paths:
+  // - Soul → profiles/{name}/workspace/CLAUDE.md (CLI auto-discovery)
+  // - MEMORY.md → ~/.claude/projects/{cwd}/memory/MEMORY.md (CLI auto-memory)
+  // - USER.md → tracked by CLI auto-memory same path
+  // Scheduler memory-sync worker only does housekeeping now (purge/lint/GC).
 
   // Skills: now CLI-native. Auto-discovered from {cwd}/.claude/skills/*/SKILL.md
   // per-profile isolation via worker cwd = profiles/{name}/workspace/.
@@ -150,10 +128,7 @@ export async function buildPrompt({ userText, fileContent, threadTs, userId, cha
     systemParts.push(`## Scripts\nUser scripts are at: ${scriptsDir}/`);
   }
 
-  // Framework directive: memory guidance (injected if memory is enabled)
-  if (process.env.MEMORY_ENABLED !== 'false') {
-    systemParts.push(MEMORY_GUIDANCE);
-  }
+  // Memory guidance directive retired — CLI auto-memory handles this natively.
 
   // Layer 3a+3b: Memory + Docs — parallel fetch to cut latency (~15s each worst-case)
   const dbPath = dataDir ? join(dataDir, 'memory.db') : undefined;
