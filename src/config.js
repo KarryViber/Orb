@@ -65,7 +65,6 @@ export function resolveProfilePaths(profile) {
   const root = config._root;
   const paths = {
     name: profile.name,
-    soulDir: resolve(root, profile.soul),
     scriptsDir: profile.scripts ? resolve(root, profile.scripts) : null,
     workspaceDir: resolve(root, profile.workspace),
     dataDir: resolve(root, profile.data),

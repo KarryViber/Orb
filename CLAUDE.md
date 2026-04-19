@@ -25,22 +25,33 @@ src/
 
 ## Key Paths
 
-- `profiles/{name}/soul/`      — Persona / collaboration boundaries / user profile (per-profile, read-only at runtime)
-- `profiles/{name}/skills/`    — Skill files (Claude Code native agent format, scanned and indexed by context.js)
-- `profiles/{name}/scripts/`   — User utility scripts
-- `profiles/{name}/workspace/` — Claude CLI working directory
-- `profiles/{name}/data/`      — sessions.json + memory.db + doc-index.db + cron-jobs.json + MEMORY.md (gitignored)
-- `lib/holographic/`           — Holographic memory engine (Python)
-- `lib/docstore/`              — DocStore file index (FTS5, Python)
-- `config.json`                — Profile routing + adapter configuration
+- `profiles/{name}/scripts/`              — User utility scripts
+- `profiles/{name}/workspace/`            — Claude CLI working directory (cwd per profile)
+- `profiles/{name}/workspace/CLAUDE.md`   — Agent persona + runtime constraints (CLI auto-discovers from cwd)
+- `profiles/{name}/workspace/.claude/skills/*/SKILL.md` — Per-profile skills (CLI auto-discovers via cwd)
+- `profiles/{name}/data/`                 — sessions.json + memory.db + doc-index.db + cron-jobs.json (gitignored)
+- `lib/holographic/`                      — Holographic memory engine (Python)
+- `lib/docstore/`                         — DocStore file index (FTS5, Python)
+- `config.json`                           — Profile routing + adapter configuration
 
 ## Prompt Architecture
 
-Worker invokes Claude CLI with two injection paths:
-- `--system-prompt`: Soul + User + MEMORY.md + Skills + Framework Directives (stable content, prompt-cache friendly)
-- `-p` (stdin): Holographic Recall + Docs + Thread History + Message (dynamic content)
+Worker invokes Claude CLI with `--append-system-prompt`, letting CLI
+natively inject (via auto-discovery):
+- CLAUDE.md (three layers: `~/.claude`, `~/Orb/`, `{cwd}/` = workspace/)
+- Skills from `{cwd}/.claude/skills/*/SKILL.md` (per-profile via cwd)
+- Agents from `~/.claude/agents/` + `{cwd}/.claude/agents/`
+- Auto-memory from `~/.claude/projects/{encoded-cwd}/memory/MEMORY.md`
 
-Soul files: SOUL.md (persona + collaboration boundaries) + USER.md (user profile). workspace/CLAUDE.md is auto-read by CLI from cwd (runtime constraints + execution discipline). USER.md is auto-synced by scheduler from holographic preference facts. MEMORY.md lives in data/, written by the agent + periodically merged from high-trust facts by scheduler. Framework directives (memory strategy, etc.) are hardcoded in context.js and conditionally injected.
+Orb's system-prompt contribution (appended, minimal):
+- Scripts path pointer (`profile.scriptsDir`)
+
+Orb's user-prompt layers (dynamic per-turn, injected via stream-json stdin):
+- Holographic memory recall (cross-thread, trust-weighted)
+- DocStore recall (project-slug scoped)
+- Thread history (from platform adapter)
+- Skill-review prior conversation (conditional, `mode === 'skill-review'`)
+- Thread metadata + file attachments + user message
 
 ## Config
 
@@ -107,18 +118,18 @@ The following rules are invariants established during architecture evolution. An
 | File | Reader | Responsibility | Maintenance frequency |
 |------|--------|----------------|----------------------|
 | `~/Orb/CLAUDE.md` (this file) | External Claude Code sessions (when modifying source) | Developer guide + architecture constraints | On architecture changes |
-| `profiles/{name}/workspace/CLAUDE.md` | Orb worker (Claude CLI's cwd) | Agent runtime constraints + execution discipline | Rarely changes |
-| `profiles/{name}/soul/SOUL.md` | Orb worker (read by context.js) | Persona + collaboration boundaries | Regular maintenance |
-| `profiles/{name}/soul/USER.md` | Orb worker (read by context.js) | User profile | Auto-synced |
+| `profiles/{name}/workspace/CLAUDE.md` | Claude CLI (auto-discovered from cwd) | Agent persona + runtime constraints + execution discipline | Regular maintenance |
+| `profiles/{name}/soul/*.md` | — (retired) | Retired — persona merged into `workspace/CLAUDE.md` | — |
+| `profiles/{name}/data/MEMORY.md` | — (retired) | Retired — CLI auto-memory (`~/.claude/projects/.../memory/MEMORY.md`) replaces it | — |
 
-Two-layer separation + framework built-in directives: soul = identity + decision principles, workspace CLAUDE.md = operational constraints, framework directives = hardcoded operational mechanisms in context.js (conditionally injected).
+Single-layer (workspace/CLAUDE.md) + CLI auto-memory: persona, decision principles, and runtime constraints all live in `workspace/CLAUDE.md`; persistent user preferences are captured by Claude CLI's native auto-memory keyed on cwd.
 
 ### Profile Isolation
 
-- Each profile uses independent `soul/`, `skills/`, `scripts/`, `workspace/`, `data/` paths under `profiles/{name}/`
+- Each profile uses independent `scripts/`, `workspace/` (with `workspace/.claude/skills/` for per-cwd skill isolation), and `data/` paths under `profiles/{name}/`
 - `userIds` mapping in `config.json` determines which profile a user belongs to; unmapped `userId`s are rejected (no `default` fallback)
 - Session data is isolated by `{platform}:{threadTs}` key, stored in each profile's `data/sessions.json`
-- Runtime root/path validation currently hard-checks `workspace/` and `data/`; `soul/` and `scripts/` are resolved per-profile but not enforced by the same guard
+- Runtime root/path validation hard-checks `workspace/` and `data/`; `scripts/` is resolved per-profile but not enforced by the same guard
 - Adding a user = create profile directory + add mapping in config.json, no source code changes
 
 ### Platform Abstraction

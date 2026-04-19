@@ -4,7 +4,6 @@ import { fileURLToPath } from 'node:url';
 import { recallMemory, searchDocs } from './memory.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-// No default soul dir — profile must always be resolved
 
 // ── DocStore slug inference (thread-scoped search) ──
 
@@ -88,10 +87,6 @@ function inferSlugFromThread(threadHistory) {
   return matched.size === 1 ? [...matched][0] : null;
 }
 
-// Soul cache retired: Soul/USER.md/MEMORY.md now CLI-native via CLAUDE.md auto-discovery.
-// Kept as no-op to avoid breaking main.js SIGHUP handler import.
-export function invalidateSoulCache() { /* no-op */ }
-
 /**
  * Build the prompt injected into Claude CLI.
  *
@@ -107,12 +102,11 @@ export function invalidateSoulCache() { /* no-op */ }
  *   4. Thread history (from adapter)
  *   5. Thread metadata + file attachments + user message
  */
-export async function buildPrompt({ userText, fileContent, threadTs, userId, channel, soulDir, scriptsDir, threadHistory, dataDir, mode, priorConversation }) {
+export async function buildPrompt({ userText, fileContent, threadTs, userId, channel, scriptsDir, threadHistory, dataDir, mode, priorConversation }) {
   const systemParts = [];
   const userParts = [];
 
-  const dir = soulDir;
-  if (!dir) throw new Error('context.js: profile.dataDir missing — upstream bug');
+  if (!dataDir) throw new Error('context.js: profile.dataDir missing — upstream bug');
 
   // Soul, USER.md, and MEMORY.md all moved to CLI-native paths:
   // - Soul → profiles/{name}/workspace/CLAUDE.md (CLI auto-discovery)
