@@ -219,7 +219,6 @@ export class CronScheduler {
     this._getProfilePaths = getProfilePaths;
     this._spawnCronWorker = spawnCronWorker;
     this._deliverResult = deliverResult;
-    this._timer = null;
     this._running = false;
   }
 

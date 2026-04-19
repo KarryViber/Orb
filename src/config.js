@@ -44,7 +44,7 @@ function interpolateEnv(obj) {
 
 /**
  * Resolve a userId to a profile name.
- * Falls back to 'default' if no match.
+ * Throws if no match — unmapped userIds are rejected.
  */
 export function resolveProfile(userId) {
   const config = loadConfig();

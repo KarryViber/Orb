@@ -16,29 +16,20 @@ import { storeConversation } from './memory.js';
  *     - mode: 'skill-review' enters a dedicated branch that requires
  *       priorConversation; context.js injects it as "## 待审查会话".
  *     - priorConversation: [{role: 'user'|'assistant', content: string}, ...]
- *   { type: 'approval_result', approved, scope, userId }
  *   { type: 'inject', userText, fileContent?, imagePaths? }
  *
  * Worker -> Scheduler:
- *   { type: 'result', text, toolCount }
- *   { type: 'error', error }
- *   { type: 'update', text, messageTs }
- *   { type: 'file', filePath, filename }
- *   { type: 'approval', prompt }
+ *   { type: 'result', text, toolCount, lastTool?, stopReason? }
+ *   { type: 'error', error, errorContext? }
  *   { type: 'turn_complete', text, toolCount, lastTool, stopReason }
  */
 
 const CLAUDE_PATH = process.env.CLAUDE_PATH || 'claude';
 const MAX_TURNS = parseInt(process.env.MAX_TURNS, 10) || 50;
 
-let _approvalResolve = null;
 let _activeCli = null;   // reference to active interactive CLI session
 
 process.on('message', async (msg) => {
-  if (msg.type === 'approval_result') {
-    if (_approvalResolve) _approvalResolve(msg);
-    return;
-  }
   if (msg.type === 'inject') {
     if (_activeCli) {
       _activeCli.inject(msg.userText, msg.fileContent);
@@ -103,21 +94,6 @@ process.on('message', async (msg) => {
     });
     const promptLen = (prompt.systemPrompt?.length || 0) + (prompt.userPrompt?.length || prompt.length || 0);
     console.log(`[worker] prompt built (${promptLen} chars), session=${sessionId || 'new'}`);
-
-    const args = [
-      '--print',
-      '--output-format', 'json',
-      '--max-turns', String(MAX_TURNS),
-      ...(model || process.env.CLAUDE_MODEL ? ['--model', model || process.env.CLAUDE_MODEL] : []),
-    ];
-
-    if (sessionId) {
-      // Resume existing session — skip system-prompt (already in session history)
-      args.push('--resume', sessionId);
-    } else if (prompt.systemPrompt) {
-      // New session — inject soul/agents/user via system-prompt
-      args.push('--system-prompt', prompt.systemPrompt);
-    }
 
     // Build image content blocks for stream-json mode
     const hasImages = Array.isArray(imagePaths) && imagePaths.length > 0;
@@ -207,40 +183,6 @@ process.on('message', async (msg) => {
   // (CLI idle timeout → stdin.end → child close → exitPromise resolves → IPC sent → exit)
   setImmediate(() => process.exit(0));
 });
-
-function runClaude(args, stdinData, workspace) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(CLAUDE_PATH, args, {
-      cwd: workspace,
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-
-    const outChunks = [];
-    const errChunks = [];
-    child.stdout.on('data', (d) => outChunks.push(d));
-    child.stderr.on('data', (d) => errChunks.push(d));
-
-    child.on('error', reject);
-    child.on('close', (code) => {
-      const stdout = Buffer.concat(outChunks).toString();
-      const stderr = Buffer.concat(errChunks).toString();
-      if (code !== 0) {
-        if (stdout.trim()) {
-          resolve({ stdout, stderr, exitError: new Error(`exit ${code}`) });
-        } else {
-          reject(new Error(`Claude CLI exit ${code}\n${stderr}`));
-        }
-      } else {
-        resolve({ stdout, stderr });
-      }
-    });
-
-    if (stdinData) {
-      child.stdin.write(stdinData);
-      child.stdin.end();
-    }
-  });
-}
 
 const IDLE_TIMEOUT = 5_000; // 5s idle → close stdin → CLI exits
 
@@ -367,38 +309,6 @@ function runClaudeInteractive(args, initialContent, workspace) {
   };
 }
 
-function parseClaudeOutput(stdout) {
-  const lines = stdout.trim().split('\n');
-  const results = [];
-  let toolCount = 0;
-  let lastTool = null;
-
-  for (const line of lines) {
-    if (!line.trim()) continue;
-    let parsed;
-    try {
-      parsed = JSON.parse(line);
-    } catch {
-      continue;
-    }
-
-    if (parsed.type === 'result') {
-      const stopReason = parsed.stop_reason || parsed.subtype || null;
-      if (parsed.result) {
-        return { text: parsed.result, toolCount, lastTool, stopReason };
-      }
-    }
-    if (parsed.type === 'assistant' && parsed.message?.content) {
-      for (const block of parsed.message.content) {
-        if (block.type === 'text') results.push(block.text);
-        if (block.type === 'tool_use') { toolCount++; lastTool = block.name || null; }
-      }
-    }
-  }
-
-  return { text: results.join('\n') || '', toolCount, lastTool, stopReason: null };
-}
-
 function ipcSend(msg) {
   return new Promise((resolve, reject) => {
     process.send(msg, (err) => {
@@ -408,16 +318,3 @@ function ipcSend(msg) {
   });
 }
 
-function extractSessionId(stdout) {
-  let lastId = null;
-  try {
-    for (const line of stdout.trim().split('\n')) {
-      if (!line.trim()) continue;
-      try {
-        const parsed = JSON.parse(line);
-        if (parsed.session_id) lastId = parsed.session_id;
-      } catch {}
-    }
-  } catch {}
-  return lastId;
-}

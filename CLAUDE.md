@@ -136,13 +136,9 @@ Scheduler ↔ Worker communication via Node IPC (process.send/on('message')):
 | Direction | Type | Payload | Notes |
 |-----------|------|---------|-------|
 | Scheduler → Worker | `task` | `{ type: 'task', userText, fileContent, imagePaths, threadTs, channel, userId, platform, threadHistory, profile, model, effort, mode?, priorConversation? }` | Initial task for a thread. `mode: 'skill-review'` requires `priorConversation`, which `context.js` injects as review context. |
-| Scheduler → Worker | `approval_result` | `{ type: 'approval_result', approved, scope, userId }` | Resumes a blocked approval request inside the active worker. |
 | Scheduler → Worker | `inject` | `{ type: 'inject', userText, fileContent?, imagePaths? }` | Injects a follow-up user message into the active same-thread Claude CLI session without spawning a new worker. |
 | Worker → Scheduler | `result` | `{ type: 'result', text, toolCount, lastTool?, stopReason? }` | Final payload emitted when the worker is about to exit. |
 | Worker → Scheduler | `error` | `{ type: 'error', error, errorContext? }` | Terminal failure payload. |
-| Worker → Scheduler | `update` | `{ type: 'update', text, messageTs }` | Streaming/progress update for in-thread delivery. |
-| Worker → Scheduler | `file` | `{ type: 'file', filePath, filename }` | Requests adapter-side file upload. |
-| Worker → Scheduler | `approval` | `{ type: 'approval', prompt }` | Requests user approval through the adapter. |
 | Worker → Scheduler | `turn_complete` | `{ type: 'turn_complete', text, toolCount, lastTool, stopReason }` | Signals that one Claude turn finished; scheduler can deliver it while keeping the worker alive for future `inject` messages. |
 
 Adding or changing message types/payload fields requires updating `worker.js` header comment, `scheduler.js` handler, and this section together.
