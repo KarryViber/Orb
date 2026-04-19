@@ -131,7 +131,7 @@ export async function buildPrompt({ userText, fileContent, threadTs, userId, cha
   const userParts = [];
 
   const dir = soulDir;
-  if (!dir) return { systemPrompt: '', userPrompt: userText || '' };
+  if (!dir) throw new Error('context.js: profile.dataDir missing — upstream bug');
 
   // Layer 1: Soul (stable → system)
   const soul = loadSoul(dir, 'SOUL.md');

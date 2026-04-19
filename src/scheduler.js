@@ -1,5 +1,5 @@
 import { join } from 'node:path';
-import { readdirSync, readFileSync, existsSync, statSync, unlinkSync } from 'node:fs';
+import { readdirSync, readFileSync, existsSync, statSync, unlinkSync, writeFileSync, mkdirSync } from 'node:fs';
 import { info, error as logError, warn } from './log.js';
 import { taskQueue } from './queue.js';
 import { sanitizeErrorText } from './format-utils.js';
@@ -190,7 +190,8 @@ export class Scheduler {
 
     let responded = false;
     let turnDelivered = false;
-    let worker; // declared for closure access in approval_result send
+    let pendingAutoContinue = null;
+    let worker;
 
     // Rerun via 🔥 reaction: first emitted payload edits targetMessageTs,
     // subsequent payloads append as normal replies.
@@ -263,7 +264,8 @@ export class Scheduler {
                   this._autoContinueCount.set(threadTs, retries + 1);
                   warn(TAG, `empty result, auto-continue ${retries + 1}/${MAX_AUTO_CONTINUE} for thread=${threadTs}`);
                   await adapter.sendReply(channel, threadTs, `⏳ 回合上限已达${msg.stopReason === 'tool_use' ? '（任务执行中）' : msg.lastTool ? '（正在: ' + msg.lastTool + '）' : ''}，自动续接中 (${retries + 1}/${MAX_AUTO_CONTINUE})…`).catch(() => {});
-                  this.submit({ userText: '继续', fileContent: null, threadTs, channel, userId, platform, threadHistory: task.threadHistory });
+                  // Defer submit to onExit — avoid race with worker's process.exit(0)
+                  pendingAutoContinue = { userText: '继续', fileContent: '', threadTs, channel, userId, platform, threadHistory: task.threadHistory };
                   return;
                 }
                 warn(TAG, `empty result after ${MAX_AUTO_CONTINUE} auto-continues for thread=${threadTs}`);
@@ -324,19 +326,6 @@ export class Scheduler {
               userId,
               dbPath: join(profile.dataDir, 'memory.db'),
             }).catch(() => {});
-          } else if (msg.type === 'update' && msg.messageTs) {
-            try {
-              const payloads = adapter.buildPayloads(msg.text);
-              const p = payloads[0];
-              await adapter.editMessage(channel, msg.messageTs, p.text, p.blocks ? { blocks: p.blocks } : {});
-            } catch (err) {
-              logError(TAG, `failed to update message: ${err.message}`);
-            }
-          } else if (msg.type === 'file') {
-            await adapter.uploadFile(channel, threadTs, msg.filePath, msg.filename);
-          } else if (msg.type === 'approval') {
-            const result = await adapter.sendApproval(channel, threadTs, msg.prompt);
-            try { worker.send({ type: 'approval_result', ...result }); } catch (_) {}
           }
         },
         onExit: async (code, signal) => {
@@ -361,6 +350,13 @@ export class Scheduler {
           }
 
           await this.processNextQueued(threadTs);
+
+          if (pendingAutoContinue) {
+            const cont = pendingAutoContinue;
+            pendingAutoContinue = null;
+            info(TAG, `auto-continue dispatched after worker exit: thread=${cont.threadTs}`);
+            await this.submit(cont);
+          }
         },
       }));
     } catch (err) {
@@ -679,6 +675,44 @@ export class Scheduler {
   shutdown(signal) {
     const allWorkers = [...this.activeWorkers.values(), ...this._backgroundWorkers];
     info(TAG, `${signal} received, draining ${this.activeWorkers.size} active + ${this._backgroundWorkers.size} background worker(s)...`);
+
+    // Persist queued tasks so they're not silently lost on SIGTERM
+    try {
+      const pending = taskQueue.drain ? taskQueue.drain() : [];
+      let drained = pending;
+      if ((!drained || drained.length === 0) && typeof taskQueue.dequeue === 'function') {
+        drained = [];
+        let t;
+        while ((t = taskQueue.dequeue())) drained.push(t);
+      }
+      if (drained && drained.length > 0) {
+        const byProfile = new Map();
+        for (const t of drained) {
+          let profileName = 'unknown';
+          try { profileName = this.getProfile(t.userId).name; } catch {}
+          if (!byProfile.has(profileName)) byProfile.set(profileName, []);
+          byProfile.get(profileName).push(t);
+        }
+        let totalPersisted = 0;
+        for (const [name, tasks] of byProfile) {
+          try {
+            let dataDir = null;
+            try { dataDir = this.getProfile(tasks[0].userId).dataDir; } catch {}
+            if (!dataDir) continue;
+            mkdirSync(dataDir, { recursive: true });
+            const outPath = join(dataDir, 'shutdown-queue.json');
+            writeFileSync(outPath, JSON.stringify(tasks, null, 2));
+            totalPersisted += tasks.length;
+            info(TAG, `shutdown: persisted ${tasks.length} task(s) for profile=${name} → ${outPath}`);
+          } catch (e) {
+            warn(TAG, `shutdown: failed to persist queue for profile=${name}: ${e.message}`);
+          }
+        }
+        warn(TAG, `shutdown: persisted ${totalPersisted} queued tasks to shutdown-queue.json`);
+      }
+    } catch (e) {
+      warn(TAG, `shutdown: queue persistence error: ${e.message}`);
+    }
 
     // Disconnect all adapters
     for (const [name, adapter] of this.adapters) {
