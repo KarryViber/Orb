@@ -60,7 +60,9 @@ Edit `config.json` to add your Slack user ID:
 }
 ```
 
-Edit `profiles/your-name/soul/SOUL.md` to define the agent's persona.
+Edit `profiles/your-name/workspace/CLAUDE.md` to define the agent's persona and runtime constraints.
+
+Legacy `profiles/your-name/soul/` files are retired after the Claude Code CLI migration.
 
 ## Starting Orb
 
