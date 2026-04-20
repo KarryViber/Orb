@@ -90,11 +90,11 @@ export class Scheduler {
     }
 
     if (this.activeWorkers.has(threadTs)) {
-      const worker = this.activeWorkers.get(threadTs);
+      const entry = this.activeWorkers.get(threadTs);
       try {
-        worker.send({ type: 'inject', userText: task.userText, fileContent: task.fileContent, imagePaths: task.imagePaths });
+        entry.worker.send({ type: 'inject', userText: task.userText, fileContent: task.fileContent, imagePaths: task.imagePaths });
         info(TAG, `injected into active worker: thread=${threadTs}`);
-        await adapter.setTyping(channel, threadTs, 'is thinking…').catch(() => {});
+        await entry.startTyping();
         return;
       } catch (e) {
         info(TAG, `inject failed, queuing: ${e.message}`);
@@ -177,16 +177,22 @@ export class Scheduler {
     // 默认 low（若前面都没设）
     if (!effectiveEffort) effectiveEffort = 'low';
 
-    let typingSet = false;
-    try {
-      await adapter.setTyping(channel, threadTs, 'is thinking…');
-      typingSet = true;
-    } catch (_) {}
-
-    // Typing refresh interval — kept alive until first response or exit
-    const typingInterval = typingSet ? setInterval(async () => {
+    let typingInterval = null;
+    const startTyping = async () => {
+      if (typingInterval) return;
       try { await adapter.setTyping(channel, threadTs, 'is thinking…'); } catch (_) {}
-    }, 5_000) : null;
+      typingInterval = setInterval(async () => {
+        try { await adapter.setTyping(channel, threadTs, 'is thinking…'); } catch (_) {}
+      }, 5_000);
+    };
+    const stopTyping = async () => {
+      if (typingInterval) {
+        clearInterval(typingInterval);
+        typingInterval = null;
+      }
+      try { await adapter.setTyping(channel, threadTs, ''); } catch (_) {}
+    };
+    await startTyping();
 
     let responded = false;
     let turnDelivered = false;
@@ -271,10 +277,20 @@ export class Scheduler {
             return;
           }
 
+          if (msg.type === 'idle') {
+            await stopTyping();
+            return;
+          }
+
+          if (msg.type === 'busy') {
+            await startTyping();
+            return;
+          }
+
           responded = true;
 
           if (msg.type === 'turn_complete') {
-            // 中间轮次完成 — 去重已由 intermediate_text 投递的文本，避免重复发送
+            // 中间轮次完成 — 去重已由 intermediate_text 投递的文本；typing 由 idle/busy/onExit 控制
             try {
               const text = msg.text?.trim();
               if (text) {
@@ -294,8 +310,8 @@ export class Scheduler {
           }
 
           if (msg.type === 'result') {
+            let text = msg.text?.trim() || null;
             try {
-              const text = msg.text?.trim() || null;
               if (!text) {
                 const retries = this._autoContinueCount.get(threadTs) || 0;
                 if (retries < MAX_AUTO_CONTINUE) {
@@ -320,6 +336,7 @@ export class Scheduler {
               } else {
                 turnDelivered = false;
               }
+              await stopTyping();
               if (text) {
                 const errorPatterns = /(?:error|failed|permission denied|ENOENT|not found|timed?\s*out|EACCES)/i;
                 if (errorPatterns.test(text) && text.length > 50) {
@@ -345,6 +362,7 @@ export class Scheduler {
                 }).catch(() => {});
               }
             } catch (err) {
+              await stopTyping();
               logError(TAG, `failed to send result: ${err.message}`);
               await adapter.sendReply(channel, threadTs, ':warning: 回复发送失败。').catch(() => {});
             }
@@ -355,6 +373,7 @@ export class Scheduler {
           } else if (msg.type === 'error') {
             const safeError = sanitizeErrorText(msg.error || '未知错误');
             logError(TAG, `worker error for thread=${threadTs}: ${safeError}`);
+            await stopTyping();
             await adapter.sendReply(channel, threadTs, `:warning: 出错了: ${safeError}`).catch(() => {});
             storeLesson({
               userText: msg.errorContext?.userText || '',
@@ -367,10 +386,7 @@ export class Scheduler {
           }
         },
         onExit: async (code, signal) => {
-          if (typingInterval) clearInterval(typingInterval);
-          if (typingSet) {
-            try { await adapter.setTyping(channel, threadTs, ''); } catch (_) {}
-          }
+          await stopTyping();
           this.activeWorkers.delete(threadTs);
 
           const next = taskQueue.dequeue();
@@ -384,7 +400,7 @@ export class Scheduler {
           if (!responded) {
             logError(TAG, `worker exited without response: thread=${threadTs} code=${code} signal=${signal}`);
             this._autoContinueCount.delete(threadTs);
-            await adapter.cleanupIndicator(channel, threadTs, typingSet, '处理过程中出错，请重试。');
+            await adapter.cleanupIndicator(channel, threadTs, false, '处理过程中出错，请重试。');
           }
 
           await this.processNextQueued(threadTs);
@@ -399,13 +415,13 @@ export class Scheduler {
       }));
     } catch (err) {
       logError(TAG, `fork failed: ${err.message}`);
-      if (typingInterval) clearInterval(typingInterval);
-      await adapter.cleanupIndicator(channel, threadTs, typingSet, 'Worker 启动失败。');
+      await stopTyping();
+      await adapter.cleanupIndicator(channel, threadTs, false, 'Worker 启动失败。');
       await this.processNextQueued(threadTs);
       return;
     }
 
-    this.activeWorkers.set(threadTs, worker);
+    this.activeWorkers.set(threadTs, { worker, startTyping, stopTyping });
     worker.on('error', (err) => {
       logError(TAG, `worker error event: pid=${worker.pid} err=${err.message}`);
     });
@@ -592,7 +608,7 @@ export class Scheduler {
   }
 
   shutdown(signal) {
-    const allWorkers = [...this.activeWorkers.values(), ...this._backgroundWorkers];
+    const allWorkers = [...this.activeWorkers.values()].map(({ worker }) => worker).concat([...this._backgroundWorkers]);
     info(TAG, `${signal} received, draining ${this.activeWorkers.size} active + ${this._backgroundWorkers.size} background worker(s)...`);
 
     // Persist queued tasks so they're not silently lost on SIGTERM
