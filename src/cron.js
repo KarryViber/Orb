@@ -326,12 +326,14 @@ export class CronScheduler {
   }
 
   async _executeCronJob(job, paths, now) {
-    if (this._inflightJobs.has(job.id)) {
+    const inflightKey = this._inflightKey(paths.dataDir, job.id);
+
+    if (this._inflightJobs.has(inflightKey)) {
       warn(TAG, `job ${job.id} still running from previous tick, skipping this fire`);
       return;
     }
 
-    this._inflightJobs.add(job.id);
+    this._inflightJobs.add(inflightKey);
     info(TAG, `executing job ${job.id} "${job.name}" (profile=${job.profileName})`);
 
     try {
@@ -379,8 +381,12 @@ export class CronScheduler {
     } catch (err) {
       logError(TAG, `failed to persist job ${job.id}: ${err.message}`);
     } finally {
-      this._inflightJobs.delete(job.id);
+      this._inflightJobs.delete(inflightKey);
     }
+  }
+
+  _inflightKey(dataDir, jobId) {
+    return `${dataDir}:${jobId}`;
   }
 
   async _awaitJobWrites(dataDir) {
