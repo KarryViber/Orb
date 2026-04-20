@@ -41,6 +41,8 @@ import os
 import re
 import subprocess
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Allow relative imports when run as script
@@ -61,14 +63,50 @@ _ARBITRATE_SYSTEM = (
 )
 
 
+def _utc_ts() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _log_arbitrate(event: str, **fields) -> None:
+    entry = {
+        "ts": _utc_ts(),
+        "component": "arbitrate",
+        "event": event,
+    }
+    entry.update(fields)
+    print(json.dumps(entry, ensure_ascii=False), file=sys.stderr, flush=True)
+
+
 def arbitrate(content: str, neighbors: list[dict]) -> dict:
     """Ask Haiku to decide ADD/UPDATE/DELETE/NONE given a new fact + neighbors.
 
     Returns: {"action": "ADD|UPDATE|DELETE|NONE", "target_id": int|None, "reason": "..."}
     Fails open: any subprocess / parse error → {"action": "ADD", "reason": "..."}.
     """
+    started_at = time.monotonic()
+    preview = (content or "")[:80]
+    neighbor_count = len(neighbors)
+    _log_arbitrate(
+        "start",
+        content_preview=preview,
+        neighbors=neighbor_count,
+        model=_ARBITRATE_MODEL,
+    )
+
+    def finalize(action: str, target_id: int | None, reason: str) -> dict:
+        decision = {"action": action, "target_id": target_id, "reason": reason}
+        _log_arbitrate(
+            "decision",
+            action=action,
+            target_id=target_id,
+            neighbors=neighbor_count,
+            elapsed_ms=int((time.monotonic() - started_at) * 1000),
+            reason=reason,
+        )
+        return decision
+
     if not _ARBITRATE_ENABLED or not neighbors:
-        return {"action": "ADD", "target_id": None, "reason": "arbitrate-skipped"}
+        return finalize("ADD", None, "arbitrate-skipped")
 
     nbr_lines = []
     for n in neighbors:
@@ -102,14 +140,42 @@ def arbitrate(content: str, neighbors: list[dict]) -> dict:
             cwd="/tmp",  # don't pick up project CLAUDE.md / skills
         )
     except subprocess.TimeoutExpired:
-        return {"action": "ADD", "target_id": None, "reason": "arbitrate-timeout"}
+        reason = "arbitrate-timeout"
+        _log_arbitrate(
+            "timeout",
+            neighbors=neighbor_count,
+            elapsed_ms=int((time.monotonic() - started_at) * 1000),
+            reason=reason,
+        )
+        return finalize("ADD", None, reason)
     except FileNotFoundError:
-        return {"action": "ADD", "target_id": None, "reason": "claude-cli-missing"}
+        reason = "claude-cli-missing"
+        _log_arbitrate(
+            "cli-missing",
+            neighbors=neighbor_count,
+            elapsed_ms=int((time.monotonic() - started_at) * 1000),
+            reason=reason,
+        )
+        return finalize("ADD", None, reason)
     except Exception as e:
-        return {"action": "ADD", "target_id": None, "reason": f"subprocess-err-{type(e).__name__}"}
+        reason = f"subprocess-err-{type(e).__name__}"
+        _log_arbitrate(
+            "subprocess-error",
+            neighbors=neighbor_count,
+            elapsed_ms=int((time.monotonic() - started_at) * 1000),
+            reason=reason,
+        )
+        return finalize("ADD", None, reason)
 
     if result.returncode != 0:
-        return {"action": "ADD", "target_id": None, "reason": f"cli-returncode-{result.returncode}"}
+        reason = f"cli-returncode-{result.returncode}"
+        _log_arbitrate(
+            "cli-returncode",
+            neighbors=neighbor_count,
+            elapsed_ms=int((time.monotonic() - started_at) * 1000),
+            reason=reason,
+        )
+        return finalize("ADD", None, reason)
 
     try:
         envelope = json.loads(result.stdout)
@@ -118,11 +184,25 @@ def arbitrate(content: str, neighbors: list[dict]) -> dict:
         text = re.sub(r"\s*```$", "", text)
         decision = json.loads(text)
     except Exception:
-        return {"action": "ADD", "target_id": None, "reason": "arbitrate-bad-json"}
+        reason = "arbitrate-bad-json"
+        _log_arbitrate(
+            "bad-json",
+            neighbors=neighbor_count,
+            elapsed_ms=int((time.monotonic() - started_at) * 1000),
+            reason=reason,
+        )
+        return finalize("ADD", None, reason)
 
     action = (decision.get("action") or "").upper()
     if action not in {"ADD", "UPDATE", "DELETE", "NONE"}:
-        return {"action": "ADD", "target_id": None, "reason": f"arbitrate-invalid-action-{action}"}
+        reason = f"arbitrate-invalid-action-{action}"
+        _log_arbitrate(
+            "invalid-action",
+            neighbors=neighbor_count,
+            elapsed_ms=int((time.monotonic() - started_at) * 1000),
+            reason=reason,
+        )
+        return finalize("ADD", None, reason)
 
     # Haiku sometimes returns target_id as a numeric string — coerce.
     raw_target = decision.get("target_id")
@@ -133,13 +213,16 @@ def arbitrate(content: str, neighbors: list[dict]) -> dict:
         target_id = int(raw_target.strip())
 
     if action in {"UPDATE", "DELETE"} and target_id is None:
-        return {"action": "ADD", "target_id": None, "reason": "arbitrate-missing-target"}
+        reason = "arbitrate-missing-target"
+        _log_arbitrate(
+            "missing-target",
+            neighbors=neighbor_count,
+            elapsed_ms=int((time.monotonic() - started_at) * 1000),
+            reason=reason,
+        )
+        return finalize("ADD", None, reason)
 
-    return {
-        "action": action,
-        "target_id": target_id,
-        "reason": str(decision.get("reason", "")),
-    }
+    return finalize(action, target_id, str(decision.get("reason", "")))
 
 
 # ── Add path: search neighbors → arbitrate → apply ───────────────────
