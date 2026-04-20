@@ -21,12 +21,13 @@ import { storeConversation } from './memory.js';
  * Worker -> Scheduler:
  *   { type: 'result', text, toolCount, lastTool?, stopReason? }
  *   { type: 'error', error, errorContext? }
- *   { type: 'turn_complete', text, toolCount, lastTool, stopReason }
+ *   { type: 'turn_complete', text, toolCount, lastTool, stopReason, deliveredTexts }  — Phase ③: includes delivered set
  *   { type: 'progress_update', text }  — Phase ①: fired on each TodoWrite event;
  *     scheduler posts/edits a single progress message in-thread (ts owned by scheduler).
  *   { type: 'typing_heartbeat', channel, threadTs }  — Phase ②: 8s pulse while Claude CLI is running
  *   { type: 'intermediate_text', text }  — Phase ③: mid-turn text block, debounced 2s
- *   { type: 'turn_complete', text, toolCount, lastTool, stopReason, deliveredTexts }  — Phase ③: includes delivered set
+ *   { type: 'idle' }  — worker activity idle (typing heartbeat suppressed)
+ *   { type: 'busy' }  — worker activity resumed
  */
 
 const CLAUDE_PATH = process.env.CLAUDE_PATH || 'claude';
@@ -135,6 +136,7 @@ process.on('message', async (msg) => {
       ...(effort || process.env.CLAUDE_EFFORT ? ['--effort', effort || process.env.CLAUDE_EFFORT] : []),
       '--input-format', 'stream-json',
       '--output-format', 'stream-json',
+      '--exclude-dynamic-system-prompt-sections',
       '--verbose',
     ];
 
@@ -154,6 +156,9 @@ process.on('message', async (msg) => {
       if (turn.text?.trim()) {
         await ipcSend({ type: 'turn_complete', text: turn.text, toolCount: turn.toolCount, lastTool: turn.lastTool, stopReason: turn.stopReason, deliveredTexts: turn.deliveredTexts || [] });
       }
+    });
+    cli.setOnActivity(async (state) => {
+      await ipcSend({ type: state });
     });
 
     // Phase ③: stream mid-turn text blocks as they arrive
@@ -200,7 +205,7 @@ process.on('message', async (msg) => {
   setImmediate(() => process.exit(0));
 });
 
-const IDLE_TIMEOUT = 5_000; // 5s idle → close stdin → CLI exits
+const IDLE_TIMEOUT = parseInt(process.env.WORKER_IDLE_TIMEOUT_MS, 10) || 60_000; // idle → close stdin → CLI exits
 
 function renderTodos(todos) {
   const lines = ['📋 进度'];
@@ -224,8 +229,12 @@ function runClaudeInteractive(args, initialContent, workspace) {
   let lastStopReason = null;
   let lastSessionId = null;
   let lastTurnText = '';
+  let lastActivityAt = 0;
+  let idleNotified = false;
+  let activityTimer = null;
   let onTurnComplete = null;
   let onIntermediateText = null;
+  let onActivity = null;
   let deliveredTexts = [];
   let pendingText = '';
   let pendingTimer = null;
@@ -263,6 +272,7 @@ function runClaudeInteractive(args, initialContent, workspace) {
   });
 
   function handleStreamMsg(msg) {
+    markActivity();
     if (msg.type === 'assistant' && msg.message?.content) {
       for (const block of msg.message.content) {
         if (block.type === 'text') {
@@ -307,6 +317,20 @@ function runClaudeInteractive(args, initialContent, workspace) {
     }
   }
 
+  function markActivity() {
+    lastActivityAt = Date.now();
+    if (idleNotified) {
+      idleNotified = false;
+      if (onActivity) onActivity('busy');
+    }
+    if (activityTimer) clearTimeout(activityTimer);
+    activityTimer = setTimeout(() => {
+      if (Date.now() - lastActivityAt < 2000) return;
+      idleNotified = true;
+      if (onActivity) onActivity('idle');
+    }, 2000);
+  }
+
   function resetIdleTimer() {
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
@@ -331,6 +355,7 @@ function runClaudeInteractive(args, initialContent, workspace) {
     if (closed) return;
     closed = true;
     if (idleTimer) clearTimeout(idleTimer);
+    if (activityTimer) clearTimeout(activityTimer);
     try { child.stdin.end(); } catch {}
   }
 
@@ -341,6 +366,7 @@ function runClaudeInteractive(args, initialContent, workspace) {
     child.on('close', (code) => {
       closed = true;
       if (idleTimer) clearTimeout(idleTimer);
+      if (activityTimer) clearTimeout(activityTimer);
       resolve({
         code,
         stderr: Buffer.concat(errChunks).toString(),
@@ -365,6 +391,7 @@ function runClaudeInteractive(args, initialContent, workspace) {
     child,
     setOnTurnComplete: (fn) => { onTurnComplete = fn; },
     setOnIntermediateText: (fn) => { onIntermediateText = fn; },
+    setOnActivity: (fn) => { onActivity = fn; },
   };
 }
 
@@ -376,4 +403,3 @@ function ipcSend(msg) {
     });
   });
 }
-

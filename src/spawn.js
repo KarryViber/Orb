@@ -24,7 +24,7 @@ const WORKER_PATH = join(import.meta.dirname, 'worker.js');
 export function spawnWorker({ task, timeout = 600_000, label, onMessage, onExit }) {
   const worker = fork(WORKER_PATH, [], {
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
-    env: { ...process.env, ORB_WORKER: '1' },
+    env: { ...process.env, ORB_WORKER: '1', ENABLE_PROMPT_CACHING_1H: '1' },
   });
 
   // stdout/stderr → log (sanitize to avoid leaking tokens)
