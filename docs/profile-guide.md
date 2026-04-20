@@ -1,127 +1,177 @@
 # Profile Guide
 
-Each profile is an isolated Claude Code workspace. Multiple profiles can run on the same Orb instance, each responding to different users with its own workspace, scripts, runtime state, and Claude Code auto-memory.
+A profile is Orb's isolation unit. Each profile has its own Claude working directory, its own runtime data, and its own utility scripts.
 
-## Directory Structure
+## Profile Anatomy
 
-```
-profiles/your-name/
-├── scripts/             # Utility scripts the agent can execute
-├── workspace/           # Claude Code working directory for this profile
-│   ├── CLAUDE.md        # Persona + runtime constraints
-│   └── .claude/
-│       ├── skills/
-│       │   └── my-skill/SKILL.md
-│       └── agents/      # Optional per-profile agents
-└── data/                # Auto-generated at runtime (gitignored)
-    ├── sessions.json    # Thread ↔ session mappings
-    ├── memory.db        # Holographic memory database
-    ├── doc-index.db     # DocStore index (when enabled)
-    └── cron-jobs.json   # Scheduled tasks
-```
-
-## workspace/CLAUDE.md — Persona And Runtime Constraints
-
-This is the profile's main instruction file. Put persona, collaboration style, execution discipline, and workspace-specific rules here.
-
-```markdown
-# Persona
-
-You are [name], [brief description].
-
-# Collaboration Boundaries
-
-- [rule 1]
-- [rule 2]
-```
-
-Claude Code discovers three `CLAUDE.md` layers automatically:
-
-- `~/.claude/CLAUDE.md`
-- `~/Orb/CLAUDE.md`
-- `profiles/{name}/workspace/CLAUDE.md`
-
-Orb does not manually rebuild those layers on `SIGHUP`. Changes in `workspace/CLAUDE.md`, `workspace/.claude/skills/`, `workspace/.claude/agents/`, or CLI auto-memory are picked up by new worker/session starts; active workers keep the context they already started with.
-
-## Claude Code Auto-Memory
-
-Persistent memory is managed by Claude Code CLI under:
+Recommended layout:
 
 ```text
-~/.claude/projects/<encoded-cwd>/memory/
+profiles/alice/
+├── scripts/
+├── workspace/
+│   ├── CLAUDE.md
+│   └── .claude/
+│       ├── skills/
+│       ├── agents/
+│       └── settings.json
+└── data/
+    ├── sessions.json
+    ├── memory.db
+    ├── doc-index.db
+    └── cron-jobs.json
 ```
 
-Orb no longer uses `profiles/{name}/data/MEMORY.md`. Treat the CLI-managed auto-memory as the durable store tied to the profile workspace `cwd`.
+Each directory has a separate responsibility:
 
-## workspace/.claude/skills/ — Agent Skills
+- `scripts/`: executable helpers the agent may call
+- `workspace/`: Claude Code `cwd` for this profile
+- `data/`: Orb-owned runtime state
 
-Place Claude Code skills under `workspace/.claude/skills/<skill-name>/SKILL.md`. Claude Code auto-discovers them from the workspace `cwd`; Orb does not inject a separate skill index file.
+## What Lives In workspace/
 
-Skill files must include `name:` and `description:` fields:
+`workspace/` is the profile's Claude Code root. Workers launch Claude Code with this directory as the current working directory, so CLI auto-discovery happens here.
 
-```markdown
----
-name: my-skill
-description: Does something useful
----
+Claude Code picks up:
 
-# Steps
+- `workspace/CLAUDE.md`
+- `workspace/.claude/skills/`
+- `workspace/.claude/agents/`
+- workspace-scoped CLI-managed memory
 
-1. ...
+Orb adds only a small system prompt pointer to `scripts/`, plus dynamic recall and thread context.
+
+## workspace/CLAUDE.md
+
+This file is where profile-specific persona and execution constraints belong.
+
+Typical contents:
+
+- role and voice
+- collaboration expectations
+- operating constraints
+- workflow preferences
+- project-specific rules
+
+If you want different users to feel like different agents, this is the primary file that should differ between profiles.
+
+## workspace/.claude/skills/
+
+Place per-profile skills here:
+
+```text
+profiles/alice/workspace/.claude/skills/my-skill/SKILL.md
 ```
 
-The agent can then invoke the skill by reading the full file when needed.
+Because the worker `cwd` is profile-specific, these skills are also profile-specific. Orb does not maintain a separate skill registry for them.
 
-## workspace/.claude/agents/ — Optional Agents
+Use this directory when a profile needs domain instructions that should not leak into other users' workspaces.
 
-Place reusable per-profile agents under `workspace/.claude/agents/` if you want Claude Code to auto-discover them from the profile workspace.
+## workspace/.claude/agents/
 
-## scripts/ — Utility Scripts
+Place reusable Claude Code agents here if you want the CLI to auto-discover them for this profile.
 
-Place executable scripts here for the agent to run during tasks. Can be any language. Orb appends the scripts directory path as a small system-prompt hint so the agent knows where to look.
+This is optional. Many Orb profiles only need `CLAUDE.md` and a few skills.
 
-## data/ — Runtime Data (auto-generated)
+## workspace/.claude/settings.json
 
-Never commit `data/` — it's gitignored. Contains:
+Orb creates this file on demand if it does not exist.
 
-- `sessions.json` — maps `{platform}:{threadTs}` → Claude session ID, enabling conversation resumption
-- `memory.db` — holographic memory: conversation embeddings, extracted facts, preference signals
-- `doc-index.db` — DocStore full-text index (when enabled)
-- `cron-jobs.json` — scheduled task definitions (read/write directly to manage cron jobs)
+The generated settings seed a conservative allowlist for common read-only or inspection operations:
 
-## Retired Files
+- `Read(*)`
+- `Skill(*)`
+- `WebSearch`
+- `WebFetch(*)`
+- common shell inspection commands such as `git`, `rg`, `ls`, `find`, `cat`, `sed`, `head`, `tail`, `wc`, `pwd`, and `date`
 
-- `profiles/{name}/soul/SOUL.md` and `profiles/{name}/soul/USER.md` are retired. Persona and user-facing operating style now belong in `workspace/CLAUDE.md`.
-- `profiles/{name}/data/MEMORY.md` is retired. Persistent Claude-side memory now lives in `~/.claude/projects/<encoded-cwd>/memory/`.
+Anything outside that allowlist can still trigger the permission flow when the worker is started with the MCP permission bridge.
 
-Legacy profiles may still contain those files, but the current prompt architecture does not depend on them.
+## What Lives In data/
 
-## Creating a New Profile
+`data/` is Orb-owned runtime state:
 
-```bash
-cp -r profiles/example profiles/your-name
+- `sessions.json`: thread-to-Claude-session persistence
+- `memory.db`: holographic fact store
+- `doc-index.db`: DocStore index
+- `cron-jobs.json`: scheduled jobs for this profile
+
+Keep this directory out of git.
+
+## Persistent Memory Model
+
+Orb uses two persistence layers:
+
+- Holographic memory in `data/memory.db` for fact extraction and trust-weighted recall
+- Claude Code's own persistent memory for the workspace under `~/.claude/projects/<encoded-cwd>/memory/`
+
+That split is intentional. Orb does not try to replace Claude Code's native memory system.
+
+## How To Add A Profile
+
+You do not need to touch `src/` to add a user.
+
+1. Create `profiles/{name}/scripts`, `profiles/{name}/workspace`, and `profiles/{name}/data`.
+2. Add or edit `profiles/{name}/workspace/CLAUDE.md`.
+3. Add optional skills under `profiles/{name}/workspace/.claude/skills/`.
+4. Add optional agents under `profiles/{name}/workspace/.claude/agents/`.
+5. Add the profile to `config.json` with `userIds`, `scripts`, `workspace`, and `data`.
+
+Example:
+
+```json
+{
+  "profiles": {
+    "alice": {
+      "userIds": ["U0123456789"],
+      "scripts": "./profiles/alice/scripts",
+      "workspace": "./profiles/alice/workspace",
+      "data": "./profiles/alice/data"
+    }
+  }
+}
 ```
 
-Then:
-1. Edit `profiles/your-name/workspace/CLAUDE.md` — define the persona and runtime constraints
-2. Add optional skills under `profiles/your-name/workspace/.claude/skills/`
-3. Add optional agents under `profiles/your-name/workspace/.claude/agents/`
-4. Add your Slack user ID to `config.json` under the new profile name
+## What Isolation Means In Practice
 
-## Cron Jobs
+Profiles are isolated at the Orb routing and filesystem-path level:
 
-The agent can manage its own scheduled tasks by reading/writing `data/cron-jobs.json`. See `CLAUDE.md` root for the job schema.
+- different users map to different `workspace/` directories
+- different threads persist sessions under different profile `data/`
+- different profiles can expose different scripts and skills
 
-Schedules support:
-- Cron expression: `"0 9 * * *"` (daily at 9am)
-- Interval: `"every 30m"`
-- One-shot delay: `"2h"` or ISO timestamp
+Profiles are not hard security sandboxes. If you need OS-level separation between trust domains, run separate Orb instances or separate containers.
 
-## Reloading Configuration
+## Cron Per Profile
 
-`SIGHUP` is a partial reload only:
+Scheduled jobs are scoped to the profile that owns the `cron-jobs.json` file. A job runs with that profile's workspace, memory, scripts path, and delivery route.
 
-- Re-reads `config.json`
-- Refreshes the cron scheduler's profile-name set
+Example:
 
-It does not rebuild adapters, rotate adapter tokens, reconnect an existing Slack Socket Mode session, restart active workers, or apply scheduler limits/timeouts already loaded in memory. Restart the daemon if you need those changes to take effect.
+```json
+{
+  "id": "daily-brief",
+  "name": "Daily Brief",
+  "prompt": "Write today's brief.",
+  "schedule": {
+    "kind": "interval",
+    "minutes": 30,
+    "display": "every 30m"
+  },
+  "profileName": "alice",
+  "enabled": true
+}
+```
+
+## Operational Notes
+
+- A worker is reused only within the same thread while it stays alive.
+- Once the worker idles out, the next message starts a new process and resumes from persisted Claude session state when available.
+- Changes to `workspace/CLAUDE.md` and workspace skills affect new worker starts, not already-running workers.
+- `SIGHUP` does not rebuild active workers or reconnect adapters.
+
+## Related Files
+
+- [configuration.md](configuration.md)
+- [adapter-development.md](adapter-development.md)
+- [architecture.md](architecture.md)

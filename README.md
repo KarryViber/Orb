@@ -2,232 +2,249 @@
   <img src=".github/orb-logo.png" alt="Orb" width="160" />
 </p>
 
-<h1 align="center">Orb</h1>
+# Orb
 
-<p align="center">A self-evolving AI agent framework that wraps <a href="https://docs.anthropic.com/en/docs/claude-code">Claude Code</a> CLI with persistent memory, multi-profile isolation, and messaging platform integration.</p>
+> A multi-profile messaging shell around Claude Code CLI.
 
-> **Why Claude Code?** Orb doesn't reimplement an agent runtime — it orchestrates Claude Code CLI as-is. Every Claude Code update (new models, tools, capabilities) flows into Orb automatically. Zero migration cost.
+## What Orb Is
 
-## What Orb Does
+Orb receives messages from a platform adapter, routes them to the right profile, starts or resumes a per-thread Claude Code CLI session, and sends the result back. Orb does not replace Claude Code's runtime. It supplies routing, profile isolation, long-term recall, document search, cron execution, and approval handling around the native CLI.
 
-```
-You (Slack) → Orb → Claude Code CLI → results back to you
-```
-
-Orb sits between your messaging platform and Claude Code. It adds what Claude Code doesn't have out of the box:
-
-- **Persistent memory** that grows across conversations
-- **Identity & persona** that stays consistent
-- **Multi-user routing** — one Orb instance, multiple people
-- **Scheduled tasks** — cron jobs that run Claude Code on a schedule
-- **Document knowledge** — local file indexing with automatic context retrieval
-
-## Architecture
-
-```
-  Slack / Discord / WeChat
-            │
-            ▼
-     ┌────────────┐
-     │   Adapter   │  Normalize platform messages
-     └──────┬──────┘
-            │
-            ▼
-     ┌────────────┐     ┌──────────────┐
-     │  Scheduler  │────▶│  Cron Engine  │  Scheduled tasks
-     └──────┬──────┘     └──────────────┘
-            │
-            ▼
-     ┌────────────┐     ┌──────────────┐
-     │   Worker    │────▶│  Claude Code  │  One-shot fork per task
-     └──────┬──────┘     └──────────────┘
-            │
-     ┌──────┴──────────────────────────┐
-     │         Context Assembly         │
-     │                                  │
-     │  ┌──────────────┐ ┌────────────┐│
-     │  │ CLAUDE Layers │ │ Auto-memory││
-     │  └──────────────┘ └────────────┘│
-     │  ┌──────────────┐ ┌────────────┐│
-     │  │ Skills/Agents │ │ DocStore   ││
-     │  └──────────────┘ └────────────┘│
-     └─────────────────────────────────┘
+```text
+You (Slack DM / thread)
+        |
+        v
+      Orb
+        |
+        v
+Claude Code CLI (one worker per thread, cwd = profiles/{name}/workspace/)
+        |
+        v
+      Reply
 ```
 
-## Key Features
+## Why Claude Code Native
 
-### Holographic Memory
+- Claude Code already auto-discovers `CLAUDE.md`, workspace skills, workspace agents, and CLI-managed memory from the current working directory.
+- Orb stays outside the agent runtime. It handles message routing, context assembly, profile boundaries, cron orchestration, and permission relay.
+- Claude Code upgrades land without a prompt-stack migration inside Orb.
+- The worker process talks to Claude Code over native `stream-json`, so Orb can reuse sessions for follow-up turns in the same thread instead of rebuilding an agent loop of its own.
 
-A local, embedding-free memory system built on [Holographic Reduced Representations](https://en.wikipedia.org/wiki/Holographic_reduced_representation) (HRR) + SQLite FTS5.
+## Features
 
-- **Local-first storage** — all facts live in a local SQLite DB; retrieval runs on-device. The only outbound call is a small Haiku arbitration per write, routed through the same Claude Code CLI the agent itself uses (no extra SDK, no separate API key).
-- **Three retrieval modes**: keyword (FTS5/BM25), token overlap (Jaccard), and algebraic (HRR phase vectors) — combined via hybrid scoring
-- **Automatic fact extraction** — conversations are decomposed into categorized facts (preferences, decisions, knowledge, lessons)
-- **Write-time LLM arbitration** — on each new fact, top-3 near-neighbors are retrieved and a Haiku call decides `ADD` / `UPDATE` / `DELETE` / `NONE` (inspired by [mem0](https://github.com/mem0ai/mem0)). Conflicts are resolved at write time, not by time-based decay.
-- **Bi-temporal tombstones** — superseded facts are never hard-deleted; they get `invalid_at` + `superseded_by` pointers (inspired by [Graphiti](https://github.com/getzep/graphiti)). Reads filter to valid facts by default; audit queries can surface history.
-- **Frozen trust scores** — trust is set once at write time from extractor confidence (`confirmed` / `default` / `speculative`), then only moved by explicit user feedback. No exponential decay to quietly erase rarely-retrieved-but-true facts (birthdays, preferences).
-- **Transient-only hard delete** — only ephemeral categories (`session_context`, `transient_state`) are purged by age (7-day default). Durable knowledge is kept forever behind tombstones.
-- **Self-healing** — daily memory-lint detects orphaned facts and duplicates. Fail-open arbitration: if the CLI call errors or times out (5s), the fact is stored as `ADD` rather than dropped — memory never blocks the hot path.
+- Multi-profile isolation with separate `scripts/`, `workspace/`, and `data/` directories per profile.
+- Slack Socket Mode adapter for production use, with adapter boundaries that keep new platforms isolated.
+- Holographic long-term memory in local SQLite for fact extraction, trust scoring, decay controls, and write-time arbitration.
+- DocStore full-text search in local SQLite FTS5, with project slug inference from the thread and registry-driven path mapping.
+- Cron scheduling with per-profile `cron-jobs.json`, fire-and-forget workers, and per-job inflight guards.
+- MCP permission relay that can surface Claude Code approval requests in Slack.
+- Short-lived per-thread workers that reuse the same Claude session for follow-up messages via `inject` IPC.
 
-### Self-Evolution
+## Quickstart
 
-Orb learns from every interaction and refines itself automatically:
+Prerequisites:
 
-1. **Fact extraction** — each conversation → categorized facts (preference, decision, lesson, knowledge, entity)
-2. **Error distillation** — mistakes → actionable lessons ("what to do differently", not "what went wrong")
-3. **Correction capture** — user corrections → preference facts with asymmetric trust scoring (penalties > rewards)
-4. **Holographic consolidation** — high-trust facts remain queryable in local `memory.db`, and contradictions tombstone older facts instead of silently coexisting
-5. **Claude Code auto-memory** — durable profile-specific memory is managed by Claude Code CLI under `~/.claude/projects/<encoded-cwd>/memory/`
+- Node.js 18 or newer
+- Python 3.11 or newer
+- Claude Code CLI installed and authenticated
+- A Slack app with Socket Mode enabled
 
-The result: the agent gets better at working with you over time, without you explicitly teaching it.
-
-### Document Knowledge (DocStore)
-
-Local file indexing with FTS5 full-text search:
-
-- **Supported formats**: Markdown, DOCX, PDF
-- **Semantic chunking**: 300-1200 char chunks with heading-aware boundaries and overlap
-- **Priority weighting**: delivery docs (1.5x) > source docs (1.2x) > meetings (1.0x) > drafts (0.6x)
-- **Thread-scoped retrieval**: automatically infers which project a conversation is about and narrows search
-
-### Multi-Profile Isolation
-
-Each user gets a fully isolated environment:
-
-```
-profiles/your-name/
-├── scripts/        # Utility scripts the agent can call
-├── workspace/      # Claude Code working directory (cwd per profile)
-│   ├── CLAUDE.md   # Persona + runtime constraints
-│   └── .claude/
-│       ├── skills/ # Per-profile Claude Code skills
-│       └── agents/ # Optional agents discovered by CLI
-└── data/           # Sessions, memory DB, cron jobs (auto-generated)
-```
-
-Profiles don't share memory, sessions, or workspace. One Orb instance can serve multiple users with completely different personas.
-
-Legacy `soul/` files and `profiles/*/data/MEMORY.md` are retired. Persona now lives in `profiles/{name}/workspace/CLAUDE.md`, and persistent memory is handled by Claude Code CLI auto-memory keyed on the workspace `cwd`.
-
-### Prompt Cache Optimization
-
-Orb keeps its own prompt additions minimal and lets Claude Code discover the stable layers natively, which maximizes [Anthropic prompt caching](https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching):
-
-| Layer | Injected via | Content | Cache behavior |
-|------|-------------|---------|----------------|
-| **CLI auto-discovery** | Claude Code native discovery | `~/.claude/CLAUDE.md` + `~/Orb/CLAUDE.md` + `{cwd}/CLAUDE.md`, per-workspace skills, agents, auto-memory | Stable — high cache hit rate |
-| **Orb appended system prompt** | `--append-system-prompt` | Scripts path pointer | Stable — minimal diff surface |
-| **Orb user prompt** | stdin (`-p` / stream-json) | Holographic recall + Doc results + Thread history + Message | Dynamic — changes per request |
-
-Stable layers stay nearly identical between turns, so prompt cache locality remains high without Orb maintaining a custom multi-file system prompt stack.
-
-### Cron Scheduler
-
-Schedule recurring Claude Code tasks:
-
-- **Cron expressions**: `0 9 * * *` (daily at 9am)
-- **Intervals**: `every 30m`
-- **One-shot delays**: `2h`, ISO timestamps
-- **Delivery routing**: results sent to specific Slack channels/threads
-- **Managed via file**: agents read/write `cron-jobs.json` directly
-
-### Platform Adapters
-
-Abstract messaging platform interface. Currently supported:
-
-- **Slack** (Socket Mode) — full support including threads, files, Block Kit, approval flows
-- **WeChat** — experimental
-
-Adding a new platform = implement `PlatformAdapter` interface + format module. No changes to scheduler/worker/context.
-
-## Quick Start
-
-### Prerequisites
-
-- Node.js >= 18
-- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated
-- Python 3.9+ with numpy (for holographic memory)
-- A Slack workspace with a [Socket Mode app](https://api.slack.com/apis/socket-mode)
-
-### Setup
+Install and start:
 
 ```bash
-# Clone and install
 git clone https://github.com/KarryViber/Orb.git
-cd Orb && npm install
-
-# Configure
-cp .env.example .env               # Add your Slack credentials
-cp config.example.json config.json  # Add your user ID
-
-# Create your profile
-cp -r profiles/example profiles/your-name
-# Edit profiles/your-name/workspace/CLAUDE.md — persona + runtime constraints
-
-# Start
-node src/main.js
+cd Orb
+npm install
+cp .env.example .env
+cp config.example.json config.json
 ```
 
-Legacy `soul/` files in older profiles are retired after the Claude Code CLI migration.
+Create your first profile:
 
-Then message your Slack bot. Orb routes the message to your profile, lets Claude Code assemble its native context layers (`CLAUDE.md` + skills/agents + auto-memory), adds Orb recall/docs context, forks Claude Code, and sends the response back.
+```bash
+mkdir -p profiles/alice/scripts
+mkdir -p profiles/alice/workspace/.claude/skills
+mkdir -p profiles/alice/data
+cp profiles/example/workspace/CLAUDE.md profiles/alice/workspace/CLAUDE.md
+```
 
-## Configuration
+Fill in `.env` and `config.json`, then start Orb:
 
-`config.json` supports `${ENV_VAR}` interpolation. Sending `SIGHUP` only re-reads `config.json` and refreshes the cron scheduler's profile-name set. It does not rebuild adapters, rotate adapter tokens, reconnect an existing Slack Socket Mode session, restart active workers, or apply already-running scheduler parameters such as worker limits and timeouts. Restart the daemon for full effect.
+```bash
+npm start
+```
 
-```jsonc
+Send the Slack bot a DM. If routing, Claude authentication, and Socket Mode are all correct, Orb will start a worker for that thread and return the reply in Slack.
+
+The full walkthrough lives in [docs/getting-started.md](docs/getting-started.md).
+
+## Architecture At A Glance
+
+```text
+src/main.js
+   |
+   +--> adapters/* ------------------------------+
+   |                                             |
+   +--> src/cron.js                              |
+   |        |                                    |
+   |        +--> spawn cron worker --------------+
+   |                                             |
+   +--> src/scheduler.js <---- unix socket ---- src/mcp-permission-server.js
+              |                                       ^
+              |                                       |
+              +--> fork src/worker.js per thread -----+
+                        |
+                        +--> Claude Code CLI
+                        |      cwd = profiles/{name}/workspace/
+                        |      auto-discovers:
+                        |      - ~/.claude/CLAUDE.md
+                        |      - ./CLAUDE.md
+                        |      - workspace/CLAUDE.md
+                        |      - workspace/.claude/skills/
+                        |      - workspace/.claude/agents/
+                        |      - CLI-managed memory
+                        |
+                        +--> sidecars
+                               - lib/holographic/*  -> memory.db
+                               - lib/docstore/*     -> doc-index.db
+```
+
+The deeper walkthrough is in [docs/architecture.md](docs/architecture.md).
+
+## Prompt Architecture
+
+Claude Code discovers the stable layers natively:
+
+- Layer 1: `~/.claude/CLAUDE.md`
+- Layer 2: repository-root `CLAUDE.md`
+- Layer 3: `profiles/{name}/workspace/CLAUDE.md`
+- Workspace add-ons: `profiles/{name}/workspace/.claude/skills/` and `profiles/{name}/workspace/.claude/agents/`
+- CLI-managed memory tied to the workspace `cwd`
+
+Orb only adds what the CLI does not already know:
+
+- A minimal appended system prompt with the profile's `scripts/` path
+- Holographic memory recall from `profiles/{name}/data/memory.db`
+- DocStore recall from `profiles/{name}/data/doc-index.db`
+- Thread history supplied by the adapter
+- Thread metadata, file text, and the current user message
+
+## Memory Subsystems
+
+Orb uses two memory tracks plus document recall:
+
+- Holographic memory: a local fact store in `profiles/{name}/data/memory.db`, used for extraction, trust-weighted recall, contradiction handling, and memory hygiene jobs.
+- Claude Code auto-memory: the CLI's own persistent memory store, keyed by the profile workspace path under `~/.claude/projects/<encoded-cwd>/memory/`.
+- DocStore: a separate file index in `profiles/{name}/data/doc-index.db` with FTS5 search and project slug scoping.
+
+The important split is architectural: Orb owns cross-thread factual recall and document lookup, while Claude Code owns its native persistent memory for the workspace.
+
+## Cron
+
+Each profile can keep scheduled jobs in `profiles/{name}/data/cron-jobs.json`. The cron scheduler reads the file, computes due runs, forks a worker, and optionally delivers the result back through an adapter.
+
+Example job:
+
+```json
 {
-  "adapters": {
-    "slack": {
-      "botToken": "${SLACK_BOT_TOKEN}",
-      "appToken": "${SLACK_APP_TOKEN}",
-      "signingSecret": "${SLACK_SIGNING_SECRET}"
-    }
+  "id": "daily-report",
+  "name": "Daily Report",
+  "prompt": "Summarize today's open work items.",
+  "schedule": {
+    "kind": "cron",
+    "expr": "0 9 * * *",
+    "display": "0 9 * * *"
   },
-  "profiles": {
-    "default": {
-      "userIds": ["U0YOUR_SLACK_ID"],
-      "freeResponseChannels": ["C0CHANNEL_ID"],
-      "freeResponseUsers": []
-    }
-  }
+  "deliver": {
+    "platform": "slack",
+    "channel": "C0123456789",
+    "threadTs": null
+  },
+  "profileName": "alice",
+  "enabled": true,
+  "model": "haiku",
+  "effort": "low"
 }
 ```
 
-See [docs/configuration.md](docs/configuration.md) for full reference.
+Suggested model tiers:
 
-## How It Works
+| Task type | Model | Effort |
+| --- | --- | --- |
+| Scripted or templated output | `haiku` | `low` |
+| Summaries and routine aggregation | `sonnet` | `medium` |
+| Decision review or knowledge distillation | `sonnet` | `high` |
+| Deep analysis | `opus` | `xhigh` |
 
-1. **Message arrives** via Slack Socket Mode
-2. **Adapter normalizes** the message (extracts text, files, thread context)
-3. **Scheduler routes** to the correct profile based on `userIds` mapping
-4. **Context assembly** combines Claude Code native discovery with Orb additions:
-   - Claude Code auto-discovers `~/.claude/CLAUDE.md`, `~/Orb/CLAUDE.md`, `{workspace}/CLAUDE.md`, per-workspace skills/agents, and auto-memory
-   - Orb appends the scripts path pointer and streams holographic recall (top 5), DocStore results (top 5), thread history, and the current message
-5. **Worker forks** Claude Code CLI with assembled context as a one-shot process
-6. **Response streams** back: text → Slack, files → uploaded, approvals → interactive buttons
-7. **Post-processing**: conversation stored → facts extracted → memory updated
+## Permission Model
 
-## Security Model
+When Claude Code requests approval for an action outside the worker's default allowlist, Orb can relay that request through an MCP permission tool:
 
-Orb delegates execution to Claude Code CLI, which has file system access within its working directory.
+- The worker writes a temporary MCP config and starts Claude Code with `--permission-prompt-tool`.
+- `src/mcp-permission-server.js` forwards the request over a Unix socket to `src/scheduler.js`.
+- The scheduler either auto-allows or sends an approval card through the active adapter.
+- Slack is the implemented interactive approval route today.
 
-- **Single-user**: No additional concerns — standard Claude Code security model
-- **Multi-user on same machine**: Profiles are logically isolated but share OS-level access. For different trust levels, **run each profile in a separate container**.
+Orb also seeds `profiles/{name}/workspace/.claude/settings.json` on demand with a conservative allowlist for common read-only and inspection commands.
 
-Best practices:
-- Store secrets in `.env` (gitignored), never in profile directories
-- Set `chmod 700` on `profiles/*/data/`
-- `config.json` is gitignored by default
+## Profiles
 
-## Contributing
+A profile is a complete Claude working environment:
 
-Contributions welcome. Key areas:
+```text
+profiles/{name}/
+├── scripts/
+├── workspace/
+│   ├── CLAUDE.md
+│   └── .claude/
+│       ├── skills/
+│       └── agents/
+└── data/
+    ├── sessions.json
+    ├── memory.db
+    ├── doc-index.db
+    └── cron-jobs.json
+```
 
-- **New adapters** — Discord, Telegram, LINE, etc.
-- **Memory improvements** — better extraction, richer arbitration prompts, smarter near-neighbor selection
-- **Documentation** — guides, examples, translations
+See [docs/profile-guide.md](docs/profile-guide.md) for the full profile model.
+
+## Adding A Platform
+
+New platforms plug in through the `PlatformAdapter` interface in `src/adapters/interface.js`. Orb keeps formatting, transport, and approval handling behind the adapter boundary so scheduler and worker code do not need platform-specific imports.
+
+See [docs/adapter-development.md](docs/adapter-development.md).
+
+## Project Layout
+
+```text
+src/
+├── main.js              # adapter startup, scheduler, signals
+├── scheduler.js         # worker lifecycle, queueing, approvals
+├── worker.js            # Claude CLI session management
+├── cron.js              # scheduled jobs
+├── context.js           # Orb-managed prompt additions
+├── memory.js            # holographic + docstore bridges
+├── session.js           # thread -> Claude session persistence
+├── format-utils.js      # adapter-agnostic text helpers
+└── adapters/
+    ├── interface.js
+    ├── slack.js
+    └── slack-format.js
+
+lib/
+├── holographic/         # Python memory bridge and maintenance
+└── docstore/            # Python FTS5 index and search bridge
+
+profiles/
+└── {name}/              # scripts + workspace + data
+```
+
+## Status
+
+- Slack adapter: production path
+- WeChat adapter: in-repo but not documented here as a primary deployment target
+- Discord: not implemented
+- Other platforms: contributions welcome
 
 ## License
 
