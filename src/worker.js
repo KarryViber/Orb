@@ -24,10 +24,9 @@ import { storeConversation } from './memory.js';
  *   { type: 'turn_complete', text, toolCount, lastTool, stopReason, deliveredTexts }  — Phase ③: includes delivered set
  *   { type: 'progress_update', text }  — Phase ①: fired on each TodoWrite event;
  *     scheduler posts/edits a single progress message in-thread (ts owned by scheduler).
- *   { type: 'typing_heartbeat', channel, threadTs }  — Phase ②: 8s pulse while Claude CLI is running
+ *   { type: 'turn_start' }  — explicit turn ownership start on task/inject receipt
+ *   { type: 'turn_end' }  — explicit turn ownership end when Claude emits result
  *   { type: 'intermediate_text', text }  — Phase ③: mid-turn text block, debounced 2s
- *   { type: 'idle' }  — worker activity idle (typing heartbeat suppressed)
- *   { type: 'busy' }  — worker activity resumed
  */
 
 const CLAUDE_PATH = process.env.CLAUDE_PATH || 'claude';
@@ -38,14 +37,21 @@ let _activeCli = null;   // reference to active interactive CLI session
 process.on('message', async (msg) => {
   if (msg.type === 'inject') {
     if (_activeCli) {
-      _activeCli.inject(msg.userText, msg.fileContent);
-      console.log(`[worker] injected: "${(msg.userText || '').slice(0, 60)}"`);
+      const injected = _activeCli.inject(msg.userText, msg.fileContent);
+      if (injected) {
+        await ipcSend({ type: 'turn_start' }).catch(() => {});
+        console.log(`[worker] injected: "${(msg.userText || '').slice(0, 60)}"`);
+      } else {
+        console.warn('[worker] inject rejected by CLI');
+      }
     } else {
       console.warn('[worker] inject received but no active CLI');
     }
     return;
   }
   if (msg.type !== 'task') return;
+
+  await ipcSend({ type: 'turn_start' }).catch(() => {});
 
   let { userText, fileContent, imagePaths, threadTs, channel, userId, platform, profile, threadHistory, model, effort, mode, priorConversation } = msg;
 
@@ -79,14 +85,6 @@ process.on('message', async (msg) => {
 
   // Session key includes platform to avoid collisions
   const sessionKey = platform ? `${platform}:${threadTs}` : threadTs;
-
-  let heartbeatBusy = true;
-
-  // Typing heartbeat — Slack TTL is ~5s; pulse every 8s while Claude is busy
-  const heartbeatInterval = setInterval(() => {
-    if (!heartbeatBusy) return;
-    ipcSend({ type: 'typing_heartbeat', channel, threadTs }).catch(() => {});
-  }, 8_000);
 
   try {
     console.log(`[worker] starting task: thread=${threadTs} profile=${profile?.name || 'default'} text="${(userText || '[files]').slice(0, 80)}"`);
@@ -160,9 +158,8 @@ process.on('message', async (msg) => {
         await ipcSend({ type: 'turn_complete', text: turn.text, toolCount: turn.toolCount, lastTool: turn.lastTool, stopReason: turn.stopReason, deliveredTexts: turn.deliveredTexts || [] });
       }
     });
-    cli.setOnActivity(async (state) => {
-      heartbeatBusy = state === 'busy';
-      await ipcSend({ type: state });
+    cli.setOnTurnEnd(async () => {
+      await ipcSend({ type: 'turn_end' }).catch(() => {});
     });
 
     // Phase ③: stream mid-turn text blocks as they arrive
@@ -200,8 +197,6 @@ process.on('message', async (msg) => {
       // 附带上下文供教训蒸馏
       errorContext: { userText: (userText || '').slice(0, 2000) },
     }).catch(() => {});
-  } finally {
-    clearInterval(heartbeatInterval);
   }
 
   // Worker exits after CLI closes — no explicit process.exit needed
@@ -233,16 +228,14 @@ function runClaudeInteractive(args, initialContent, workspace) {
   let lastStopReason = null;
   let lastSessionId = null;
   let lastTurnText = '';
-  let lastActivityAt = 0;
-  let idleNotified = false;
-  let activityTimer = null;
   let onTurnComplete = null;
   let onIntermediateText = null;
-  let onActivity = null;
+  let onTurnEnd = null;
   let deliveredTexts = [];
   let pendingText = '';
   let pendingTimer = null;
   let closed = false;
+  let turnOpen = true;
 
   const queueIntermediate = (text) => {
     if (!text?.trim() || !onIntermediateText) return;
@@ -276,7 +269,6 @@ function runClaudeInteractive(args, initialContent, workspace) {
   });
 
   function handleStreamMsg(msg) {
-    markActivity();
     if (msg.type === 'assistant' && msg.message?.content) {
       for (const block of msg.message.content) {
         if (block.type === 'text') {
@@ -296,6 +288,10 @@ function runClaudeInteractive(args, initialContent, workspace) {
       lastSessionId = msg.session_id || lastSessionId;
       lastStopReason = msg.stop_reason || msg.subtype || null;
       const turnText = msg.result || turnBuffer.join('\n');
+      if (turnOpen && onTurnEnd) {
+        turnOpen = false;
+        onTurnEnd();
+      }
 
       // Cancel pending intermediate flush — turn is done, onTurnComplete takes over
       if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null; pendingText = ''; }
@@ -321,20 +317,6 @@ function runClaudeInteractive(args, initialContent, workspace) {
     }
   }
 
-  function markActivity() {
-    lastActivityAt = Date.now();
-    if (idleNotified) {
-      idleNotified = false;
-      if (onActivity) onActivity('busy');
-    }
-    if (activityTimer) clearTimeout(activityTimer);
-    activityTimer = setTimeout(() => {
-      if (Date.now() - lastActivityAt < 2000) return;
-      idleNotified = true;
-      if (onActivity) onActivity('idle');
-    }, 2000);
-  }
-
   function resetIdleTimer() {
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
@@ -350,6 +332,7 @@ function runClaudeInteractive(args, initialContent, workspace) {
     const content = [{ type: 'text', text }];
     const msg = JSON.stringify({ type: 'user', message: { role: 'user', content } });
     child.stdin.write(msg + '\n');
+    turnOpen = true;
     // Reset idle timer — new message means stay alive
     resetIdleTimer();
     return true;
@@ -359,7 +342,6 @@ function runClaudeInteractive(args, initialContent, workspace) {
     if (closed) return;
     closed = true;
     if (idleTimer) clearTimeout(idleTimer);
-    if (activityTimer) clearTimeout(activityTimer);
     try { child.stdin.end(); } catch {}
   }
 
@@ -370,7 +352,6 @@ function runClaudeInteractive(args, initialContent, workspace) {
     child.on('close', (code) => {
       closed = true;
       if (idleTimer) clearTimeout(idleTimer);
-      if (activityTimer) clearTimeout(activityTimer);
       resolve({
         code,
         stderr: Buffer.concat(errChunks).toString(),
@@ -395,7 +376,7 @@ function runClaudeInteractive(args, initialContent, workspace) {
     child,
     setOnTurnComplete: (fn) => { onTurnComplete = fn; },
     setOnIntermediateText: (fn) => { onIntermediateText = fn; },
-    setOnActivity: (fn) => { onActivity = fn; },
+    setOnTurnEnd: (fn) => { onTurnEnd = fn; },
   };
 }
 
