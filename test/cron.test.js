@@ -55,6 +55,19 @@ function createScheduler(dataDir, spawnCronWorker) {
   return scheduler;
 }
 
+function createMultiProfileScheduler(profileDirs, spawnCronWorker) {
+  const scheduler = new CronScheduler({
+    getProfilePaths: (profileName) => {
+      const dataDir = profileDirs[profileName];
+      return { dataDir, workspaceDir: dataDir, scriptsDir: dataDir };
+    },
+    spawnCronWorker,
+    deliverResult: async () => {},
+  });
+  scheduler.setProfileNames(Object.keys(profileDirs));
+  return scheduler;
+}
+
 test('tick releases the scheduler lock before worker completion', async () => {
   const dataDir = createTempDataDir();
   const gate = deferred();
@@ -109,6 +122,34 @@ test('per-job guard prevents concurrent execution of the same job', async () => 
   gate.resolve('ok');
   await delay(20);
   await scheduler._awaitJobWrites(dataDir);
+});
+
+test('per-job guard is scoped per profile for identical job ids', async () => {
+  const alphaDataDir = createTempDataDir();
+  const betaDataDir = createTempDataDir();
+  const gate = deferred();
+  const spawnedProfiles = [];
+
+  const scheduler = createMultiProfileScheduler(
+    { alpha: alphaDataDir, beta: betaDataDir },
+    async (job) => {
+      spawnedProfiles.push(job.profileName);
+      return gate.promise;
+    }
+  );
+
+  writeJobs(alphaDataDir, [createJob('shared-job', { profileName: 'alpha' })]);
+  writeJobs(betaDataDir, [createJob('shared-job', { profileName: 'beta' })]);
+
+  await scheduler.tick();
+  assert.deepEqual(spawnedProfiles.sort(), ['alpha', 'beta']);
+
+  gate.resolve('ok');
+  await delay(20);
+  await Promise.all([
+    scheduler._awaitJobWrites(alphaDataDir),
+    scheduler._awaitJobWrites(betaDataDir),
+  ]);
 });
 
 test('fire-and-forget execution still persists job state', async () => {

@@ -6,7 +6,8 @@
   "main": "src/main.js",
   "scripts": {
     "start": "node src/main.js",
-    "dev": "node --watch src/main.js"
+    "dev": "node --watch src/main.js",
+    "test": "node --test test/*.test.js"
   },
   "keywords": ["ai-agent", "claude", "slack-bot", "multi-profile", "claude-code"],
   "author": "Kailiang Zhang",

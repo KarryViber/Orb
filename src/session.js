@@ -1,7 +1,7 @@
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, unlinkSync } from 'node:fs';
 import { resolve } from 'node:path';
 import lockfile from 'proper-lockfile';
-import { warn } from './log.js';
+import { error, warn } from './log.js';
 
 function sessionsPath(dataDir) {
   return resolve(dataDir, 'sessions.json');
@@ -18,13 +18,31 @@ function load(dataDir) {
   const file = sessionsPath(dataDir);
   try {
     if (existsSync(file)) return JSON.parse(readFileSync(file, 'utf8'));
-  } catch {}
+  } catch (err) {
+    const corruptPath = `${file}.corrupt.${new Date().toISOString()}`;
+    try {
+      renameSync(file, corruptPath);
+      error('session', `failed to load ${file}: ${err?.message || 'unknown error'}; moved corrupt file to ${corruptPath}`);
+    } catch (renameErr) {
+      error(
+        'session',
+        `failed to load ${file}: ${err?.message || 'unknown error'}; failed to quarantine corrupt file: ${renameErr?.message || 'unknown error'}`
+      );
+    }
+  }
   return {};
 }
 
 function save(dataDir, sessions) {
   mkdirSync(dataDir, { recursive: true });
-  try { writeFileSync(sessionsPath(dataDir), JSON.stringify(sessions, null, 2), 'utf8'); } catch {}
+  const file = sessionsPath(dataDir);
+  const tmp = `${file}.tmp.${process.pid}`;
+  try {
+    writeFileSync(tmp, JSON.stringify(sessions, null, 2), 'utf8');
+    renameSync(tmp, file);
+  } catch {
+    try { unlinkSync(tmp); } catch {}
+  }
 }
 
 /**
