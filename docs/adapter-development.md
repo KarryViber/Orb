@@ -1,116 +1,169 @@
 # Adapter Development
 
-Orb's platform abstraction lets you add new messaging platforms without touching the core scheduler or worker code.
+Orb keeps messaging-platform code behind a narrow adapter boundary. If you add a new platform, the goal is to keep scheduler, worker, prompt assembly, and memory code untouched.
 
 ## PlatformAdapter Interface
 
-All adapters extend `PlatformAdapter` from `src/adapters/interface.js`:
+Adapters implement `src/adapters/interface.js`.
 
 ```javascript
-import { PlatformAdapter } from './interface.js';
-
-export class MyAdapter extends PlatformAdapter {
-  // Required
-  async start(scheduler) { ... }
-  async disconnect() { ... }
-  async sendReply(channel, text, threadTs, options) { ... }
-
-  // Optional
-  async editMessage(channel, messageTs, text) { ... }
-  async uploadFile(channel, filePath, filename, threadTs) { ... }
-  async setTyping(channel, threadTs) { ... }
-  async sendApproval(channel, threadTs, prompt) { ... }
-  async fetchThreadHistory(channel, threadTs) { ... }
-  buildPayloads(text, options) { ... }
+export class PlatformAdapter {
+  async start(onMessage, onInteractive) {}
+  async disconnect() {}
+  async sendReply(channel, threadTs, text, extra) {}
+  async editMessage(channel, ts, text, extra) {}
+  async uploadFile(channel, threadTs, filePath, filename) {}
+  async setTyping(channel, threadTs, status) {}
+  async sendApproval(channel, threadTs, prompt) {}
+  buildPayloads(text) {}
+  async cleanupIndicator(channel, threadTs, typingSet, errorMsg) {}
+  async fetchThreadHistory(threadTs, channel) { return null; }
+  get botUserId() {}
+  get platform() { return "unknown"; }
 }
 ```
 
-## Method Reference
+The scheduler only depends on these methods. It does not import platform SDKs directly.
 
-### `start(scheduler)`
-Connect to the platform and begin receiving messages. Call `scheduler.handleMessage(payload)` for each incoming message.
+## Method Responsibilities
 
-`payload` shape:
+### `start(onMessage, onInteractive)`
+
+Bring up the transport and forward normalized incoming events to Orb.
+
+The adapter should translate raw platform events into the task shape the scheduler expects:
+
 ```javascript
 {
-  userText: string,       // message text
-  fileContent: string,    // attachment text content (optional)
-  imagePaths: string[],   // local paths to downloaded images (optional)
-  threadTs: string,       // thread identifier (unique per conversation)
-  channel: string,        // channel/chat identifier
-  userId: string,         // sender's platform user ID
-  platform: string,       // e.g. 'slack'
-  profile: object,        // resolved profile config
-  threadHistory: string,  // formatted prior messages in thread (optional)
+  userText,
+  fileContent,
+  imagePaths,
+  threadTs,
+  channel,
+  userId,
+  platform,
+  threadHistory
 }
 ```
 
-### `sendReply(channel, text, threadTs, options)`
-Send a message. `options` can include platform-specific fields (e.g. Slack Block Kit payloads).
+### `sendReply(channel, threadTs, text, extra)`
 
-### `editMessage(channel, messageTs, text)`
-Edit an existing message in-place (used for streaming updates).
+Send a reply into the right conversation. `extra` can carry platform-native payloads such as Slack blocks.
 
-### `uploadFile(channel, filePath, filename, threadTs)`
-Upload a file as a reply.
+### `editMessage(channel, ts, text, extra)`
 
-### `setTyping(channel, threadTs)`
-Show a typing indicator.
+Update an existing message. Orb uses this for progress updates and approval-card state changes.
+
+### `uploadFile(channel, threadTs, filePath, filename)`
+
+Upload a file produced by Claude Code.
+
+### `setTyping(channel, threadTs, status)`
+
+Turn a typing indicator on or off. The scheduler is the owner of typing state; workers emit lifecycle events.
 
 ### `sendApproval(channel, threadTs, prompt)`
-Send an approval request and wait for user response. Returns `{ approved, scope }`.
 
-### `fetchThreadHistory(channel, threadTs)`
-Return a formatted string of prior messages in the thread.
+Present an approval request to the user and return a decision object. In Slack, this powers permission approval cards.
 
-### `buildPayloads(text, options)`
-Convert text and options into platform-native message payloads. Called by the scheduler before `sendReply`.
+### `buildPayloads(text)`
 
-## Example: Minimal Adapter
+Convert plain text into one or more platform-native outbound payloads. This is where message splitting and rich rendering start.
+
+### `fetchThreadHistory(threadTs, channel)`
+
+Return a formatted representation of the existing thread so Orb can pass prior context to the worker.
+
+## format-utils vs Adapter-Specific Formatting
+
+Keep the boundary clean:
+
+- `src/format-utils.js`: platform-agnostic helpers such as text sanitization and splitting
+- `src/adapters/{platform}-format.js`: platform-specific rendering such as Slack `mrkdwn`, blocks, chunking, or platform card layouts
+
+Do not put Slack-specific formatting rules in shared utilities.
+
+## Registration Path
+
+Adding an adapter requires two integration points.
+
+### 1. Create The Adapter
+
+Place the implementation in `src/adapters/{platform}.js`.
+
+### 2. Register It In main.js
+
+`src/main.js` is where enabled adapters are instantiated and started. Follow the existing Slack and WeChat branches:
 
 ```javascript
-import { PlatformAdapter } from './interface.js';
+if (name === "myplatform") {
+  const adapter = new MyPlatformAdapter(adapterConfig);
+  scheduler.addAdapter(name, adapter);
+  await adapter.start((task) => scheduler.submit(task));
+}
+```
+
+The corresponding `config.json` entry should live under `adapters.myplatform`.
+
+## Minimal Skeleton
+
+```javascript
+import { PlatformAdapter } from "./interface.js";
 
 export class ConsoleAdapter extends PlatformAdapter {
-  async start(scheduler) {
-    this.scheduler = scheduler;
-    process.stdin.on('data', (data) => {
-      scheduler.handleMessage({
-        userText: data.toString().trim(),
-        threadTs: 'console',
-        channel: 'console',
-        userId: 'local-user',
-        platform: 'console',
-        profile: this.config.profiles?.default,
+  constructor(config = {}) {
+    super();
+    this.config = config;
+  }
+
+  get platform() {
+    return "console";
+  }
+
+  async start(onMessage) {
+    process.stdin.on("data", (chunk) => {
+      onMessage({
+        userText: chunk.toString().trim(),
+        threadTs: "console-thread",
+        channel: "console",
+        userId: "local-user",
+        platform: "console",
+        threadHistory: null
       });
     });
   }
 
   async disconnect() {}
 
-  async sendReply(channel, text) {
-    console.log(`[bot] ${text}`);
+  async sendReply(channel, threadTs, text) {
+    console.log(text);
+  }
+
+  buildPayloads(text) {
+    return [{ text }];
   }
 }
 ```
 
-## Registering an Adapter
+## Approval Flow Integration
 
-In `config.json`:
-```json
-{
-  "adapters": {
-    "myconsole": {
-      "enabled": true
-    }
-  }
-}
-```
+If your platform supports interactive UI, implement `sendApproval()` and message updates so Orb can route permission requests back to the user.
 
-In `src/main.js`, import and instantiate your adapter alongside the existing ones.
+If it does not, you can still support the platform for normal replies while leaving permission approval unavailable there. The scheduler already handles that distinction.
 
-## Format Utilities
+## Testing Strategy
 
-Platform-specific text formatting belongs in `src/adapters/{platform}-format.js`. Platform-agnostic utilities (text sanitization, message splitting) go in `src/format-utils.js`.
+Focus on behavior, not just transport startup:
 
-See `src/adapters/slack-format.js` for a reference implementation (Markdown → mrkdwn conversion, Block Kit construction).
+- inbound message normalization
+- thread identity and history fetch
+- outbound reply chunking
+- approval-card lifecycle if the platform supports interactions
+- file upload handling
+- error paths such as reconnects and expired tokens
+
+The Slack adapter in `src/adapters/slack.js` is the best reference for the full contract, including approvals, progress updates, thread history, and rich payload rendering.
+
+## Design Rule
+
+If you find yourself adding platform-specific branches to `src/scheduler.js`, `src/worker.js`, or `src/context.js`, stop and move that logic back into the adapter.

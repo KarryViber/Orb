@@ -1,88 +1,257 @@
 # Configuration
 
-## config.json
+Orb reads one runtime config file, `config.json`, and interpolates `${ENV_VAR}` values before startup. This document describes the schema that the current code actually uses.
 
-The main configuration file. Copy from `config.example.json` and never commit the real file (it's `.gitignore`d).
+## Overview
 
-Supports `${ENV_VAR}` interpolation — values like `"${SLACK_BOT_TOKEN}"` are expanded from environment variables at startup.
+`config.json` has three top-level sections:
 
-Send `SIGHUP` to re-read `config.json` and refresh the cron scheduler's profile-name set without a full restart: `kill -HUP $(pgrep -f "node src/main.js")`
+- `adapters`: enabled messaging transports and their platform-specific settings
+- `profiles`: user routing and on-disk paths for each Claude workspace
+- `scheduler`: worker concurrency and timeout settings
 
-`SIGHUP` does **not** rebuild adapters, reload adapter tokens, reconnect an existing Slack Socket Mode session, restart active workers, or apply scheduler parameters that were already constructed in memory (`maxWorkers`, timeouts, etc.). Restart the daemon for full effect.
+Environment variable interpolation is exact-match only:
 
-### Full Schema
+```json
+{
+  "botToken": "${SLACK_BOT_TOKEN}"
+}
+```
+
+`"${SLACK_BOT_TOKEN}"` is expanded, but `"token:${SLACK_BOT_TOKEN}"` is not.
+
+## Full Example
 
 ```json
 {
   "adapters": {
     "slack": {
+      "enabled": true,
       "botToken": "${SLACK_BOT_TOKEN}",
       "appToken": "${SLACK_APP_TOKEN}",
-      "signingSecret": "${SLACK_SIGNING_SECRET}"
+      "allowBots": "none",
+      "replyBroadcast": false,
+      "freeResponseChannels": ["C0123456789"],
+      "freeResponseUsers": ["U0123456789"]
+    },
+    "wechat": {
+      "enabled": false,
+      "accountId": "${WECHAT_ACCOUNT_ID}",
+      "token": "${WECHAT_TOKEN}",
+      "dmPolicy": "allowlist",
+      "allowedUsers": []
     }
   },
   "profiles": {
-    "default": {
-      "userIds": [],
-      "freeResponseChannels": [],
-      "freeResponseUsers": []
-    },
     "alice": {
-      "userIds": ["U01234ABCDE"],
-      "freeResponseChannels": ["C09876FGHIJ"],
-      "freeResponseUsers": []
+      "userIds": ["U0123456789"],
+      "scripts": "./profiles/alice/scripts",
+      "workspace": "./profiles/alice/workspace",
+      "data": "./profiles/alice/data"
+    },
+    "ops": {
+      "userIds": ["U0987654321"],
+      "scripts": "./profiles/ops/scripts",
+      "workspace": "./profiles/ops/workspace",
+      "data": "./profiles/ops/data"
     }
   },
-  "claudePath": "claude",
-  "maxConcurrentWorkers": 2
+  "scheduler": {
+    "maxWorkers": 3,
+    "timeoutMs": 900000
+  }
 }
 ```
 
-### Profile Routing
+## Required Vs Optional
 
-- `userIds`: Slack user IDs routed to this profile. Find yours in Slack profile → More → Copy member ID.
-- `freeResponseChannels`: Channels where the bot responds without an `@mention`.
-- `freeResponseUsers`: User IDs that can DM the bot without `@mention`.
-- `default`: Fallback profile for users not listed in any other profile.
+### Required For A Minimal Slack Deployment
 
-### Top-Level Fields
+- `adapters.slack.enabled`
+- `adapters.slack.botToken`
+- `adapters.slack.appToken`
+- `profiles.{name}.userIds`
+- `profiles.{name}.workspace`
+- `profiles.{name}.data`
 
-| Field | Default | Description |
-|-------|---------|-------------|
-| `claudePath` | `"claude"` | Path to Claude Code CLI binary |
-| `maxConcurrentWorkers` | `2` | Max simultaneous worker processes |
+`profiles.{name}.scripts` is strongly recommended because Orb appends that path to Claude Code's system prompt, but the current resolver does not hard-fail if it is missing.
 
-## Environment Variables (.env)
+### Optional
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `SLACK_BOT_TOKEN` | Yes | Bot token (`xoxb-...`) |
-| `SLACK_APP_TOKEN` | Yes | App-level token (`xapp-...`) |
-| `SLACK_SIGNING_SECRET` | Yes | Request signing secret |
-| `CLAUDE_PATH` | No | Override Claude CLI path |
-| `CLAUDE_MODEL` | No | Default model (e.g. `claude-sonnet-4-6`) |
-| `MAX_TURNS` | No | Max agent turns per task (default: 50) |
-| `MAX_WORKERS` | No | Override max concurrent workers |
-| `MEMORY_ENABLED` | No | Enable holographic memory (default: true) |
-| `PYTHON_PATH` | No | Python binary for memory engine (default: python3) |
-| `REPLY_BROADCAST` | No | Also post replies to main channel (default: false) |
+- `adapters.slack.allowBots`
+- `adapters.slack.replyBroadcast`
+- `adapters.slack.freeResponseChannels`
+- `adapters.slack.freeResponseUsers`
+- `adapters.slack.dmRouting`
+- `adapters.wechat.*`
+- `scheduler.maxWorkers`
+- `scheduler.timeoutMs`
 
-## Holographic Memory
+## Top-Level Fields
 
-Requires Python 3.9+ and the deps in `lib/holographic/requirements.txt`:
+### adapters
 
-```bash
-pip install -r lib/holographic/requirements.txt
+Object keyed by adapter name.
+
+Currently read by `src/main.js`:
+
+- `slack`
+- `wechat`
+
+An adapter only starts when `enabled` is truthy.
+
+### profiles
+
+Object keyed by profile name.
+
+Each profile should point at three directories under `profiles/{name}/`:
+
+- `scripts`: utility scripts for the agent
+- `workspace`: Claude Code working directory
+- `data`: sessions, memory, DocStore index, cron jobs
+
+### scheduler
+
+Worker pool settings:
+
+- `maxWorkers`: maximum foreground workers at once
+- `timeoutMs`: hard timeout passed to each worker process
+
+If omitted, the scheduler falls back to built-in defaults.
+
+## Slack Adapter Fields
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `enabled` | Yes | Starts the adapter when `true` |
+| `botToken` | Yes | Slack bot token |
+| `appToken` | Yes | Slack Socket Mode app token |
+| `allowBots` | No | Bot-message policy |
+| `replyBroadcast` | No | Broadcast thread replies into the parent channel |
+| `freeResponseChannels` | No | Channels where the bot may answer without a mention |
+| `freeResponseUsers` | No | Users who may trigger free-response behavior |
+| `dmRouting` | No | Rule-based DM rerouting and worker prompt synthesis |
+
+The historical `signingSecret` field may still appear in older examples, but the current Socket Mode startup path does not read it.
+
+## WeChat Adapter Fields
+
+| Field | Required When Enabled | Meaning |
+| --- | --- | --- |
+| `accountId` | Yes | Account identity used by the adapter |
+| `token` | No | API token |
+| `dmPolicy` | No | Direct-message policy |
+| `allowedUsers` | No | Explicit allowlist when the policy requires it |
+| `sendChunkDelayMs` | No | Delay between outbound chunks |
+
+## Profile Routing Semantics
+
+Orb resolves a profile by scanning `profiles.*.userIds` for the incoming platform user ID.
+
+Important properties of the current resolver:
+
+- There is no fallback profile for unknown users.
+- The first matching `userIds` entry wins.
+- A new user means a new profile entry in `config.json`; no source change is required.
+
+That means a config like this routes two Slack users to different workspaces:
+
+```json
+{
+  "profiles": {
+    "alice": {
+      "userIds": ["U0123456789"],
+      "scripts": "./profiles/alice/scripts",
+      "workspace": "./profiles/alice/workspace",
+      "data": "./profiles/alice/data"
+    },
+    "research": {
+      "userIds": ["U0987654321"],
+      "scripts": "./profiles/research/scripts",
+      "workspace": "./profiles/research/workspace",
+      "data": "./profiles/research/data"
+    }
+  }
+}
 ```
 
-Orb's holographic memory is stored per-profile in `profiles/{name}/data/memory.db` for semantic recall and conflict tracking.
+## Multi-Adapter Example
 
-Persistent Claude-side memory is managed separately by Claude Code CLI auto-memory under `~/.claude/projects/<encoded-cwd>/memory/`. `profiles/{name}/data/MEMORY.md` is retired.
+Slack plus WeChat, two profiles:
 
-To disable: set `MEMORY_ENABLED=false` in `.env`.
+```json
+{
+  "adapters": {
+    "slack": {
+      "enabled": true,
+      "botToken": "${SLACK_BOT_TOKEN}",
+      "appToken": "${SLACK_APP_TOKEN}"
+    },
+    "wechat": {
+      "enabled": true,
+      "accountId": "${WECHAT_ACCOUNT_ID}",
+      "token": "${WECHAT_TOKEN}",
+      "dmPolicy": "open",
+      "allowedUsers": []
+    }
+  },
+  "profiles": {
+    "alice": {
+      "userIds": ["U0123456789"],
+      "scripts": "./profiles/alice/scripts",
+      "workspace": "./profiles/alice/workspace",
+      "data": "./profiles/alice/data"
+    },
+    "eting": {
+      "userIds": ["o9cq804ps1h8ylV_i6h6kBT9ocUY@im.wechat"],
+      "scripts": "./profiles/eting/scripts",
+      "workspace": "./profiles/eting/workspace",
+      "data": "./profiles/eting/data"
+    }
+  }
+}
+```
 
-## DocStore
+## Environment Variables
 
-Requires Python 3.9+ and the deps in `lib/docstore/requirements.txt`. Enables the agent to search indexed project documentation.
+These variables are commonly relevant in a real deployment:
 
-Configure `DOC_REGISTRY_PATH` or `DOC_PROJECTS_ROOT` env vars to point to your registry file.
+| Variable | Meaning |
+| --- | --- |
+| `SLACK_BOT_TOKEN` | Slack bot token |
+| `SLACK_APP_TOKEN` | Slack Socket Mode app token |
+| `WECHAT_ACCOUNT_ID` | WeChat account identifier |
+| `WECHAT_TOKEN` | WeChat token |
+| `CLAUDE_PATH` | Override the Claude Code binary path |
+| `CLAUDE_MODEL` | Default Claude model for workers |
+| `CLAUDE_EFFORT` | Default effort setting for workers |
+| `PYTHON_PATH` | Override the Python executable used by bridges |
+| `MEMORY_ENABLED` | Disable holographic memory when set to `false` |
+| `DOC_INDEX_ENABLED` | Disable DocStore when set to `false` |
+| `ORB_PERMISSION_APPROVAL_MODE` | `auto-allow` by default, `slack` for Slack approval cards |
+| `ORB_PERMISSION_TIMEOUT_MS` | Approval timeout |
+| `WORKER_IDLE_TIMEOUT_MS` | Idle lifetime for a live Claude CLI session |
+
+## Reload Behavior
+
+`SIGHUP` is a partial reload, not a full process rebuild.
+
+What updates:
+
+- `config.json` is re-read
+- the cron scheduler refreshes its profile-name set
+
+What does not update in place:
+
+- existing adapter connections
+- adapter credentials
+- active workers
+- already constructed scheduler limits and timeouts
+
+If you changed tokens, adapter enablement, or worker policy, restart Orb.
+
+## Related Files
+
+- [getting-started.md](getting-started.md)
+- [profile-guide.md](profile-guide.md)
+- [architecture.md](architecture.md)
