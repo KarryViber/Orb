@@ -252,6 +252,11 @@ export class Scheduler {
             return;
           }
 
+          if (msg.type === 'typing_heartbeat') {
+            try { await adapter.setTyping(msg.channel, msg.threadTs, 'is thinking…'); } catch (_) {}
+            return;
+          }
+
           responded = true;
 
           if (msg.type === 'turn_complete') {

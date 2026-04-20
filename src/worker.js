@@ -24,6 +24,7 @@ import { storeConversation } from './memory.js';
  *   { type: 'turn_complete', text, toolCount, lastTool, stopReason }
  *   { type: 'progress_update', text }  — Phase ①: fired on each TodoWrite event;
  *     scheduler posts/edits a single progress message in-thread (ts owned by scheduler).
+ *   { type: 'typing_heartbeat', channel, threadTs }  — Phase ②: 8s pulse while Claude CLI is running
  */
 
 const CLAUDE_PATH = process.env.CLAUDE_PATH || 'claude';
@@ -75,6 +76,11 @@ process.on('message', async (msg) => {
 
   // Session key includes platform to avoid collisions
   const sessionKey = platform ? `${platform}:${threadTs}` : threadTs;
+
+  // Typing heartbeat — Slack TTL is ~5s; pulse every 8s while CLI runs
+  const heartbeatInterval = setInterval(() => {
+    ipcSend({ type: 'typing_heartbeat', channel, threadTs }).catch(() => {});
+  }, 8_000);
 
   try {
     console.log(`[worker] starting task: thread=${threadTs} profile=${profile?.name || 'default'} text="${(userText || '[files]').slice(0, 80)}"`);
@@ -178,6 +184,8 @@ process.on('message', async (msg) => {
       // 附带上下文供教训蒸馏
       errorContext: { userText: (userText || '').slice(0, 2000) },
     }).catch(() => {});
+  } finally {
+    clearInterval(heartbeatInterval);
   }
 
   // Worker exits after CLI closes — no explicit process.exit needed
