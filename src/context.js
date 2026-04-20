@@ -1,9 +1,30 @@
 import { readFileSync, existsSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { recallMemory, searchDocs } from './memory.js';
+import { warn } from './log.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const TAG = 'context';
+
+function serializeError(error) {
+  if (!error) return 'Error: unknown';
+  const name = error.name || 'Error';
+  const message = error.message || String(error);
+  return `${name}: ${message}`;
+}
+
+function logRecallFailure(operation, dbPath, error) {
+  const parts = [
+    `operation=${operation}`,
+    `db=${basename(dbPath || 'unknown')}`,
+    `error=${serializeError(error)}`,
+  ];
+  if (error?.kind === 'timeout' || error?.code === 'ETIMEDOUT' || /timed out/i.test(error?.message || '')) {
+    parts.push('kind=timeout');
+  }
+  warn(TAG, parts.join(' '));
+}
 
 // ── DocStore slug inference (thread-scoped search) ──
 
@@ -133,6 +154,14 @@ export async function buildPrompt({ userText, fileContent, threadTs, userId, cha
       return searchDocs(userText, dataDir, slug);
     })(),
   ]);
+
+  if (memoryResult.status === 'rejected') {
+    logRecallFailure('buildPrompt.recallMemory', dbPath, memoryResult.reason);
+  }
+  if (docsResult.status === 'rejected') {
+    const docsDbPath = (dataDir ? join(dataDir, 'doc-index.db') : process.env.DOC_INDEX_DB) || 'doc-index.db';
+    logRecallFailure('buildPrompt.searchDocs', docsDbPath, docsResult.reason);
+  }
 
   const memories = memoryResult.status === 'fulfilled' ? (memoryResult.value || []) : [];
   const docs = docsResult.status === 'fulfilled' ? (docsResult.value || []) : [];

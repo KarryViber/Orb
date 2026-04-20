@@ -9,8 +9,9 @@
  */
 
 import { execFile } from 'node:child_process';
-import { join, dirname } from 'node:path';
+import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { info, warn } from './log.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const HOLOGRAPHIC_BRIDGE = join(__dirname, '..', 'lib', 'holographic', 'bridge.py');
@@ -28,6 +29,60 @@ const DEFAULT_DOC_DB = process.env.DOC_INDEX_DB || '';  // explicit env override
 const MEMORY_RECALL_LIMIT = parseInt(process.env.ORB_MEMORY_RECALL_LIMIT || '10', 10);
 const MEMORY_MIN_TRUST = parseFloat(process.env.ORB_MEMORY_MIN_TRUST || '0.3');
 const DOC_RECALL_LIMIT = parseInt(process.env.ORB_DOC_RECALL_LIMIT || '8', 10);
+const TAG = 'memory';
+
+function serializeError(error) {
+  if (!error) return 'Error: unknown';
+  const name = error.name || 'Error';
+  const message = error.message || String(error);
+  return `${name}: ${message}`;
+}
+
+function isTimeoutError(error) {
+  if (!error) return false;
+  return error.kind === 'timeout'
+    || error.code === 'ETIMEDOUT'
+    || /timed out/i.test(error.message || '');
+}
+
+function logBridgeFallback(operation, dbPath, error) {
+  const parts = [
+    `operation=${operation}`,
+    `db=${basename(dbPath || 'unknown')}`,
+    `error=${serializeError(error)}`,
+  ];
+  if (isTimeoutError(error)) parts.push('kind=timeout');
+  warn(TAG, parts.join(' '));
+}
+
+function forwardArbitrateStderr(stderr) {
+  const passthrough = [];
+  for (const rawLine of (stderr || '').split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    let forwarded = false;
+    try {
+      const parsed = JSON.parse(line);
+      if (parsed?.component === 'arbitrate') {
+        info(TAG, line);
+        forwarded = true;
+      }
+    } catch {}
+    if (!forwarded) passthrough.push(line);
+  }
+  return passthrough.join('\n');
+}
+
+function createBridgeError(prefix, err, stderr = '') {
+  const suffix = stderr ? ` ${stderr}` : '';
+  const wrapped = new Error(`${prefix}: ${err.message}${suffix}`);
+  wrapped.name = err.name || 'Error';
+  wrapped.code = err.code;
+  if (err.killed || err.code === 'ETIMEDOUT' || /timed out/i.test(err.message || '')) {
+    wrapped.kind = 'timeout';
+  }
+  return wrapped;
+}
 
 // ── Holographic bridge (JSON args) ──
 
@@ -38,8 +93,9 @@ function holographicBridge(dbPath, command, args = {}) {
       [HOLOGRAPHIC_BRIDGE, dbPath, command, JSON.stringify(args)],
       { timeout: 15_000, maxBuffer: 1024 * 1024 },
       (err, stdout, stderr) => {
+        const bridgeStderr = forwardArbitrateStderr(stderr);
         if (err) {
-          reject(new Error(`holographic ${command} failed: ${err.message} ${stderr || ''}`));
+          reject(createBridgeError(`holographic ${command} failed`, err, bridgeStderr));
           return;
         }
         try {
@@ -60,8 +116,9 @@ function holographicBatchBridge(dbPath, operations) {
       PYTHON,
       [HOLOGRAPHIC_BRIDGE, dbPath, 'batch', JSON.stringify({ operations })],
       { timeout: 30_000, maxBuffer: 2 * 1024 * 1024 },
-      (err, stdout) => {
-        if (err) return reject(err);
+      (err, stdout, stderr) => {
+        const bridgeStderr = forwardArbitrateStderr(stderr);
+        if (err) return reject(createBridgeError('holographic batch failed', err, bridgeStderr));
         try { resolve(JSON.parse(stdout.trim())); }
         catch { reject(new Error('batch: invalid JSON')); }
       },
@@ -79,7 +136,7 @@ function docstoreBridge(dbPath, command, ...extraArgs) {
       { timeout: 30_000, maxBuffer: 2 * 1024 * 1024 },
       (err, stdout, stderr) => {
         if (err) {
-          reject(new Error(`docstore ${command} failed: ${err.message} ${stderr || ''}`));
+          reject(createBridgeError(`docstore ${command} failed`, err, stderr));
           return;
         }
         try {
@@ -108,7 +165,8 @@ export async function recallMemory(query, userId, dbPath) {
     });
     if (Array.isArray(results)) return results;
     return [];
-  } catch {
+  } catch (error) {
+    logBridgeFallback('recallMemory', dbPath, error);
     return [];
   }
 }
@@ -121,15 +179,16 @@ export async function recallMemory(query, userId, dbPath) {
  */
 export async function searchDocs(query, dataDir, slug = null) {
   if (!DOC_INDEX_ENABLED || !query || DOC_RECALL_LIMIT <= 0) return [];
+  const db = (dataDir ? join(dataDir, 'doc-index.db') : '') || DEFAULT_DOC_DB;
   try {
-    const db = (dataDir ? join(dataDir, 'doc-index.db') : '') || DEFAULT_DOC_DB;
     if (!db) return [];
     const extraArgs = ['--limit', String(DOC_RECALL_LIMIT)];
     if (slug) extraArgs.push('--slug', slug);
     const results = await docstoreBridge(db, 'search', query, ...extraArgs);
     if (Array.isArray(results)) return results;
     return [];
-  } catch {
+  } catch (error) {
+    logBridgeFallback('searchDocs', db, error);
     return [];
   }
 }
@@ -174,7 +233,8 @@ export async function listFacts(dbPath, { category, minTrust = 0.5, limit = 50 }
     const results = await holographicBridge(db, 'list', { category, min_trust: minTrust, limit });
     if (Array.isArray(results)) return results;
     return [];
-  } catch {
+  } catch (error) {
+    logBridgeFallback('listFacts', dbPath, error);
     return [];
   }
 }
@@ -209,7 +269,11 @@ export async function storeConversation({ userText, responseText, threadTs, user
           confidence: fact.confidence || 'default',
         },
       }));
-      await holographicBatchBridge(db, operations).catch(() => {});
+      try {
+        await holographicBatchBridge(db, operations);
+      } catch (error) {
+        logBridgeFallback('storeConversation.batchAdd', db, error);
+      }
     } else if ((userText || '').length > 30) {
       // Fallback: store condensed raw if extraction found nothing
       // but user message was non-trivial
@@ -221,7 +285,9 @@ export async function storeConversation({ userText, responseText, threadTs, user
       });
     }
     // Short trivial exchanges: don't store at all
-  } catch { /* degrade gracefully */ }
+  } catch (error) {
+    logBridgeFallback('storeConversation', dbPath, error);
+  }
 }
 
 /**
@@ -256,7 +322,10 @@ export async function storeLesson({ userText, errorText, responseText, threadTs,
         category: 'lesson',
         min_trust: 0.0,
         limit: 1,
-      }).catch(() => []);
+      }).catch((error) => {
+        logBridgeFallback('storeLesson.dedupSearch', dbPath, error);
+        return [];
+      });
 
       if (Array.isArray(existing) && existing.length > 0 && existing[0].similarity > 0.85) {
         continue; // 语义高度相似，跳过
@@ -267,9 +336,13 @@ export async function storeLesson({ userText, errorText, responseText, threadTs,
         category: 'lesson',
         tags,
         source: lesson.source || 'unknown',
-      }).catch(() => {});
+      }).catch((error) => {
+        logBridgeFallback('storeLesson.add', dbPath, error);
+      });
     }
-  } catch { /* degrade gracefully */ }
+  } catch (error) {
+    logBridgeFallback('storeLesson', dbPath, error);
+  }
 }
 
 /**
@@ -310,7 +383,10 @@ export async function storeCorrectionLesson({ userText, responseText, threadHist
         category: 'lesson',
         min_trust: 0.0,
         limit: 1,
-      }).catch(() => []);
+      }).catch((error) => {
+        logBridgeFallback('storeCorrectionLesson.dedupSearch', dbPath, error);
+        return [];
+      });
       if (Array.isArray(existing) && existing.length > 0 && existing[0].similarity > 0.85) {
         continue;
       }
@@ -319,9 +395,13 @@ export async function storeCorrectionLesson({ userText, responseText, threadHist
         category: 'lesson',
         tags,
         source: lesson.source || 'correction_capture',
-      }).catch(() => {});
+      }).catch((error) => {
+        logBridgeFallback('storeCorrectionLesson.add', dbPath, error);
+      });
     }
-  } catch { /* degrade gracefully */ }
+  } catch (error) {
+    logBridgeFallback('storeCorrectionLesson', dbPath, error);
+  }
 }
 
 /**
@@ -336,7 +416,8 @@ export async function purgeTransient(dbPath, { categories, maxAgeDays = 7 } = {}
     if (categories) args.categories = categories;
     const result = await holographicBridge(dbPath, 'purge_transient', args);
     return result || { purged: 0 };
-  } catch {
+  } catch (error) {
+    logBridgeFallback('purgeTransient', dbPath, error);
     return { purged: 0 };
   }
 }
