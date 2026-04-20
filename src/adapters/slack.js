@@ -367,6 +367,7 @@ export class SlackAdapter extends PlatformAdapter {
     // Thread context cache (60s TTL, avoids hammering Slack API)
     this._threadCtxCache = new Map();
     this._THREAD_CTX_TTL = 60 * 1000;
+    this._cleanupInterval = null;
 
     // Pending approvals
     this._pendingApprovals = new Map();
@@ -966,6 +967,10 @@ export class SlackAdapter extends PlatformAdapter {
   }
 
   async disconnect() {
+    if (this._cleanupInterval) {
+      clearInterval(this._cleanupInterval);
+      this._cleanupInterval = null;
+    }
     this._socket.disconnect();
   }
 
@@ -1382,7 +1387,7 @@ export class SlackAdapter extends PlatformAdapter {
     info(TAG, `socket connected, reply_broadcast=${this._replyBroadcast}`);
 
     // Periodic cleanup every 30 min
-    setInterval(() => {
+    this._cleanupInterval = setInterval(() => {
       this._cleanupTrackedThreads();
       cleanImageCache(this._imageCacheDir).catch(() => {});
       info(TAG, `cleanup: trackedThreads=${this._trackedThreads.size} seenMessages=${this._seenMessages.size}`);

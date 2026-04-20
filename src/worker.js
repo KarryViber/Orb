@@ -13,7 +13,7 @@ import { storeConversation } from './memory.js';
  * Scheduler -> Worker:
  *   { type: 'task', userText, fileContent, imagePaths, threadTs, channel,
  *                   userId, platform, threadHistory, profile, model, effort,
- *                   mode?, priorConversation? }
+ *                   mode?, priorConversation?, disablePermissionPrompt? }
  *     - mode: 'skill-review' enters a dedicated branch that requires
  *       priorConversation; context.js injects it as "## 待审查会话".
  *     - priorConversation: [{role: 'user'|'assistant', content: string}, ...]
@@ -22,7 +22,7 @@ import { storeConversation } from './memory.js';
  * Worker -> Scheduler:
  *   { type: 'result', text, toolCount, lastTool?, stopReason? }
  *   { type: 'error', error, errorContext? }
- *   { type: 'turn_complete', text, toolCount, lastTool, stopReason, deliveredTexts }  — Phase ③: includes delivered set
+ *   { type: 'turn_complete', text, toolCount, lastTool, stopReason, deliveredTexts, undeliveredText? }  — Phase ③: includes delivered set + remaining text
  *   { type: 'progress_update', text }  — Phase ①: fired on each TodoWrite event;
  *     scheduler posts/edits a single progress message in-thread (ts owned by scheduler).
  *   { type: 'turn_start' }  — explicit turn ownership start on task/inject receipt
@@ -57,7 +57,7 @@ let _activeCli = null;   // reference to active interactive CLI session
 process.on('message', async (msg) => {
   if (msg.type === 'inject') {
     if (_activeCli) {
-      const injected = _activeCli.inject(msg.userText, msg.fileContent);
+      const injected = _activeCli.inject(msg.userText, msg.fileContent, msg.imagePaths);
       if (injected) {
         await ipcSend({ type: 'turn_start' }).catch(() => {});
         console.log(`[worker] injected: "${(msg.userText || '').slice(0, 60)}"`);
@@ -73,7 +73,7 @@ process.on('message', async (msg) => {
 
   await ipcSend({ type: 'turn_start' }).catch(() => {});
 
-  let { userText, fileContent, imagePaths, threadTs, channel, userId, platform, profile, threadHistory, model, effort, mode, priorConversation } = msg;
+  let { userText, fileContent, imagePaths, threadTs, channel, userId, platform, profile, threadHistory, model, effort, mode, priorConversation, disablePermissionPrompt } = msg;
 
   // Fail-fast: skill-review mode without context produces "no skill" noise.
   // Without real content to review the worker is just burning tokens on nothing.
@@ -127,36 +127,23 @@ process.on('message', async (msg) => {
     const promptLen = (prompt.systemPrompt?.length || 0) + (prompt.userPrompt?.length || prompt.length || 0);
     console.log(`[worker] prompt built (${promptLen} chars), session=${sessionId || 'new'}`);
     ensureWorkspaceClaudeSettings(WORKSPACE);
-    mcpConfigPath = writePermissionMcpConfig({
-      threadTs,
-      channel,
-      userId,
-      permissionTimeoutMs: DEFAULT_PERMISSION_TIMEOUT_MS,
-    });
-
-    // Build image content blocks for stream-json mode
-    const hasImages = Array.isArray(imagePaths) && imagePaths.length > 0;
-    const imageBlocks = [];
-    if (hasImages) {
-      const imgDir = join(WORKSPACE, '.images');
-      mkdirSync(imgDir, { recursive: true });
-      for (const imgPath of imagePaths) {
-        const name = imgPath.split('/').pop();
-        const dest = join(imgDir, name);
-        copyFileSync(imgPath, dest);
-        const ext = name.split('.').pop().toLowerCase();
-        const mimeMap = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp' };
-        const mediaType = mimeMap[ext] || 'image/png';
-        const b64 = readFileSync(dest, 'base64');
-        imageBlocks.push({ type: 'image', source: { type: 'base64', media_type: mediaType, data: b64 } });
-        console.log(`[worker] attached image: ${name} (${mediaType}, ${Math.round(b64.length / 1024)}KB b64)`);
-      }
+    const permissionPromptDisabled = disablePermissionPrompt === true || platform === 'system' || channel == null;
+    if (!permissionPromptDisabled) {
+      mcpConfigPath = writePermissionMcpConfig({
+        threadTs,
+        channel,
+        userId,
+        permissionTimeoutMs: DEFAULT_PERMISSION_TIMEOUT_MS,
+      });
     }
 
+    // Build image content blocks for stream-json mode
     // ── Build initial content (unified stream-json format) ──
-    const initialContent = [];
-    if (hasImages) initialContent.push(...imageBlocks);
-    initialContent.push({ type: 'text', text: prompt.userPrompt || String(prompt) });
+    const initialContent = buildUserContent({
+      userText: prompt.userPrompt || String(prompt),
+      imagePaths,
+      workspace: WORKSPACE,
+    });
 
     // ── CLI args for interactive stream-json mode ──
     const streamArgs = [
@@ -167,10 +154,14 @@ process.on('message', async (msg) => {
       '--output-format', 'stream-json',
       '--exclude-dynamic-system-prompt-sections',
       '--verbose',
-      '--permission-prompt-tool', 'mcp__orb_permission__orb_request_permission',
-      '--mcp-config', mcpConfigPath,
-      '--strict-mcp-config',
     ];
+    if (!permissionPromptDisabled) {
+      streamArgs.push(
+        '--permission-prompt-tool', 'mcp__orb_permission__orb_request_permission',
+        '--mcp-config', mcpConfigPath,
+        '--strict-mcp-config',
+      );
+    }
 
     if (sessionId) {
       streamArgs.push('--resume', sessionId);
@@ -303,6 +294,7 @@ function runClaudeInteractive(args, initialContent, workspace) {
   let onIntermediateText = null;
   let onTurnEnd = null;
   let deliveredTexts = [];
+  let accumulatedDelivered = '';
   let pendingText = '';
   let pendingTimer = null;
   let closed = false;
@@ -318,6 +310,7 @@ function runClaudeInteractive(args, initialContent, workspace) {
       pendingText = '';
       if (toSend) {
         deliveredTexts.push(toSend);
+        accumulatedDelivered += toSend;
         onIntermediateText(toSend);
       }
     }, 2000);
@@ -377,12 +370,14 @@ function runClaudeInteractive(args, initialContent, workspace) {
             lastTool,
             stopReason: lastStopReason,
             deliveredTexts: [...deliveredTexts],
+            undeliveredText: computeUndeliveredTurnText(turnText, accumulatedDelivered, deliveredTexts),
           });
         }
       } else if (!lastTurnText && turnText) {
         lastTurnText = turnText;
       }
       deliveredTexts = [];
+      accumulatedDelivered = '';
       turnBuffer = [];
       resetIdleTimer();
     }
@@ -396,11 +391,9 @@ function runClaudeInteractive(args, initialContent, workspace) {
     }, IDLE_TIMEOUT);
   }
 
-  function inject(userText, fileContent) {
+  function inject(userText, fileContent, imagePaths) {
     if (closed) return false;
-    let text = userText || '';
-    if (fileContent) text += `\n\n---\n\n## 附件\n${fileContent}`;
-    const content = [{ type: 'text', text }];
+    const content = buildUserContent({ userText, fileContent, imagePaths, workspace });
     const msg = JSON.stringify({ type: 'user', message: { role: 'user', content } });
     child.stdin.write(msg + '\n');
     turnOpen = true;
@@ -462,6 +455,49 @@ function ipcSend(msg) {
 
 function sanitizeFileToken(value) {
   return String(value || 'unknown').replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 80) || 'unknown';
+}
+
+export function computeUndeliveredTurnText(finalText, accumulatedDelivered = '', deliveredTexts = []) {
+  const text = String(finalText || '').trim();
+  if (!text) return '';
+
+  const accumulated = String(accumulatedDelivered || '').trim();
+  if (accumulated) {
+    if (text === accumulated || accumulated.includes(text)) return '';
+    if (text.startsWith(accumulated)) return text.slice(accumulated.length).trimStart();
+    if (text.endsWith(accumulated)) return text.slice(0, text.length - accumulated.length).trimEnd();
+  }
+
+  const deliveredSet = new Set((deliveredTexts || []).map((entry) => String(entry || '').trim()).filter(Boolean));
+  return deliveredSet.has(text) ? '' : text;
+}
+
+function buildUserContent({ userText, fileContent, imagePaths, workspace }) {
+  let text = userText || '';
+  if (fileContent) text += `\n\n---\n\n## 附件\n${fileContent}`;
+  return [
+    ...buildImageBlocks(imagePaths, workspace),
+    { type: 'text', text },
+  ];
+}
+
+function buildImageBlocks(imagePaths, workspace) {
+  if (!Array.isArray(imagePaths) || imagePaths.length === 0) return [];
+  const imgDir = join(workspace, '.images');
+  mkdirSync(imgDir, { recursive: true });
+  const blocks = [];
+  for (const imgPath of imagePaths) {
+    const name = imgPath.split('/').pop();
+    const dest = join(imgDir, name);
+    copyFileSync(imgPath, dest);
+    const ext = name.split('.').pop().toLowerCase();
+    const mimeMap = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp' };
+    const mediaType = mimeMap[ext] || 'image/png';
+    const b64 = readFileSync(dest, 'base64');
+    blocks.push({ type: 'image', source: { type: 'base64', media_type: mediaType, data: b64 } });
+    console.log(`[worker] attached image: ${name} (${mediaType}, ${Math.round(b64.length / 1024)}KB b64)`);
+  }
+  return blocks;
 }
 
 function schedulerSocketPathForPid(pid) {
