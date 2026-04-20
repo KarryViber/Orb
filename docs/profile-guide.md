@@ -1,31 +1,31 @@
 # Profile Guide
 
-Each profile is a self-contained agent identity. Multiple profiles can run simultaneously on the same Orb instance, each responding to different users.
+Each profile is an isolated Claude Code workspace. Multiple profiles can run on the same Orb instance, each responding to different users with its own workspace, scripts, runtime state, and Claude Code auto-memory.
 
 ## Directory Structure
 
 ```
 profiles/your-name/
-├── soul/
-│   ├── SOUL.md          # Agent persona & collaboration boundaries
-│   └── USER.md          # User profile (auto-synced from holographic memory)
-├── skills/              # Claude Code agent-format skill files (.md)
 ├── scripts/             # Utility scripts the agent can execute
-├── workspace/
-│   └── CLAUDE.md        # Agent runtime constraints (read by Claude CLI)
+├── workspace/           # Claude Code working directory for this profile
+│   ├── CLAUDE.md        # Persona + runtime constraints
+│   └── .claude/
+│       ├── skills/
+│       │   └── my-skill/SKILL.md
+│       └── agents/      # Optional per-profile agents
 └── data/                # Auto-generated at runtime (gitignored)
     ├── sessions.json    # Thread ↔ session mappings
     ├── memory.db        # Holographic memory database
-    ├── cron-jobs.json   # Scheduled tasks
-    └── MEMORY.md        # Distilled facts (injected into system prompt)
+    ├── doc-index.db     # DocStore index (when enabled)
+    └── cron-jobs.json   # Scheduled tasks
 ```
 
-## SOUL.md — Agent Persona
+## workspace/CLAUDE.md — Persona And Runtime Constraints
 
-Defines who the agent is and how it behaves. This is the core identity file.
+This is the profile's main instruction file. Put persona, collaboration style, execution discipline, and workspace-specific rules here.
 
 ```markdown
-# Identity
+# Persona
 
 You are [name], [brief description].
 
@@ -35,32 +35,27 @@ You are [name], [brief description].
 - [rule 2]
 ```
 
-Loaded once per session (cached, invalidated on SIGHUP). Changes take effect on next cold start or SIGHUP.
+Claude Code discovers three `CLAUDE.md` layers automatically:
 
-## USER.md — User Profile
+- `~/.claude/CLAUDE.md`
+- `~/Orb/CLAUDE.md`
+- `profiles/{name}/workspace/CLAUDE.md`
 
-Describes the user the agent is assisting. Used to tailor responses.
+Orb does not manually rebuild those layers on `SIGHUP`. Changes in `workspace/CLAUDE.md`, `workspace/.claude/skills/`, `workspace/.claude/agents/`, or CLI auto-memory are picked up by new worker/session starts; active workers keep the context they already started with.
 
-```markdown
-# User Profile
+## Claude Code Auto-Memory
 
-- **Name**: Alice
-- **Timezone**: America/New_York
-- **Language**: English
-- **Work style**: Direct, prefers bullet points over prose
+Persistent memory is managed by Claude Code CLI under:
+
+```text
+~/.claude/projects/<encoded-cwd>/memory/
 ```
 
-This file is automatically updated by the scheduler when holographic memory extracts high-trust preference facts. You can also edit it manually.
+Orb no longer uses `profiles/{name}/data/MEMORY.md`. Treat the CLI-managed auto-memory as the durable store tied to the profile workspace `cwd`.
 
-## workspace/CLAUDE.md — Runtime Constraints
+## workspace/.claude/skills/ — Agent Skills
 
-Read by Claude Code CLI as its `CLAUDE.md` file (from the workspace `cwd`). Controls agent behavior at the execution level — what it's allowed to do, output format, discipline rules.
-
-The example in `profiles/example/workspace/CLAUDE.md` is a good starting point.
-
-## skills/ — Agent Skills
-
-Place Claude Code agent-format skill files here. Each `.md` file is auto-indexed and injected into the system prompt as a skill reference.
+Place Claude Code skills under `workspace/.claude/skills/<skill-name>/SKILL.md`. Claude Code auto-discovers them from the workspace `cwd`; Orb does not inject a separate skill index file.
 
 Skill files must include `name:` and `description:` fields:
 
@@ -77,9 +72,13 @@ description: Does something useful
 
 The agent can then invoke the skill by reading the full file when needed.
 
+## workspace/.claude/agents/ — Optional Agents
+
+Place reusable per-profile agents under `workspace/.claude/agents/` if you want Claude Code to auto-discover them from the profile workspace.
+
 ## scripts/ — Utility Scripts
 
-Place executable scripts here for the agent to run during tasks. Can be any language. The scripts directory path is injected into the system prompt so the agent knows where to look.
+Place executable scripts here for the agent to run during tasks. Can be any language. Orb appends the scripts directory path as a small system-prompt hint so the agent knows where to look.
 
 ## data/ — Runtime Data (auto-generated)
 
@@ -87,8 +86,15 @@ Never commit `data/` — it's gitignored. Contains:
 
 - `sessions.json` — maps `{platform}:{threadTs}` → Claude session ID, enabling conversation resumption
 - `memory.db` — holographic memory: conversation embeddings, extracted facts, preference signals
+- `doc-index.db` — DocStore full-text index (when enabled)
 - `cron-jobs.json` — scheduled task definitions (read/write directly to manage cron jobs)
-- `MEMORY.md` — distilled high-trust facts, injected into every system prompt
+
+## Retired Files
+
+- `profiles/{name}/soul/SOUL.md` and `profiles/{name}/soul/USER.md` are retired. Persona and user-facing operating style now belong in `workspace/CLAUDE.md`.
+- `profiles/{name}/data/MEMORY.md` is retired. Persistent Claude-side memory now lives in `~/.claude/projects/<encoded-cwd>/memory/`.
+
+Legacy profiles may still contain those files, but the current prompt architecture does not depend on them.
 
 ## Creating a New Profile
 
@@ -97,9 +103,9 @@ cp -r profiles/example profiles/your-name
 ```
 
 Then:
-1. Edit `profiles/your-name/soul/SOUL.md` — define the persona
-2. Edit `profiles/your-name/soul/USER.md` — describe the user
-3. Edit `profiles/your-name/workspace/CLAUDE.md` — customize runtime constraints
+1. Edit `profiles/your-name/workspace/CLAUDE.md` — define the persona and runtime constraints
+2. Add optional skills under `profiles/your-name/workspace/.claude/skills/`
+3. Add optional agents under `profiles/your-name/workspace/.claude/agents/`
 4. Add your Slack user ID to `config.json` under the new profile name
 
 ## Cron Jobs
@@ -110,3 +116,12 @@ Schedules support:
 - Cron expression: `"0 9 * * *"` (daily at 9am)
 - Interval: `"every 30m"`
 - One-shot delay: `"2h"` or ISO timestamp
+
+## Reloading Configuration
+
+`SIGHUP` is a partial reload only:
+
+- Re-reads `config.json`
+- Refreshes the cron scheduler's profile-name set
+
+It does not rebuild adapters, rotate adapter tokens, reconnect an existing Slack Socket Mode session, restart active workers, or apply scheduler limits/timeouts already loaded in memory. Restart the daemon if you need those changes to take effect.

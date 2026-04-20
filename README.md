@@ -45,14 +45,12 @@ Orb sits between your messaging platform and Claude Code. It adds what Claude Co
      ┌──────┴──────────────────────────┐
      │         Context Assembly         │
      │                                  │
-     │  ┌─────────┐  ┌──────────────┐  │
-     │  │  Soul    │  │  Holographic │  │
-     │  │  Layer   │  │  Memory      │  │
-     │  └─────────┘  └──────────────┘  │
-     │  ┌─────────┐  ┌──────────────┐  │
-     │  │  Skills  │  │  DocStore    │  │
-     │  │  Index   │  │  (FTS5)     │  │
-     │  └─────────┘  └──────────────┘  │
+     │  ┌──────────────┐ ┌────────────┐│
+     │  │ CLAUDE Layers │ │ Auto-memory││
+     │  └──────────────┘ └────────────┘│
+     │  ┌──────────────┐ ┌────────────┐│
+     │  │ Skills/Agents │ │ DocStore   ││
+     │  └──────────────┘ └────────────┘│
      └─────────────────────────────────┘
 ```
 
@@ -78,9 +76,8 @@ Orb learns from every interaction and refines itself automatically:
 1. **Fact extraction** — each conversation → categorized facts (preference, decision, lesson, knowledge, entity)
 2. **Error distillation** — mistakes → actionable lessons ("what to do differently", not "what went wrong")
 3. **Correction capture** — user corrections → preference facts with asymmetric trust scoring (penalties > rewards)
-4. **Memory sync** (every 6h) — high-trust facts → consolidated into `MEMORY.md` (durable agent memory)
-5. **User profile sync** — preference facts → auto-merged into `USER.md` (the agent's understanding of you)
-6. **Conflict resolution** — new facts trigger a Haiku arbitration against near-neighbors; contradictions tombstone older facts instead of silently coexisting
+4. **Holographic consolidation** — high-trust facts remain queryable in local `memory.db`, and contradictions tombstone older facts instead of silently coexisting
+5. **Claude Code auto-memory** — durable profile-specific memory is managed by Claude Code CLI under `~/.claude/projects/<encoded-cwd>/memory/`
 
 The result: the agent gets better at working with you over time, without you explicitly teaching it.
 
@@ -99,28 +96,30 @@ Each user gets a fully isolated environment:
 
 ```
 profiles/your-name/
-├── soul/           # Agent persona & behavior rules
-│   ├── SOUL.md     # Identity, tone, collaboration boundaries
-│   └── USER.md     # Your profile (auto-synced from memory)
-├── skills/         # Claude Code agent-format skill files
 ├── scripts/        # Utility scripts the agent can call
-├── workspace/      # Claude Code working directory
-│   └── CLAUDE.md   # Agent runtime constraints
+├── workspace/      # Claude Code working directory (cwd per profile)
+│   ├── CLAUDE.md   # Persona + runtime constraints
+│   └── .claude/
+│       ├── skills/ # Per-profile Claude Code skills
+│       └── agents/ # Optional agents discovered by CLI
 └── data/           # Sessions, memory DB, cron jobs (auto-generated)
 ```
 
 Profiles don't share memory, sessions, or workspace. One Orb instance can serve multiple users with completely different personas.
 
+Legacy `soul/` files and `profiles/*/data/MEMORY.md` are retired. Persona now lives in `profiles/{name}/workspace/CLAUDE.md`, and persistent memory is handled by Claude Code CLI auto-memory keyed on the workspace `cwd`.
+
 ### Prompt Cache Optimization
 
-Orb splits context injection into two tiers to maximize [Anthropic prompt caching](https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching):
+Orb keeps its own prompt additions minimal and lets Claude Code discover the stable layers natively, which maximizes [Anthropic prompt caching](https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching):
 
-| Tier | Injected via | Content | Cache behavior |
+| Layer | Injected via | Content | Cache behavior |
 |------|-------------|---------|----------------|
-| **System prompt** | `--system-prompt` | Soul + User + MEMORY.md + Skills + Directives | Stable — high cache hit rate |
-| **User prompt** | stdin (`-p`) | Memory recall + Doc results + Thread history + Message | Dynamic — changes per request |
+| **CLI auto-discovery** | Claude Code native discovery | `~/.claude/CLAUDE.md` + `~/Orb/CLAUDE.md` + `{cwd}/CLAUDE.md`, per-workspace skills, agents, auto-memory | Stable — high cache hit rate |
+| **Orb appended system prompt** | `--append-system-prompt` | Scripts path pointer | Stable — minimal diff surface |
+| **Orb user prompt** | stdin (`-p` / stream-json) | Holographic recall + Doc results + Thread history + Message | Dynamic — changes per request |
 
-The system prompt stays nearly identical between turns → prompt cache stays warm → lower latency and cost.
+Stable layers stay nearly identical between turns, so prompt cache locality remains high without Orb maintaining a custom multi-file system prompt stack.
 
 ### Cron Scheduler
 
@@ -163,18 +162,19 @@ cp config.example.json config.json  # Add your user ID
 
 # Create your profile
 cp -r profiles/example profiles/your-name
-# Edit profiles/your-name/soul/SOUL.md — who should the agent be?
-# Edit profiles/your-name/soul/USER.md — who are you?
+# Edit profiles/your-name/workspace/CLAUDE.md — persona + runtime constraints
 
 # Start
 node src/main.js
 ```
 
-Then message your Slack bot. Orb routes the message to your profile, assembles context (soul + memory + docs), forks Claude Code, and sends the response back.
+Legacy `soul/` files in older profiles are retired after the Claude Code CLI migration.
+
+Then message your Slack bot. Orb routes the message to your profile, lets Claude Code assemble its native context layers (`CLAUDE.md` + skills/agents + auto-memory), adds Orb recall/docs context, forks Claude Code, and sends the response back.
 
 ## Configuration
 
-`config.json` supports `${ENV_VAR}` interpolation. Send `SIGHUP` to hot-reload without restart.
+`config.json` supports `${ENV_VAR}` interpolation. Sending `SIGHUP` only re-reads `config.json` and refreshes the cron scheduler's profile-name set. It does not rebuild adapters, rotate adapter tokens, reconnect an existing Slack Socket Mode session, restart active workers, or apply already-running scheduler parameters such as worker limits and timeouts. Restart the daemon for full effect.
 
 ```jsonc
 {
@@ -202,9 +202,9 @@ See [docs/configuration.md](docs/configuration.md) for full reference.
 1. **Message arrives** via Slack Socket Mode
 2. **Adapter normalizes** the message (extracts text, files, thread context)
 3. **Scheduler routes** to the correct profile based on `userIds` mapping
-4. **Context assembly** builds the prompt:
-   - System prompt: Soul + User + MEMORY.md + Skills index + Framework directives
-   - User prompt: Holographic recall (top 5) + DocStore results (top 5) + Thread history + Message
+4. **Context assembly** combines Claude Code native discovery with Orb additions:
+   - Claude Code auto-discovers `~/.claude/CLAUDE.md`, `~/Orb/CLAUDE.md`, `{workspace}/CLAUDE.md`, per-workspace skills/agents, and auto-memory
+   - Orb appends the scripts path pointer and streams holographic recall (top 5), DocStore results (top 5), thread history, and the current message
 5. **Worker forks** Claude Code CLI with assembled context as a one-shot process
 6. **Response streams** back: text → Slack, files → uploaded, approvals → interactive buttons
 7. **Post-processing**: conversation stored → facts extracted → memory updated

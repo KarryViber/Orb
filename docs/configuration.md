@@ -6,7 +6,9 @@ The main configuration file. Copy from `config.example.json` and never commit th
 
 Supports `${ENV_VAR}` interpolation — values like `"${SLACK_BOT_TOKEN}"` are expanded from environment variables at startup.
 
-Send `SIGHUP` to reload without restarting: `kill -HUP $(pgrep -f "node src/main.js")`
+Send `SIGHUP` to re-read `config.json` and refresh the cron scheduler's profile-name set without a full restart: `kill -HUP $(pgrep -f "node src/main.js")`
+
+`SIGHUP` does **not** rebuild adapters, reload adapter tokens, reconnect an existing Slack Socket Mode session, restart active workers, or apply scheduler parameters that were already constructed in memory (`maxWorkers`, timeouts, etc.). Restart the daemon for full effect.
 
 ### Full Schema
 
@@ -73,7 +75,9 @@ Requires Python 3.9+ and the deps in `lib/holographic/requirements.txt`:
 pip install -r lib/holographic/requirements.txt
 ```
 
-Memory is stored per-profile in `profiles/{name}/data/memory.db`. The agent can recall past facts semantically and distill high-trust facts into `MEMORY.md` (injected into system prompt).
+Orb's holographic memory is stored per-profile in `profiles/{name}/data/memory.db` for semantic recall and conflict tracking.
+
+Persistent Claude-side memory is managed separately by Claude Code CLI auto-memory under `~/.claude/projects/<encoded-cwd>/memory/`. `profiles/{name}/data/MEMORY.md` is retired.
 
 To disable: set `MEMORY_ENABLED=false` in `.env`.
 
