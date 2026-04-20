@@ -220,6 +220,8 @@ export class CronScheduler {
     this._spawnCronWorker = spawnCronWorker;
     this._deliverResult = deliverResult;
     this._running = false;
+    this._inflightJobs = new Set();
+    this._jobWriteChains = new Map();
   }
 
   start() {
@@ -258,11 +260,12 @@ export class CronScheduler {
           continue;
         }
 
+        await this._awaitJobWrites(paths.dataDir);
         const jobs = loadJobs(paths.dataDir);
         if (jobs.length === 0) continue;
 
-        let dirty = false;
         const dueJobs = [];
+        const nextRunUpdates = new Map();
 
         for (const job of jobs) {
           if (!job.enabled) continue;
@@ -279,7 +282,7 @@ export class CronScheduler {
             const next = computeNextRun(job.schedule, now);
             job.nextRunAt = next ? next.toISOString() : null;
             warn(TAG, `fast-forwarded stale job ${job.id} "${job.name}" (missed by ${Math.round(stale / 60_000)}m)`);
-            dirty = true;
+            nextRunUpdates.set(job.id, { nextRunAt: job.nextRunAt });
             continue;
           }
 
@@ -287,20 +290,33 @@ export class CronScheduler {
           if (job.schedule.kind !== 'once') {
             const next = computeNextRun(job.schedule, now);
             job.nextRunAt = next ? next.toISOString() : null;
+            nextRunUpdates.set(job.id, { nextRunAt: job.nextRunAt });
           }
-          dirty = true;
 
           dueJobs.push(job);
         }
 
-        // Execute all due jobs in parallel within this profile
-        if (dueJobs.length > 0) {
-          await Promise.allSettled(
-            dueJobs.map((job) => this._executeCronJob(job, paths, now))
-          );
+        if (nextRunUpdates.size > 0) {
+          await this._queueJobWrite(paths.dataDir, (storedJobs) => {
+            let dirty = false;
+
+            for (const storedJob of storedJobs) {
+              const updates = nextRunUpdates.get(storedJob.id);
+              if (!updates) continue;
+              if (storedJob.nextRunAt === updates.nextRunAt) continue;
+              storedJob.nextRunAt = updates.nextRunAt;
+              dirty = true;
+            }
+
+            return dirty;
+          });
         }
 
-        if (dirty) saveJobs(paths.dataDir, jobs);
+        for (const job of dueJobs) {
+          this._executeCronJob(job, paths, now).catch((err) => {
+            logError(TAG, `job ${job.id} failed: ${err.message}`);
+          });
+        }
       }
     } catch (err) {
       logError(TAG, `tick error: ${err.stack || err.message}`);
@@ -310,6 +326,12 @@ export class CronScheduler {
   }
 
   async _executeCronJob(job, paths, now) {
+    if (this._inflightJobs.has(job.id)) {
+      warn(TAG, `job ${job.id} still running from previous tick, skipping this fire`);
+      return;
+    }
+
+    this._inflightJobs.add(job.id);
     info(TAG, `executing job ${job.id} "${job.name}" (profile=${job.profileName})`);
 
     try {
@@ -351,6 +373,64 @@ export class CronScheduler {
       job.enabled = false;
       job.nextRunAt = null;
     }
+
+    try {
+      await this._persistJobState(paths.dataDir, job);
+    } catch (err) {
+      logError(TAG, `failed to persist job ${job.id}: ${err.message}`);
+    } finally {
+      this._inflightJobs.delete(job.id);
+    }
+  }
+
+  async _awaitJobWrites(dataDir) {
+    const pending = this._jobWriteChains.get(dataDir);
+    if (!pending) return;
+    await pending.catch(() => {});
+  }
+
+  _queueJobWrite(dataDir, mutateJobs) {
+    const previous = this._jobWriteChains.get(dataDir) || Promise.resolve();
+    const next = previous
+      .catch(() => {})
+      .then(() => {
+        const jobs = loadJobs(dataDir);
+        if (!mutateJobs(jobs)) return;
+        saveJobs(dataDir, jobs);
+      });
+
+    let tracked;
+    tracked = next.finally(() => {
+      if (this._jobWriteChains.get(dataDir) === tracked) {
+        this._jobWriteChains.delete(dataDir);
+      }
+    });
+
+    this._jobWriteChains.set(dataDir, tracked);
+    return tracked;
+  }
+
+  _persistJobState(dataDir, job) {
+    return this._queueJobWrite(dataDir, (jobs) => {
+      const storedJob = jobs.find((item) => item.id === job.id);
+      if (!storedJob) return false;
+
+      storedJob.lastRunAt = job.lastRunAt;
+      storedJob.lastStatus = job.lastStatus;
+      storedJob.lastError = job.lastError;
+      storedJob.lastDeliveryError = job.lastDeliveryError;
+
+      if (job.repeat) {
+        storedJob.repeat = { ...(storedJob.repeat || {}), ...job.repeat };
+      }
+
+      if (!job.enabled) {
+        storedJob.enabled = false;
+        storedJob.nextRunAt = null;
+      }
+
+      return true;
+    });
   }
 
   /**

@@ -1,0 +1,134 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
+import { CronScheduler } from '../src/cron.js';
+
+function createTempDataDir() {
+  const root = mkdtempSync(join(tmpdir(), 'orb-cron-'));
+  const dataDir = join(root, 'data');
+  mkdirSync(dataDir, { recursive: true });
+  return dataDir;
+}
+
+function writeJobs(dataDir, jobs) {
+  writeFileSync(join(dataDir, 'cron-jobs.json'), JSON.stringify(jobs, null, 2) + '\n', 'utf-8');
+}
+
+function readJobs(dataDir) {
+  return JSON.parse(readFileSync(join(dataDir, 'cron-jobs.json'), 'utf-8'));
+}
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+function createJob(id, overrides = {}) {
+  return {
+    id,
+    name: id,
+    enabled: true,
+    profileName: 'karry',
+    prompt: `run ${id}`,
+    schedule: { kind: 'interval', minutes: 1, display: 'every 1m' },
+    nextRunAt: new Date(Date.now() - 60_000).toISOString(),
+    deliver: null,
+    ...overrides,
+  };
+}
+
+function createScheduler(dataDir, spawnCronWorker) {
+  const scheduler = new CronScheduler({
+    getProfilePaths: () => ({ dataDir, workspaceDir: dataDir, scriptsDir: dataDir }),
+    spawnCronWorker,
+    deliverResult: async () => {},
+  });
+  scheduler.setProfileNames(['karry']);
+  return scheduler;
+}
+
+test('tick releases the scheduler lock before worker completion', async () => {
+  const dataDir = createTempDataDir();
+  const gate = deferred();
+  const spawned = [];
+
+  const scheduler = createScheduler(dataDir, async (job) => {
+    spawned.push(job.id);
+    if (job.id === 'job-1') return gate.promise;
+    return 'ok';
+  });
+
+  writeJobs(dataDir, [createJob('job-1')]);
+
+  const tickPromise = scheduler.tick();
+  assert.equal(await Promise.race([tickPromise.then(() => 'resolved'), delay(50, 'timeout')]), 'resolved');
+
+  const persisted = readJobs(dataDir);
+  writeJobs(dataDir, [
+    persisted[0],
+    createJob('job-2'),
+  ]);
+
+  await scheduler.tick();
+  assert.deepEqual(spawned, ['job-1', 'job-2']);
+
+  gate.resolve('ok');
+  await delay(20);
+  await scheduler._awaitJobWrites(dataDir);
+});
+
+test('per-job guard prevents concurrent execution of the same job', async () => {
+  const dataDir = createTempDataDir();
+  const gate = deferred();
+  let spawnCount = 0;
+
+  const scheduler = createScheduler(dataDir, async () => {
+    spawnCount += 1;
+    return gate.promise;
+  });
+
+  writeJobs(dataDir, [createJob('job-1')]);
+
+  await scheduler.tick();
+
+  const jobs = readJobs(dataDir);
+  jobs[0].nextRunAt = new Date(Date.now() - 60_000).toISOString();
+  writeJobs(dataDir, jobs);
+
+  await scheduler.tick();
+  assert.equal(spawnCount, 1);
+
+  gate.resolve('ok');
+  await delay(20);
+  await scheduler._awaitJobWrites(dataDir);
+});
+
+test('fire-and-forget execution still persists job state', async () => {
+  const dataDir = createTempDataDir();
+  const scheduler = createScheduler(dataDir, async () => 'ok');
+
+  writeJobs(dataDir, [
+    createJob('job-1', {
+      schedule: { kind: 'once', runAt: new Date(Date.now() - 60_000).toISOString(), display: 'once' },
+    }),
+  ]);
+
+  await scheduler.tick();
+  await delay(20);
+  await scheduler._awaitJobWrites(dataDir);
+
+  const [job] = readJobs(dataDir);
+  assert.equal(job.enabled, false);
+  assert.equal(job.nextRunAt, null);
+  assert.equal(job.lastStatus, 'ok');
+  assert.equal(job.lastError, null);
+  assert.match(job.lastRunAt, /\d{4}-\d{2}-\d{2}T/);
+});
