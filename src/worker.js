@@ -22,6 +22,8 @@ import { storeConversation } from './memory.js';
  *   { type: 'result', text, toolCount, lastTool?, stopReason? }
  *   { type: 'error', error, errorContext? }
  *   { type: 'turn_complete', text, toolCount, lastTool, stopReason }
+ *   { type: 'progress_update', text }  — Phase ①: fired on each TodoWrite event;
+ *     scheduler posts/edits a single progress message in-thread (ts owned by scheduler).
  */
 
 const CLAUDE_PATH = process.env.CLAUDE_PATH || 'claude';
@@ -185,6 +187,15 @@ process.on('message', async (msg) => {
 
 const IDLE_TIMEOUT = 5_000; // 5s idle → close stdin → CLI exits
 
+function renderTodos(todos) {
+  const lines = ['📋 进度'];
+  for (const t of todos) {
+    const icon = t.status === 'completed' ? '✅' : t.status === 'in_progress' ? '🔄' : '⬜';
+    lines.push(`${icon} ${t.content}`);
+  }
+  return lines.join('\n');
+}
+
 function runClaudeInteractive(args, initialContent, workspace) {
   const child = spawn(CLAUDE_PATH, args, {
     cwd: workspace,
@@ -221,7 +232,13 @@ function runClaudeInteractive(args, initialContent, workspace) {
     if (msg.type === 'assistant' && msg.message?.content) {
       for (const block of msg.message.content) {
         if (block.type === 'text') turnBuffer.push(block.text);
-        if (block.type === 'tool_use') { totalToolCount++; lastTool = block.name || null; }
+        if (block.type === 'tool_use') {
+          totalToolCount++;
+          lastTool = block.name || null;
+          if (block.name === 'TodoWrite' && Array.isArray(block.input?.todos)) {
+            ipcSend({ type: 'progress_update', text: renderTodos(block.input.todos) }).catch(() => {});
+          }
+        }
       }
     }
     if (msg.type === 'result') {

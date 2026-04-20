@@ -196,6 +196,8 @@ export class Scheduler {
     // Rerun via 🔥 reaction: first emitted payload edits targetMessageTs,
     // subsequent payloads append as normal replies.
     let pendingEdit = task.targetMessageTs || null;
+    // Phase ①: ts of the in-thread progress message (null until first TodoWrite)
+    let progressTs = null;
     const emitPayload = async (payload) => {
       const extra = payload.blocks ? { blocks: payload.blocks } : {};
       if (pendingEdit) {
@@ -235,6 +237,21 @@ export class Scheduler {
             return;
           }
           info(TAG, `worker response: type=${msg.type} thread=${threadTs} textLen=${msg.text?.length || 0}`);
+
+          if (msg.type === 'progress_update') {
+            try {
+              if (!progressTs) {
+                const result = await adapter.sendReply(channel, threadTs, msg.text);
+                progressTs = result?.ts || null;
+              } else {
+                await adapter.editMessage(channel, progressTs, msg.text);
+              }
+            } catch (err) {
+              warn(TAG, `progress message failed: ${err.message}`);
+            }
+            return;
+          }
+
           responded = true;
 
           if (msg.type === 'turn_complete') {
