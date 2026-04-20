@@ -453,6 +453,9 @@ export class SlackAdapter extends PlatformAdapter {
   // --- Approval buttons ---
 
   _buildApprovalBlocks(prompt, approvalId) {
+    if (prompt && typeof prompt === 'object' && prompt.kind === 'permission') {
+      return this._buildPermissionApprovalBlocks(prompt, approvalId);
+    }
     return [
       { type: 'section', text: { type: 'mrkdwn', text: prompt } },
       { type: 'actions', elements: [
@@ -468,24 +471,125 @@ export class SlackAdapter extends PlatformAdapter {
     ];
   }
 
+  _buildPermissionApprovalBlocks(prompt, approvalId) {
+    const timeoutSeconds = Math.round((prompt.timeoutMs || 300_000) / 1000);
+    const toolInput = this._truncateForSlackCodeBlock(prompt.toolInput, 500);
+    return [
+      {
+        type: 'section',
+        text: { type: 'mrkdwn', text: `*🔐 权限请求* \`${prompt.toolName || 'unknown'}\`` },
+      },
+      {
+        type: 'section',
+        fields: [
+          { type: 'mrkdwn', text: `*来源*\nthread \`${prompt.threadTs || 'unknown'}\`` },
+          { type: 'mrkdwn', text: `*Request ID*\n\`${prompt.requestId || 'unknown'}\`` },
+        ],
+      },
+      {
+        type: 'section',
+        text: { type: 'mrkdwn', text: `*参数*\n\`\`\`${toolInput}\`\`\`` },
+      },
+      {
+        type: 'context',
+        elements: [
+          { type: 'mrkdwn', text: `请在 ${timeoutSeconds}s 内处理；超时后将自动拒绝。` },
+        ],
+      },
+      {
+        type: 'actions',
+        elements: [
+          {
+            type: 'button',
+            text: { type: 'plain_text', text: '允许', emoji: true },
+            style: 'primary',
+            action_id: 'orb_approve_once',
+            value: approvalId,
+          },
+          {
+            type: 'button',
+            text: { type: 'plain_text', text: '拒绝', emoji: true },
+            style: 'danger',
+            action_id: 'orb_deny',
+            value: approvalId,
+          },
+        ],
+      },
+    ];
+  }
+
+  _truncateForSlackCodeBlock(value, maxChars) {
+    let text;
+    try {
+      text = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+    } catch {
+      text = String(value);
+    }
+    const normalized = (text || '').replace(/```/g, '` ` `');
+    if (normalized.length <= maxChars) return normalized;
+    return `${normalized.slice(0, maxChars - 3)}...`;
+  }
+
+  _approvalFallbackText(prompt) {
+    if (prompt && typeof prompt === 'object' && prompt.kind === 'permission') {
+      return `权限请求: ${prompt.toolName || 'unknown'}`;
+    }
+    return `承認リクエスト: ${String(prompt || '').slice(0, 100)}`;
+  }
+
+  _approvalTimeoutReason(prompt) {
+    if (prompt && typeof prompt === 'object' && prompt.kind === 'permission') {
+      const seconds = Math.round((prompt.timeoutMs || 300_000) / 1000);
+      return `timeout: no response from Slack approval in ${seconds}s`;
+    }
+    return 'timeout';
+  }
+
+  _buildApprovalStatusBlocks(pending, label, extraText) {
+    const updatedBlocks = (pending.blocks || [])
+      .filter((b) => b.type !== 'actions')
+      .concat([{
+        type: 'context',
+        elements: [
+          { type: 'mrkdwn', text: extraText ? `${label} · ${extraText}` : label },
+        ],
+      }]);
+    return updatedBlocks;
+  }
+
   async sendApproval(channel, threadTs, prompt) {
+    const effectivePrompt = (prompt && typeof prompt === 'object')
+      ? { ...prompt, threadTs, channel }
+      : prompt;
     const approvalId = `${threadTs}_${Date.now()}`;
-    const blocks = this._buildApprovalBlocks(prompt, approvalId);
+    const blocks = this._buildApprovalBlocks(effectivePrompt, approvalId);
+    const timeoutMs = (effectivePrompt && typeof effectivePrompt === 'object' && effectivePrompt.timeoutMs) ? effectivePrompt.timeoutMs : 10 * 60 * 1000;
 
     const msg = await this._slack.chat.postMessage({
       channel,
       thread_ts: threadTs,
       blocks,
-      text: `承認リクエスト: ${prompt.slice(0, 100)}`,
+      text: this._approvalFallbackText(effectivePrompt),
     });
 
     return new Promise((resolve) => {
       const timeoutHandle = setTimeout(() => {
         if (this._pendingApprovals.has(approvalId)) {
+          const pending = this._pendingApprovals.get(approvalId);
           this._pendingApprovals.delete(approvalId);
-          resolve({ approved: false, reason: 'timeout' });
+          const reason = this._approvalTimeoutReason(effectivePrompt);
+          const label = effectivePrompt?.kind === 'permission' ? '⏰ 超时自动拒绝' : '⏰ Timed Out';
+          this._slack.chat.update({
+            channel,
+            ts: msg.ts,
+            blocks: this._buildApprovalStatusBlocks(pending, label, reason),
+            text: label,
+          }).catch((err) => {
+            logError(TAG, `failed to update timed out approval: ${err.message}`);
+          });
+          resolve({ approved: false, reason, scope: 'once' });
         }
-      }, 10 * 60 * 1000);
+      }, timeoutMs);
 
       this._pendingApprovals.set(approvalId, {
         resolve,
@@ -493,6 +597,8 @@ export class SlackAdapter extends PlatformAdapter {
         threadTs,
         messageTs: msg.ts,
         timeoutHandle,
+        prompt: effectivePrompt,
+        blocks,
       });
     });
   }
@@ -523,12 +629,7 @@ export class SlackAdapter extends PlatformAdapter {
     const { approved, scope, label } = decision;
 
     try {
-      const originalBlocks = body.message?.blocks || [];
-      const updatedBlocks = originalBlocks
-        .filter((b) => b.type !== 'actions')
-        .concat([{ type: 'context', elements: [
-          { type: 'mrkdwn', text: `${label} by <@${userId}>` },
-        ]}]);
+      const updatedBlocks = this._buildApprovalStatusBlocks(pending, label, `by <@${userId}>`);
 
       await this._slack.chat.update({
         channel: pending.channel,
