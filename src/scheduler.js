@@ -257,17 +257,34 @@ export class Scheduler {
             return;
           }
 
+          if (msg.type === 'intermediate_text') {
+            if (msg.text?.trim()) {
+              try {
+                const payloads = adapter.buildPayloads(msg.text);
+                for (const payload of payloads) {
+                  await adapter.sendReply(channel, threadTs, payload.text, payload.blocks ? { blocks: payload.blocks } : {});
+                }
+              } catch (err) {
+                warn(TAG, `failed to send intermediate text: ${err.message}`);
+              }
+            }
+            return;
+          }
+
           responded = true;
 
           if (msg.type === 'turn_complete') {
-            // 中间轮次完成 — 发送结果，typing 由 interval 维持
+            // 中间轮次完成 — 去重已由 intermediate_text 投递的文本，避免重复发送
             try {
               const text = msg.text?.trim();
               if (text) {
-                turnDelivered = true;
-                const payloads = adapter.buildPayloads(text);
-                for (const payload of payloads) {
-                  await emitPayload(payload);
+                const deliveredSet = new Set((msg.deliveredTexts || []).map(t => t.trim()));
+                if (!deliveredSet.has(text)) {
+                  turnDelivered = true;
+                  const payloads = adapter.buildPayloads(text);
+                  for (const payload of payloads) {
+                    await emitPayload(payload);
+                  }
                 }
               }
             } catch (err) {

@@ -25,6 +25,8 @@ import { storeConversation } from './memory.js';
  *   { type: 'progress_update', text }  — Phase ①: fired on each TodoWrite event;
  *     scheduler posts/edits a single progress message in-thread (ts owned by scheduler).
  *   { type: 'typing_heartbeat', channel, threadTs }  — Phase ②: 8s pulse while Claude CLI is running
+ *   { type: 'intermediate_text', text }  — Phase ③: mid-turn text block, debounced 2s
+ *   { type: 'turn_complete', text, toolCount, lastTool, stopReason, deliveredTexts }  — Phase ③: includes delivered set
  */
 
 const CLAUDE_PATH = process.env.CLAUDE_PATH || 'claude';
@@ -150,8 +152,13 @@ process.on('message', async (msg) => {
     // Each turn completed → send to scheduler for delivery
     cli.setOnTurnComplete(async (turn) => {
       if (turn.text?.trim()) {
-        await ipcSend({ type: 'turn_complete', text: turn.text, toolCount: turn.toolCount, lastTool: turn.lastTool, stopReason: turn.stopReason });
+        await ipcSend({ type: 'turn_complete', text: turn.text, toolCount: turn.toolCount, lastTool: turn.lastTool, stopReason: turn.stopReason, deliveredTexts: turn.deliveredTexts || [] });
       }
+    });
+
+    // Phase ③: stream mid-turn text blocks as they arrive
+    cli.setOnIntermediateText(async (text) => {
+      await ipcSend({ type: 'intermediate_text', text }).catch(() => {});
     });
 
     // Wait for CLI to exit (idle timeout or stdin.end)
@@ -218,7 +225,26 @@ function runClaudeInteractive(args, initialContent, workspace) {
   let lastSessionId = null;
   let lastTurnText = '';
   let onTurnComplete = null;
+  let onIntermediateText = null;
+  let deliveredTexts = [];
+  let pendingText = '';
+  let pendingTimer = null;
   let closed = false;
+
+  const queueIntermediate = (text) => {
+    if (!text?.trim() || !onIntermediateText) return;
+    if (pendingTimer) clearTimeout(pendingTimer);
+    pendingText = pendingText ? pendingText + '\n' + text : text;
+    pendingTimer = setTimeout(() => {
+      pendingTimer = null;
+      const toSend = pendingText.trim();
+      pendingText = '';
+      if (toSend) {
+        deliveredTexts.push(toSend);
+        onIntermediateText(toSend);
+      }
+    }, 2000);
+  };
 
   // ── stdout: incremental NDJSON parse ──
   let stdoutBuf = '';
@@ -239,7 +265,10 @@ function runClaudeInteractive(args, initialContent, workspace) {
   function handleStreamMsg(msg) {
     if (msg.type === 'assistant' && msg.message?.content) {
       for (const block of msg.message.content) {
-        if (block.type === 'text') turnBuffer.push(block.text);
+        if (block.type === 'text') {
+          turnBuffer.push(block.text);
+          queueIntermediate(block.text);
+        }
         if (block.type === 'tool_use') {
           totalToolCount++;
           lastTool = block.name || null;
@@ -254,6 +283,9 @@ function runClaudeInteractive(args, initialContent, workspace) {
       lastStopReason = msg.stop_reason || msg.subtype || null;
       const turnText = msg.result || turnBuffer.join('\n');
 
+      // Cancel pending intermediate flush — turn is done, onTurnComplete takes over
+      if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null; pendingText = ''; }
+
       // 防止同一段文本重复触发（CLI 可能输出多个 result 行）
       if (turnText && turnText !== lastTurnText) {
         lastTurnText = turnText;
@@ -263,11 +295,13 @@ function runClaudeInteractive(args, initialContent, workspace) {
             toolCount: totalToolCount,
             lastTool,
             stopReason: lastStopReason,
+            deliveredTexts: [...deliveredTexts],
           });
         }
       } else if (!lastTurnText && turnText) {
         lastTurnText = turnText;
       }
+      deliveredTexts = [];
       turnBuffer = [];
       resetIdleTimer();
     }
@@ -330,6 +364,7 @@ function runClaudeInteractive(args, initialContent, workspace) {
     exitPromise,
     child,
     setOnTurnComplete: (fn) => { onTurnComplete = fn; },
+    setOnIntermediateText: (fn) => { onIntermediateText = fn; },
   };
 }
 

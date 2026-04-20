@@ -153,6 +153,8 @@ Scheduler ↔ Worker communication via Node IPC (process.send/on('message')):
 | Worker → Scheduler | `turn_complete` | `{ type: 'turn_complete', text, toolCount, lastTool, stopReason }` | Signals that one Claude turn finished; scheduler can deliver it while keeping the worker alive for future `inject` messages. |
 | Worker → Scheduler | `progress_update` | `{ type: 'progress_update', text }` | Phase ①: emitted on every TodoWrite event. Scheduler posts on first occurrence (stores `ts`), then edits in-place on subsequent ones. Does NOT set `responded` flag or clear typing. |
 | Worker → Scheduler | `typing_heartbeat` | `{ type: 'typing_heartbeat', channel, threadTs }` | Phase ②: 8s pulse while Claude CLI runs. Scheduler refreshes Slack typing indicator without clearing it. Does NOT set `responded` flag. |
+| Worker → Scheduler | `intermediate_text` | `{ type: 'intermediate_text', text }` | Phase ③: mid-turn assistant text block, debounced 2s. Scheduler delivers immediately; `turn_complete` deduplicates against `deliveredTexts` to avoid re-sending. |
+| Worker → Scheduler | `turn_complete` (updated) | `{ type: 'turn_complete', text, toolCount, lastTool, stopReason, deliveredTexts }` | Phase ③ update: now carries `deliveredTexts[]` so scheduler can skip re-delivery of already-streamed text. |
 
 Adding or changing message types/payload fields requires updating `worker.js` header comment, `scheduler.js` handler, and this section together.
 
