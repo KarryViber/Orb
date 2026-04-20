@@ -80,8 +80,11 @@ process.on('message', async (msg) => {
   // Session key includes platform to avoid collisions
   const sessionKey = platform ? `${platform}:${threadTs}` : threadTs;
 
-  // Typing heartbeat — Slack TTL is ~5s; pulse every 8s while CLI runs
+  let heartbeatBusy = true;
+
+  // Typing heartbeat — Slack TTL is ~5s; pulse every 8s while Claude is busy
   const heartbeatInterval = setInterval(() => {
+    if (!heartbeatBusy) return;
     ipcSend({ type: 'typing_heartbeat', channel, threadTs }).catch(() => {});
   }, 8_000);
 
@@ -158,6 +161,7 @@ process.on('message', async (msg) => {
       }
     });
     cli.setOnActivity(async (state) => {
+      heartbeatBusy = state === 'busy';
       await ipcSend({ type: state });
     });
 
