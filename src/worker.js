@@ -33,6 +33,7 @@ import { storeConversation } from './memory.js';
 const CLAUDE_PATH = process.env.CLAUDE_PATH || 'claude';
 const MAX_TURNS = parseInt(process.env.MAX_TURNS, 10) || 50;
 const DEFAULT_PERMISSION_TIMEOUT_MS = parseInt(process.env.ORB_PERMISSION_TIMEOUT_MS, 10) || 300_000;
+const MCP_PERMISSION_TOOL_NOT_FOUND_RE = /MCP tool mcp__orb_permission__orb_request_permission[\s\S]*not found[\s\S]*Available MCP tools: none/i;
 const DEFAULT_WORKSPACE_ALLOW_RULES = [
   'Read(*)',
   'Skill(*)',
@@ -178,32 +179,67 @@ process.on('message', async (msg) => {
     }
 
     console.log(`[worker] cli args: ${streamArgs.join(' ')}`);
-    console.log(`[worker] starting interactive CLI session`);
-    const cli = runClaudeInteractive(streamArgs, initialContent, WORKSPACE);
-    _activeCli = cli;
+    let mcpRetried = false;
 
-    // Each turn completed → send to scheduler for delivery
-    cli.setOnTurnComplete(async (turn) => {
-      if (turn.text?.trim()) {
-        await ipcSend({ type: 'turn_complete', text: turn.text, toolCount: turn.toolCount, lastTool: turn.lastTool, stopReason: turn.stopReason, deliveredTexts: turn.deliveredTexts || [] });
+    const startCliSession = () => {
+      console.log(`[worker] starting interactive CLI session`);
+      const cli = runClaudeInteractive(streamArgs, initialContent, WORKSPACE);
+      _activeCli = cli;
+
+      // Each turn completed → send to scheduler for delivery
+      cli.setOnTurnComplete(async (turn) => {
+        if (turn.text?.trim()) {
+          await ipcSend({ type: 'turn_complete', text: turn.text, toolCount: turn.toolCount, lastTool: turn.lastTool, stopReason: turn.stopReason, deliveredTexts: turn.deliveredTexts || [] });
+        }
+      });
+      cli.setOnTurnEnd(async () => {
+        await ipcSend({ type: 'turn_end' }).catch(() => {});
+      });
+
+      // Phase ③: stream mid-turn text blocks as they arrive
+      cli.setOnIntermediateText(async (text) => {
+        await ipcSend({ type: 'intermediate_text', text }).catch(() => {});
+      });
+
+      return cli;
+    };
+
+    const waitForCliExit = async (cli) => {
+      const exitResult = await cli.exitPromise;
+      if (_activeCli === cli) _activeCli = null;
+
+      console.log(`[worker] CLI exited: code=${exitResult.code} tools=${exitResult.toolCount}`);
+      if (exitResult.stderr?.trim()) {
+        console.error(`[worker] CLI stderr: ${exitResult.stderr.trim()}`);
       }
-    });
-    cli.setOnTurnEnd(async () => {
-      await ipcSend({ type: 'turn_end' }).catch(() => {});
-    });
 
-    // Phase ③: stream mid-turn text blocks as they arrive
-    cli.setOnIntermediateText(async (text) => {
-      await ipcSend({ type: 'intermediate_text', text }).catch(() => {});
-    });
+      return exitResult;
+    };
 
-    // Wait for CLI to exit (idle timeout or stdin.end)
-    const exitResult = await cli.exitPromise;
-    _activeCli = null;
-
-    console.log(`[worker] CLI exited: code=${exitResult.code} tools=${exitResult.toolCount}`);
-    if (exitResult.stderr?.trim()) {
-      console.error(`[worker] CLI stderr: ${exitResult.stderr.trim()}`);
+    let cli = startCliSession();
+    let exitResult = await waitForCliExit(cli);
+    if (
+      exitResult.code === 1 &&
+      exitResult.stderr?.trim() &&
+      MCP_PERMISSION_TOOL_NOT_FOUND_RE.test(exitResult.stderr) &&
+      !mcpRetried
+    ) {
+      mcpRetried = true;
+      console.log('[worker] MCP race detected, retrying after 500ms (1/1)');
+      cleanupTempFile(mcpConfigPath);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      mcpConfigPath = writePermissionMcpConfig({
+        threadTs,
+        channel,
+        userId,
+        permissionTimeoutMs: DEFAULT_PERMISSION_TIMEOUT_MS,
+      });
+      const mcpConfigIndex = streamArgs.indexOf('--mcp-config');
+      if (mcpConfigIndex >= 0 && streamArgs[mcpConfigIndex + 1]) {
+        streamArgs[mcpConfigIndex + 1] = mcpConfigPath;
+      }
+      cli = startCliSession();
+      exitResult = await waitForCliExit(cli);
     }
 
     // Session persistence
