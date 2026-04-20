@@ -1,5 +1,7 @@
 import { join } from 'node:path';
+import net from 'node:net';
 import { readdirSync, readFileSync, existsSync, statSync, unlinkSync, writeFileSync, mkdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { info, error as logError, warn } from './log.js';
 import { taskQueue } from './queue.js';
 import { sanitizeErrorText } from './format-utils.js';
@@ -11,6 +13,7 @@ const SKILL_REVIEW_THRESHOLD = 10;   // cumulative tool uses before triggering r
 const MEMORY_SYNC_THRESHOLD = 20;    // cumulative tool uses before memory/user sync
 const MEMORY_SYNC_INTERVAL = 6 * 60 * 60 * 1000;  // min 6h between syncs per profile
 const MAX_AUTO_CONTINUE = 2;  // max auto-retries on empty result (context overflow)
+const PERMISSION_APPROVAL_TIMEOUT_MS = parseInt(process.env.ORB_PERMISSION_TIMEOUT_MS, 10) || 300_000;
 
 // --- Effort escalation keywords ---
 // 命中任一关键词且消息长度 > 20 字 → 升到 xhigh
@@ -61,6 +64,11 @@ export class Scheduler {
     this._autoContinueCount = new Map(); // threadTs → retry count for empty results
     this._backgroundWorkers = new Set(); // skill-review + memory-sync workers
     this._maxBackgroundWorkers = 2;
+    this._pendingPermissionRequests = new Map();
+    this._permissionApprovalMode = process.env.ORB_PERMISSION_APPROVAL_MODE || 'auto-allow';
+    this._permissionSocketPath = join(tmpdir(), `orb-permission-scheduler-${process.pid}.sock`);
+    this._permissionServer = null;
+    this._startPermissionServer();
   }
 
   addAdapter(name, adapter) {
@@ -69,6 +77,147 @@ export class Scheduler {
 
   _getAdapter(platform) {
     return this.adapters.get(platform) || this.adapters.values().next().value;
+  }
+
+  _startPermissionServer() {
+    try {
+      if (existsSync(this._permissionSocketPath)) unlinkSync(this._permissionSocketPath);
+    } catch (err) {
+      warn(TAG, `failed to cleanup stale permission socket: ${err.message}`);
+    }
+
+    this._permissionServer = net.createServer((socket) => this._handlePermissionSocket(socket));
+    this._permissionServer.on('error', (err) => {
+      logError(TAG, `permission socket server error: ${err.message}`);
+    });
+    this._permissionServer.listen(this._permissionSocketPath, () => {
+      info(TAG, `permission socket listening: ${this._permissionSocketPath} mode=${this._permissionApprovalMode}`);
+    });
+  }
+
+  _handlePermissionSocket(socket) {
+    socket.setEncoding('utf8');
+    let buffer = '';
+
+    socket.on('data', (chunk) => {
+      buffer += chunk;
+      const newlineIndex = buffer.indexOf('\n');
+      if (newlineIndex === -1) return;
+      const line = buffer.slice(0, newlineIndex).trim();
+      buffer = buffer.slice(newlineIndex + 1);
+      if (!line) return;
+
+      let msg;
+      try {
+        msg = JSON.parse(line);
+      } catch (err) {
+        warn(TAG, `invalid permission socket payload: ${err.message}`);
+        this._writePermissionSocketResponse(socket, { allow: false, reason: `invalid permission payload: ${err.message}` });
+        return;
+      }
+
+      this._handlePermissionRequest(msg, socket).catch((err) => {
+        logError(TAG, `permission request failed: ${err.message}`);
+        this._writePermissionSocketResponse(socket, { allow: false, reason: `permission request failed: ${err.message}` });
+      });
+    });
+
+    socket.on('error', (err) => {
+      warn(TAG, `permission socket client error: ${err.message}`);
+    });
+  }
+
+  async _handlePermissionRequest(msg, socket) {
+    if (msg?.type !== 'permission_request') {
+      this._writePermissionSocketResponse(socket, { allow: false, reason: `unsupported socket message type: ${msg?.type || 'unknown'}` });
+      return;
+    }
+
+    const requestId = String(msg.requestId || '');
+    const threadTs = String(msg.threadTs || '');
+    const channel = msg.channel || null;
+    const toolName = msg.toolName || 'unknown';
+    const key = this._permissionRequestKey(threadTs, requestId);
+    if (!threadTs || !requestId) {
+      this._writePermissionSocketResponse(socket, { allow: false, reason: 'permission request missing threadTs/requestId' });
+      return;
+    }
+    if (this._pendingPermissionRequests.has(key)) {
+      this._writePermissionSocketResponse(socket, { allow: false, reason: `duplicate permission request: ${key}` });
+      return;
+    }
+
+    const activeEntry = this.activeWorkers.get(threadTs);
+    const platform = activeEntry?.platform || 'slack';
+    const adapter = this._getAdapter(platform);
+    this._pendingPermissionRequests.set(key, {
+      socket,
+      requestId,
+      threadTs,
+      channel,
+      toolName,
+      createdAt: Date.now(),
+      settled: false,
+    });
+
+    socket.once('close', () => {
+      const pending = this._pendingPermissionRequests.get(key);
+      if (pending && !pending.settled) {
+        this._pendingPermissionRequests.delete(key);
+        warn(TAG, `permission socket closed before response: ${key}`);
+      }
+    });
+
+    if (this._permissionApprovalMode !== 'slack') {
+      info(TAG, `permission auto-allow: thread=${threadTs} tool=${toolName} request=${requestId}`);
+      this._resolvePermissionRequest(key, { allow: true, reason: 'auto-allow stub' });
+      return;
+    }
+
+    if (!adapter?.sendApproval) {
+      this._resolvePermissionRequest(key, { allow: false, reason: 'permission approval adapter unavailable' });
+      return;
+    }
+
+    // TODO(karry): Slack interactive callback path needs daemon-backed manual validation in a real thread.
+    info(TAG, `permission approval requested: thread=${threadTs} tool=${toolName} request=${requestId}`);
+    const decision = await adapter.sendApproval(channel, threadTs, {
+      kind: 'permission',
+      toolName,
+      toolInput: msg.toolInput,
+      requestId,
+      toolUseId: msg.toolUseId,
+      timeoutMs: PERMISSION_APPROVAL_TIMEOUT_MS,
+    });
+
+    const reason = decision?.approved
+      ? `approved by ${decision.userId || 'unknown'}`
+      : decision?.reason || `timeout: no response from Slack approval in ${Math.round(PERMISSION_APPROVAL_TIMEOUT_MS / 1000)}s`;
+    this._resolvePermissionRequest(key, {
+      allow: Boolean(decision?.approved),
+      reason,
+    });
+  }
+
+  _permissionRequestKey(threadTs, requestId) {
+    return `${threadTs}:${requestId}`;
+  }
+
+  _resolvePermissionRequest(key, payload) {
+    const pending = this._pendingPermissionRequests.get(key);
+    if (!pending) return;
+    pending.settled = true;
+    this._pendingPermissionRequests.delete(key);
+    this._writePermissionSocketResponse(pending.socket, payload);
+  }
+
+  _writePermissionSocketResponse(socket, payload) {
+    if (!socket || socket.destroyed) return;
+    try {
+      socket.end(`${JSON.stringify(payload)}\n`);
+    } catch (err) {
+      warn(TAG, `failed to write permission socket response: ${err.message}`);
+    }
   }
 
   async submit(task) {
@@ -414,7 +563,7 @@ export class Scheduler {
       return;
     }
 
-    this.activeWorkers.set(threadTs, { worker });
+    this.activeWorkers.set(threadTs, { worker, platform, channel, userId });
     worker.on('error', (err) => {
       logError(TAG, `worker error event: pid=${worker.pid} err=${err.message}`);
     });
@@ -603,6 +752,12 @@ export class Scheduler {
   shutdown(signal) {
     const allWorkers = [...this.activeWorkers.values()].map(({ worker }) => worker).concat([...this._backgroundWorkers]);
     info(TAG, `${signal} received, draining ${this.activeWorkers.size} active + ${this._backgroundWorkers.size} background worker(s)...`);
+    try {
+      this._permissionServer?.close();
+    } catch {}
+    try {
+      if (existsSync(this._permissionSocketPath)) unlinkSync(this._permissionSocketPath);
+    } catch {}
 
     // Persist queued tasks so they're not silently lost on SIGTERM
     try {

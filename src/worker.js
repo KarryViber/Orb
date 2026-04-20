@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
-import { mkdirSync, copyFileSync, readFileSync } from 'node:fs';
+import { mkdirSync, copyFileSync, readFileSync, existsSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir, homedir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildPrompt } from './context.js';
@@ -31,6 +32,24 @@ import { storeConversation } from './memory.js';
 
 const CLAUDE_PATH = process.env.CLAUDE_PATH || 'claude';
 const MAX_TURNS = parseInt(process.env.MAX_TURNS, 10) || 50;
+const DEFAULT_PERMISSION_TIMEOUT_MS = parseInt(process.env.ORB_PERMISSION_TIMEOUT_MS, 10) || 300_000;
+const DEFAULT_WORKSPACE_ALLOW_RULES = [
+  'Read(*)',
+  'Skill(*)',
+  'WebFetch(*)',
+  'WebSearch',
+  'Bash(git *)',
+  'Bash(rg *)',
+  'Bash(ls *)',
+  'Bash(find *)',
+  'Bash(cat *)',
+  'Bash(sed *)',
+  'Bash(head *)',
+  'Bash(tail *)',
+  'Bash(wc *)',
+  'Bash(pwd)',
+  'Bash(date)',
+];
 
 let _activeCli = null;   // reference to active interactive CLI session
 
@@ -85,6 +104,7 @@ process.on('message', async (msg) => {
 
   // Session key includes platform to avoid collisions
   const sessionKey = platform ? `${platform}:${threadTs}` : threadTs;
+  let mcpConfigPath = null;
 
   try {
     console.log(`[worker] starting task: thread=${threadTs} profile=${profile?.name || 'default'} text="${(userText || '[files]').slice(0, 80)}"`);
@@ -105,6 +125,13 @@ process.on('message', async (msg) => {
     });
     const promptLen = (prompt.systemPrompt?.length || 0) + (prompt.userPrompt?.length || prompt.length || 0);
     console.log(`[worker] prompt built (${promptLen} chars), session=${sessionId || 'new'}`);
+    ensureWorkspaceClaudeSettings(WORKSPACE);
+    mcpConfigPath = writePermissionMcpConfig({
+      threadTs,
+      channel,
+      userId,
+      permissionTimeoutMs: DEFAULT_PERMISSION_TIMEOUT_MS,
+    });
 
     // Build image content blocks for stream-json mode
     const hasImages = Array.isArray(imagePaths) && imagePaths.length > 0;
@@ -139,6 +166,9 @@ process.on('message', async (msg) => {
       '--output-format', 'stream-json',
       '--exclude-dynamic-system-prompt-sections',
       '--verbose',
+      '--permission-prompt-tool', 'mcp__orb_permission__orb_request_permission',
+      '--mcp-config', mcpConfigPath,
+      '--strict-mcp-config',
     ];
 
     if (sessionId) {
@@ -172,6 +202,9 @@ process.on('message', async (msg) => {
     _activeCli = null;
 
     console.log(`[worker] CLI exited: code=${exitResult.code} tools=${exitResult.toolCount}`);
+    if (exitResult.stderr?.trim()) {
+      console.error(`[worker] CLI stderr: ${exitResult.stderr.trim()}`);
+    }
 
     // Session persistence
     if (exitResult.sessionId) {
@@ -197,6 +230,8 @@ process.on('message', async (msg) => {
       // 附带上下文供教训蒸馏
       errorContext: { userText: (userText || '').slice(0, 2000) },
     }).catch(() => {});
+  } finally {
+    cleanupTempFile(mcpConfigPath);
   }
 
   // Worker exits after CLI closes — no explicit process.exit needed
@@ -387,4 +422,95 @@ function ipcSend(msg) {
       else resolve();
     });
   });
+}
+
+function sanitizeFileToken(value) {
+  return String(value || 'unknown').replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 80) || 'unknown';
+}
+
+function schedulerSocketPathForPid(pid) {
+  return join(tmpdir(), `orb-permission-scheduler-${pid}.sock`);
+}
+
+function writePermissionMcpConfig({ threadTs, channel, userId, permissionTimeoutMs }) {
+  const configPath = join(
+    tmpdir(),
+    `orb-mcp-${process.pid}-${sanitizeFileToken(threadTs)}.json`,
+  );
+  const serverPath = join(dirname(fileURLToPath(import.meta.url)), 'mcp-permission-server.js');
+  const config = {
+    mcpServers: {
+      orb_permission: {
+        type: 'stdio',
+        command: process.execPath,
+        args: [serverPath],
+        env: {
+          ORB_SCHEDULER_SOCKET: schedulerSocketPathForPid(process.ppid),
+          ORB_THREAD_TS: String(threadTs || ''),
+          ORB_CHANNEL: String(channel || ''),
+          ORB_USER_ID: String(userId || ''),
+          ORB_PERMISSION_TIMEOUT_MS: String(permissionTimeoutMs || DEFAULT_PERMISSION_TIMEOUT_MS),
+          ...(process.env.ORB_MCP_PERMISSION_LOG ? { ORB_MCP_PERMISSION_LOG: process.env.ORB_MCP_PERMISSION_LOG } : {}),
+        },
+      },
+    },
+  };
+  writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`);
+  console.log(`[worker] wrote MCP config: ${configPath}`);
+  return configPath;
+}
+
+function cleanupTempFile(filePath) {
+  if (!filePath) return;
+  try {
+    rmSync(filePath, { force: true });
+  } catch {}
+}
+
+function ensureWorkspaceClaudeSettings(workspace) {
+  const claudeDir = join(workspace, '.claude');
+  const settingsPath = join(claudeDir, 'settings.json');
+  if (existsSync(settingsPath)) return settingsPath;
+
+  mkdirSync(claudeDir, { recursive: true });
+  const settings = {
+    permissions: {
+      allow: collectWorkspaceAllowRules(),
+      defaultMode: 'default',
+    },
+  };
+  writeFileSync(settingsPath, `${JSON.stringify(settings, null, 2)}\n`);
+  console.log(`[worker] wrote workspace settings: ${settingsPath}`);
+  return settingsPath;
+}
+
+function collectWorkspaceAllowRules() {
+  const allow = new Set(DEFAULT_WORKSPACE_ALLOW_RULES);
+  const homeSettingsPath = join(homedir(), '.claude', 'settings.json');
+  if (!existsSync(homeSettingsPath)) return [...allow];
+
+  try {
+    const homeSettings = JSON.parse(readFileSync(homeSettingsPath, 'utf8'));
+    const homeAllow = homeSettings?.permissions?.allow;
+    if (Array.isArray(homeAllow)) {
+      for (const rule of homeAllow) {
+        if (isCommonAllowRule(rule)) allow.add(rule);
+      }
+    }
+  } catch (err) {
+    console.warn(`[worker] failed to read ~/.claude/settings.json: ${err.message}`);
+  }
+
+  return [...allow];
+}
+
+function isCommonAllowRule(rule) {
+  if (typeof rule !== 'string') return false;
+  return (
+    rule === 'Read(*)' ||
+    rule === 'Skill(*)' ||
+    rule === 'WebSearch' ||
+    rule === 'WebFetch(*)' ||
+    /^Bash\((git|rg|ls|find|cat|sed|head|tail|wc|pwd|date)(?:\s|[)])/.test(rule)
+  );
 }
