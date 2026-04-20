@@ -94,7 +94,6 @@ export class Scheduler {
       try {
         entry.worker.send({ type: 'inject', userText: task.userText, fileContent: task.fileContent, imagePaths: task.imagePaths });
         info(TAG, `injected into active worker: thread=${threadTs}`);
-        await entry.startTyping();
         return;
       } catch (e) {
         info(TAG, `inject failed, queuing: ${e.message}`);
@@ -192,7 +191,6 @@ export class Scheduler {
       }
       try { await adapter.setTyping(channel, threadTs, ''); } catch (_) {}
     };
-    await startTyping();
 
     let responded = false;
     let turnDelivered = false;
@@ -258,8 +256,13 @@ export class Scheduler {
             return;
           }
 
-          if (msg.type === 'typing_heartbeat') {
-            try { await adapter.setTyping(msg.channel, msg.threadTs, 'is thinking…'); } catch (_) {}
+          if (msg.type === 'turn_start') {
+            await startTyping();
+            return;
+          }
+
+          if (msg.type === 'turn_end') {
+            await stopTyping();
             return;
           }
 
@@ -277,20 +280,10 @@ export class Scheduler {
             return;
           }
 
-          if (msg.type === 'idle') {
-            await stopTyping();
-            return;
-          }
-
-          if (msg.type === 'busy') {
-            await startTyping();
-            return;
-          }
-
           responded = true;
 
           if (msg.type === 'turn_complete') {
-            // 中间轮次完成 — 去重已由 intermediate_text 投递的文本；typing 由 idle/busy/onExit 控制
+            // 中间轮次完成 — 去重已由 intermediate_text 投递的文本；typing 由 turn_start/turn_end/onExit 控制
             try {
               const text = msg.text?.trim();
               if (text) {
@@ -421,7 +414,7 @@ export class Scheduler {
       return;
     }
 
-    this.activeWorkers.set(threadTs, { worker, startTyping, stopTyping });
+    this.activeWorkers.set(threadTs, { worker });
     worker.on('error', (err) => {
       logError(TAG, `worker error event: pid=${worker.pid} err=${err.message}`);
     });
