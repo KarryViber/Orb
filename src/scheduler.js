@@ -14,6 +14,8 @@ const MEMORY_SYNC_THRESHOLD = 20;    // cumulative tool uses before memory/user 
 const MEMORY_SYNC_INTERVAL = 6 * 60 * 60 * 1000;  // min 6h between syncs per profile
 const MAX_AUTO_CONTINUE = 2;  // max auto-retries on empty result (context overflow)
 const PERMISSION_APPROVAL_TIMEOUT_MS = parseInt(process.env.ORB_PERMISSION_TIMEOUT_MS, 10) || 300_000;
+const SHUTDOWN_QUEUE_FILE = 'shutdown-queue.json';
+const SHUTDOWN_QUEUE_VERSION = 2;
 
 // --- Effort escalation keywords ---
 // 命中任一关键词且消息长度 > 20 字 → 升到 xhigh
@@ -69,14 +71,20 @@ export class Scheduler {
     this._permissionSocketPath = join(tmpdir(), `orb-permission-scheduler-${process.pid}.sock`);
     this._permissionServer = null;
     this._startPermissionServer();
+    this._restoreShutdownQueues();
   }
 
   addAdapter(name, adapter) {
     this.adapters.set(name, adapter);
+    setImmediate(() => {
+      this.replayQueuedTasks().catch((err) => {
+        warn(TAG, `startup replay dispatch failed: ${err.message}`);
+      });
+    });
   }
 
   _getAdapter(platform) {
-    return this.adapters.get(platform) || this.adapters.values().next().value;
+    return this.adapters.get(platform) || null;
   }
 
   _startPermissionServer() {
@@ -174,6 +182,15 @@ export class Scheduler {
       return;
     }
 
+    if (platform === 'system' || channel == null) {
+      warn(TAG, `permission request denied: unsupported approval route platform=${platform} thread=${threadTs} request=${requestId}`);
+      this._resolvePermissionRequest(key, {
+        allow: false,
+        reason: `permission approval unavailable for platform=${platform} channel=${channel == null ? 'null' : 'set'}`,
+      });
+      return;
+    }
+
     if (!adapter?.sendApproval) {
       this._resolvePermissionRequest(key, { allow: false, reason: 'permission approval adapter unavailable' });
       return;
@@ -230,9 +247,71 @@ export class Scheduler {
     }
   }
 
+  _restoreShutdownQueues() {
+    const profilesDir = join(import.meta.dirname, '..', 'profiles');
+    if (!existsSync(profilesDir)) return;
+
+    try {
+      const profiles = readdirSync(profilesDir, { withFileTypes: true }).filter((entry) => entry.isDirectory());
+      for (const entry of profiles) {
+        const queuePath = join(profilesDir, entry.name, 'data', SHUTDOWN_QUEUE_FILE);
+        if (!existsSync(queuePath)) continue;
+
+        try {
+          const raw = JSON.parse(readFileSync(queuePath, 'utf8'));
+          const restored = this._normalizeShutdownQueue(raw, queuePath);
+          let restoredCount = 0;
+
+          for (const task of restored.globalQueue) {
+            if (taskQueue.enqueue(task)) restoredCount++;
+            else warn(TAG, `startup replay dropped global queued task for thread=${task?.threadTs || 'unknown'}: taskQueue full`);
+          }
+
+          for (const [threadTs, queue] of Object.entries(restored.threadQueues)) {
+            const validQueue = Array.isArray(queue) ? queue.filter(Boolean) : [];
+            if (validQueue.length === 0) continue;
+            this.threadQueues.set(threadTs, validQueue);
+            restoredCount += validQueue.length;
+          }
+
+          unlinkSync(queuePath);
+          info(TAG, `startup replay restored ${restoredCount} queued task(s) from ${queuePath}`);
+        } catch (err) {
+          warn(TAG, `startup replay failed for ${queuePath}: ${err.message}`);
+        }
+      }
+    } catch (err) {
+      warn(TAG, `startup replay scan failed: ${err.message}`);
+    }
+  }
+
+  _normalizeShutdownQueue(raw, queuePath) {
+    if (Array.isArray(raw)) {
+      warn(TAG, `startup replay: legacy shutdown queue schema detected at ${queuePath}; only global queue will be restored`);
+      return { globalQueue: raw, threadQueues: {} };
+    }
+    if (!raw || typeof raw !== 'object') {
+      throw new Error('shutdown queue payload must be an array or object');
+    }
+
+    const globalQueue = Array.isArray(raw.globalQueue)
+      ? raw.globalQueue
+      : Array.isArray(raw.taskQueue)
+        ? raw.taskQueue
+        : [];
+    const threadQueues = raw.threadQueues && typeof raw.threadQueues === 'object'
+      ? raw.threadQueues
+      : {};
+    return { globalQueue, threadQueues };
+  }
+
   async submit(task) {
     const { threadTs, channel, platform } = task;
     const adapter = this._getAdapter(platform);
+    if (!adapter) {
+      logError(TAG, `submit failed: no adapter for platform=${platform} thread=${threadTs}`);
+      return;
+    }
 
     // Rerun (🔥 reaction): bypass inject, spawn fresh worker. If a worker is
     // already active on this thread, queue the rerun so it runs after it exits.
@@ -296,9 +375,41 @@ export class Scheduler {
     }
   }
 
+  async replayQueuedTasks() {
+    if (this.activeWorkers.size >= this.maxWorkers) return;
+
+    const pendingGlobal = Array.isArray(taskQueue.queue) ? taskQueue.queue.splice(0, taskQueue.queue.length) : [];
+    const deferredGlobal = [];
+    for (const task of pendingGlobal) {
+      if (this.activeWorkers.size >= this.maxWorkers) {
+        deferredGlobal.push(task);
+        continue;
+      }
+      if (!this._getAdapter(task.platform)) {
+        deferredGlobal.push(task);
+        continue;
+      }
+      await this.submit(task);
+    }
+    if (deferredGlobal.length > 0) taskQueue.queue.unshift(...deferredGlobal);
+
+    for (const [threadTs, queue] of [...this.threadQueues]) {
+      if (this.activeWorkers.size >= this.maxWorkers) break;
+      if (this.activeWorkers.has(threadTs) || queue.length === 0) continue;
+      if (!this._getAdapter(queue[0]?.platform)) continue;
+      const nextTask = queue.shift();
+      if (queue.length === 0) this.threadQueues.delete(threadTs);
+      await this.submit(nextTask);
+    }
+  }
+
   async _spawnWorker(task) {
     const { userText, fileContent, imagePaths, threadTs, channel, userId, platform } = task;
     const adapter = this._getAdapter(platform);
+    if (!adapter && platform !== 'system') {
+      logError(TAG, `spawn failed: no adapter for platform=${platform} thread=${threadTs}`);
+      return;
+    }
 
     // Resolve profile for this user
     let profile;
@@ -442,17 +553,14 @@ export class Scheduler {
           responded = true;
 
           if (msg.type === 'turn_complete') {
-            // 中间轮次完成 — 去重已由 intermediate_text 投递的文本；typing 由 turn_start/turn_end/onExit 控制
+            // 中间轮次完成 — worker 已裁剪掉经 intermediate_text 投递过的部分
             try {
-              const text = msg.text?.trim();
+              const text = (typeof msg.undeliveredText === 'string' ? msg.undeliveredText : msg.text)?.trim();
               if (text) {
-                const deliveredSet = new Set((msg.deliveredTexts || []).map(t => t.trim()));
-                if (!deliveredSet.has(text)) {
-                  turnDelivered = true;
-                  const payloads = adapter.buildPayloads(text);
-                  for (const payload of payloads) {
-                    await emitPayload(payload);
-                  }
+                turnDelivered = true;
+                const payloads = adapter.buildPayloads(text);
+                for (const payload of payloads) {
+                  await emitPayload(payload);
                 }
               }
             } catch (err) {
@@ -695,6 +803,7 @@ export class Scheduler {
         threadHistory: null,
         model: 'haiku',
         effort: 'low',
+        disablePermissionPrompt: true,
         mode: 'skill-review',
         priorConversation: priorMessages,
         profile: {
@@ -778,30 +887,53 @@ export class Scheduler {
         let t;
         while ((t = taskQueue.dequeue())) drained.push(t);
       }
-      if (drained && drained.length > 0) {
-        const byProfile = new Map();
-        for (const t of drained) {
-          let profileName = 'unknown';
-          try { profileName = this.getProfile(t.userId).name; } catch {}
-          if (!byProfile.has(profileName)) byProfile.set(profileName, []);
-          byProfile.get(profileName).push(t);
+      const byProfile = new Map();
+      const addPersistedTask = (task, threadTs = null) => {
+        let profileName = 'unknown';
+        let dataDir = null;
+        try {
+          const profile = this.getProfile(task.userId);
+          profileName = profile.name;
+          dataDir = profile.dataDir;
+        } catch {}
+        if (!dataDir) return;
+        if (!byProfile.has(profileName)) {
+          byProfile.set(profileName, { dataDir, globalQueue: [], threadQueues: {} });
         }
+        const entry = byProfile.get(profileName);
+        if (threadTs) {
+          if (!entry.threadQueues[threadTs]) entry.threadQueues[threadTs] = [];
+          entry.threadQueues[threadTs].push(task);
+        } else {
+          entry.globalQueue.push(task);
+        }
+      };
+
+      for (const task of drained || []) addPersistedTask(task);
+      for (const [threadTs, queue] of this.threadQueues) {
+        for (const task of queue) addPersistedTask(task, threadTs);
+      }
+
+      if (byProfile.size > 0) {
         let totalPersisted = 0;
-        for (const [name, tasks] of byProfile) {
+        for (const [name, payload] of byProfile) {
           try {
-            let dataDir = null;
-            try { dataDir = this.getProfile(tasks[0].userId).dataDir; } catch {}
-            if (!dataDir) continue;
-            mkdirSync(dataDir, { recursive: true });
-            const outPath = join(dataDir, 'shutdown-queue.json');
-            writeFileSync(outPath, JSON.stringify(tasks, null, 2));
-            totalPersisted += tasks.length;
-            info(TAG, `shutdown: persisted ${tasks.length} task(s) for profile=${name} → ${outPath}`);
+            mkdirSync(payload.dataDir, { recursive: true });
+            const outPath = join(payload.dataDir, SHUTDOWN_QUEUE_FILE);
+            writeFileSync(outPath, `${JSON.stringify({
+              version: SHUTDOWN_QUEUE_VERSION,
+              globalQueue: payload.globalQueue,
+              threadQueues: payload.threadQueues,
+            }, null, 2)}\n`);
+            const profileCount = payload.globalQueue.length
+              + Object.values(payload.threadQueues).reduce((sum, queue) => sum + queue.length, 0);
+            totalPersisted += profileCount;
+            info(TAG, `shutdown: persisted ${profileCount} task(s) for profile=${name} → ${outPath}`);
           } catch (e) {
             warn(TAG, `shutdown: failed to persist queue for profile=${name}: ${e.message}`);
           }
         }
-        warn(TAG, `shutdown: persisted ${totalPersisted} queued tasks to shutdown-queue.json`);
+        warn(TAG, `shutdown: persisted ${totalPersisted} queued task(s) to ${SHUTDOWN_QUEUE_FILE}`);
       }
     } catch (e) {
       warn(TAG, `shutdown: queue persistence error: ${e.message}`);

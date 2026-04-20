@@ -11,7 +11,7 @@ src/
   config.js            — config.json loading, profile routing
   worker.js            — Fork child process, invoke Claude CLI
   cron.js              — Cron scheduled tasks (60s tick, job persistence, schedule parsing)
-  context.js           — Layered prompt assembly (soul → user → directives → memory → thread → message)
+  context.js           — Prompt assembly (CLI-native layers + Orb recall/docs/thread injection)
   session.js           — thread↔session persistence (per-profile isolation)
   memory.js            — Holographic memory retrieval + conversation storage (via Python bridge)
   format-utils.js      — Platform-agnostic text utilities (sanitize, split)
@@ -55,7 +55,7 @@ Orb's user-prompt layers (dynamic per-turn, injected via stream-json stdin):
 
 ## Config
 
-`config.json` supports `${ENV_VAR}` interpolation. SIGHUP triggers hot-reload.
+`config.json` supports `${ENV_VAR}` interpolation. `SIGHUP` is a partial reload only: it re-runs `loadConfig(true)` and refreshes the cron scheduler's profile-name set. It does not rebuild adapters, rotate adapter tokens, reconnect Socket Mode, restart active workers, or apply scheduler parameter changes already loaded in memory. Restart the daemon for full effect.
 
 ## Dev
 
@@ -147,12 +147,12 @@ Scheduler ↔ Worker communication via Node IPC (process.send/on('message')):
 | Direction | Type | Payload | Notes |
 |-----------|------|---------|-------|
 | Scheduler → Worker | `task` | `{ type: 'task', userText, fileContent, imagePaths, threadTs, channel, userId, platform, threadHistory, profile, model, effort, mode?, priorConversation? }` | Initial task for a thread. `mode: 'skill-review'` requires `priorConversation`, which `context.js` injects as review context. |
-| Scheduler → Worker | `inject` | `{ type: 'inject', userText, fileContent?, imagePaths? }` | Injects a follow-up user message into the active same-thread Claude CLI session without spawning a new worker. |
+| Scheduler → Worker | `inject` | `{ type: 'inject', userText, fileContent?, imagePaths? }` | Injects a follow-up user message into the active same-thread Claude CLI session without spawning a new worker. When `imagePaths` is present the worker attaches them as image content blocks before sending the turn. |
 | Worker → Scheduler | `result` | `{ type: 'result', text, toolCount, lastTool?, stopReason? }` | Final payload emitted when the worker is about to exit. |
 | Worker → Scheduler | `error` | `{ type: 'error', error, errorContext? }` | Terminal failure payload. |
 | Worker → Scheduler | `turn_start` | `{ type: 'turn_start' }` | Phase ②: emitted immediately when the worker receives a `task` or accepted `inject`, making the scheduler the sole typing owner. |
 | Worker → Scheduler | `turn_end` | `{ type: 'turn_end' }` | Phase ②: emitted when Claude CLI produces a `result` event for the current turn; scheduler stops typing immediately. |
-| Worker → Scheduler | `turn_complete` | `{ type: 'turn_complete', text, toolCount, lastTool, stopReason, deliveredTexts }` | Signals that one Claude turn finished; scheduler can deliver it while keeping the worker alive for future `inject` messages. `deliveredTexts[]` lets the scheduler skip re-sending text already emitted via `intermediate_text`. |
+| Worker → Scheduler | `turn_complete` | `{ type: 'turn_complete', text, toolCount, lastTool, stopReason, deliveredTexts, undeliveredText? }` | Signals that one Claude turn finished; scheduler can deliver it while keeping the worker alive for future `inject` messages. When `intermediate_text` already emitted partial content, `undeliveredText` contains only the remaining text that still needs delivery. |
 | Worker → Scheduler | `progress_update` | `{ type: 'progress_update', text }` | Phase ①: emitted on every TodoWrite event. Scheduler posts on first occurrence (stores `ts`), then edits in-place on subsequent ones. Does NOT set `responded` flag or clear typing. |
 | Worker → Scheduler | `intermediate_text` | `{ type: 'intermediate_text', text }` | Phase ③: mid-turn assistant text block, debounced 2s. Scheduler delivers immediately; `turn_complete` deduplicates against `deliveredTexts` to avoid re-sending. |
 
