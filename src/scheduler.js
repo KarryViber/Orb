@@ -203,9 +203,19 @@ export class Scheduler {
     return `${threadTs}:${requestId}`;
   }
 
+  _permissionResolutionAction(payload) {
+    if (payload?.allow) return 'allow';
+    const reason = String(payload?.reason || '').toLowerCase();
+    if (reason.startsWith('timeout:') || reason === 'timeout') return 'timeout';
+    return 'deny';
+  }
+
   _resolvePermissionRequest(key, payload) {
     const pending = this._pendingPermissionRequests.get(key);
     if (!pending) return;
+    const action = this._permissionResolutionAction(payload);
+    const latencyMs = Math.max(0, Date.now() - (pending.createdAt || Date.now()));
+    info(TAG, `permission resolved: thread=${pending.threadTs} request=${pending.requestId} action=${action} latency=${latencyMs}ms`);
     pending.settled = true;
     this._pendingPermissionRequests.delete(key);
     this._writePermissionSocketResponse(pending.socket, payload);
