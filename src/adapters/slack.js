@@ -1195,7 +1195,6 @@ export class SlackAdapter extends PlatformAdapter {
   async startStream(channel, threadTs, { task_display_mode = 'aggregated' } = {}) {
     const params = {
       channel,
-      markdown_text: ' ',
       task_display_mode: this.normalizeTaskDisplayMode(task_display_mode),
       chunks: [{ type: 'plan_update', title: 'Task progress' }],
       ...(await this._resolveStreamRecipient(channel, threadTs)),
@@ -1227,7 +1226,6 @@ export class SlackAdapter extends PlatformAdapter {
       result = await this._slack.apiCall('chat.appendStream', {
         channel: stream.channel,
         ts: stream.ts,
-        markdown_text: ' ',
         chunks: normalizedChunks,
       });
     } catch (err) {
@@ -1246,7 +1244,6 @@ export class SlackAdapter extends PlatformAdapter {
       result = await this._slack.apiCall('chat.stopStream', {
         channel: stream.channel,
         ts: stream.ts,
-        markdown_text: ' ',
         ...(Array.isArray(final_blocks) && final_blocks.length > 0 ? { blocks: final_blocks } : {}),
       });
     } catch (err) {
