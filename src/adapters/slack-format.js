@@ -488,6 +488,89 @@ export function splitPlainText(text) {
   return chunks;
 }
 
+function richTextFromString(text) {
+  const normalized = String(text || '').trim();
+  return {
+    type: 'rich_text',
+    elements: [{
+      type: 'rich_text_section',
+      elements: normalized ? [{ type: 'text', text: normalized }] : [{ type: 'text', text: ' ' }],
+    }],
+  };
+}
+
+function buildPromptMessage(action) {
+  const normalized = String(action || '').trim().replace(/[。？?！!]+$/g, '');
+  if (!normalized) return '';
+  if (/^(请|继续|直接|顺手|把|将|帮我|帮我把|帮我将)/.test(normalized)) return normalized;
+  return `请${normalized}`;
+}
+
+function buildPromptTitle(action) {
+  const normalized = String(action || '').trim()
+    .replace(/^[，、\s]+/, '')
+    .replace(/[。？?！!]+$/g, '')
+    .replace(/^(帮我|帮我把|帮我将|请|继续|直接|顺手|把|将)/, '')
+    .trim();
+  return (normalized || action || '继续').slice(0, 24);
+}
+
+export function extractSuggestedPrompts(text) {
+  const source = String(text || '');
+  if (!source.trim()) return [];
+
+  const prompts = [];
+  const seen = new Set();
+  const pushPrompt = (action) => {
+    const message = buildPromptMessage(action);
+    const title = buildPromptTitle(action);
+    if (!message || !title) return;
+    const key = `${title}::${message}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    prompts.push({ title, message });
+  };
+
+  for (const match of source.matchAll(/要我(.+?)吗[？?]/g)) {
+    pushPrompt(match[1]);
+    if (prompts.length >= 4) return prompts;
+  }
+
+  for (const match of source.matchAll(/需要(?:我)?(.+?)吗[？?]/g)) {
+    pushPrompt(match[1]);
+    if (prompts.length >= 4) return prompts;
+  }
+
+  for (const match of source.matchAll(/\*\*(.+?)\*\*\s*[\/／]\s*\*\*(.+?)\*\*/g)) {
+    pushPrompt(match[1]);
+    if (prompts.length >= 4) return prompts;
+    pushPrompt(match[2]);
+    if (prompts.length >= 4) return prompts;
+  }
+
+  return prompts;
+}
+
+export function buildPlanBlock(taskCardsMap) {
+  const tasks = [...(taskCardsMap?.entries?.() || [])].map(([task_id, card]) => {
+    const task = {
+      type: 'task_card',
+      task_id,
+      title: String(card?.title || 'Task').slice(0, 255),
+      status: card?.status || 'in_progress',
+    };
+    if (card?.details) task.details = richTextFromString(card.details);
+    if (card?.output) task.output = richTextFromString(card.output);
+    return task;
+  });
+
+  return {
+    type: 'plan',
+    title: 'Task progress',
+    ...(tasks.length > 0 ? { tasks } : {}),
+  };
+}
+
 
 
 export { sanitizeErrorText } from '../format-utils.js';

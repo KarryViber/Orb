@@ -24,7 +24,14 @@ import { storeConversation } from './memory.js';
  *   { type: 'error', error, errorContext? }
  *   { type: 'turn_complete', text, toolCount, lastTool, stopReason, deliveredTexts, undeliveredText? }  — Phase ③: includes delivered set + remaining text
  *   { type: 'progress_update', text }  — Phase ①: fired on each TodoWrite event;
- *     scheduler posts/edits a single progress message in-thread (ts owned by scheduler).
+ *     scheduler posts/edits a single progress message in-thread (ts owned by scheduler)
+ *     only outside the task-card path / error fallback scenes.
+ *   { type: 'tool_call', task_id, tool_name, title, details }  — task-card path:
+ *     emitted for selected tool_use blocks so scheduler can update Slack task cards.
+ *   { type: 'tool_result', task_id, status, output }  — task-card path:
+ *     emitted from tool_result blocks; status is 'complete' | 'error'.
+ *   { type: 'status_update', text }  — short assistant thread status text;
+ *     emitted when a tool starts, and cleared with empty text on turn_complete.
  *   { type: 'turn_start' }  — explicit turn ownership start on task/inject receipt
  *   { type: 'turn_end' }  — explicit turn ownership end when Claude emits result
  *   { type: 'intermediate_text', text }  — Phase ③: mid-turn text block, debounced 2s
@@ -51,6 +58,12 @@ const DEFAULT_WORKSPACE_ALLOW_RULES = [
   'Bash(pwd)',
   'Bash(date)',
 ];
+const TASK_CARD_TOOLS = new Set([
+  'TodoWrite', 'Task', 'Agent',
+  'Bash', 'Write', 'Edit', 'NotebookEdit',
+  'WebFetch', 'WebSearch',
+  'Skill',
+]);
 
 let _activeCli = null;   // reference to active interactive CLI session
 
@@ -277,6 +290,195 @@ function renderTodos(todos) {
   return lines.join('\n');
 }
 
+function truncateText(text, maxChars) {
+  const normalized = String(text || '').replace(/\s+\n/g, '\n').trim();
+  if (normalized.length <= maxChars) return normalized;
+  return `${normalized.slice(0, maxChars - 3)}...`;
+}
+
+function tokenizeShellCommand(command) {
+  return String(command || '')
+    .match(/'[^']*'|"[^"]*"|\S+/g)
+    ?.map((token) => token.replace(/^['"]|['"]$/g, '')) || [];
+}
+
+function parseToolInput(toolInput) {
+  if (toolInput && typeof toolInput === 'object') return toolInput;
+  if (typeof toolInput !== 'string') return null;
+  const trimmed = toolInput.trim();
+  if (!trimmed) return null;
+  if (!((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']')))) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(trimmed);
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function stringifyToolValue(value) {
+  if (typeof value === 'string') return value;
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function summarizePrimitiveParams(input, limit = 4) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return '';
+  const parts = [];
+  for (const [key, value] of Object.entries(input)) {
+    if (value == null) continue;
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+      parts.push(`${key}: ${String(value)}`);
+    } else if (Array.isArray(value)) {
+      parts.push(`${key}: [${value.slice(0, 3).map((item) => String(item)).join(', ')}${value.length > 3 ? ', ...' : ''}]`);
+    }
+    if (parts.length >= limit) break;
+  }
+  return parts.join('\n');
+}
+
+function firstNonFlagToken(command) {
+  const tokens = tokenizeShellCommand(command);
+  return tokens.find((token) => token && token !== '--' && !token.startsWith('-')) || tokens[0] || 'sh';
+}
+
+function summarizeWriteDetails(parsedInput) {
+  const filePath = parsedInput?.file_path ? `path: ${parsedInput.file_path}` : '';
+  const content = parsedInput?.content != null
+    ? `content: ${truncateText(stringifyToolValue(parsedInput.content), 120)}`
+    : '';
+  return [filePath, content].filter(Boolean).join('\n');
+}
+
+function summarizeEditDetails(parsedInput) {
+  const filePath = parsedInput?.file_path ? `path: ${parsedInput.file_path}` : '';
+  const oldString = parsedInput?.old_string != null
+    ? `old: ${truncateText(stringifyToolValue(parsedInput.old_string), 80)}`
+    : '';
+  const newString = parsedInput?.new_string != null
+    ? `new: ${truncateText(stringifyToolValue(parsedInput.new_string), 80)}`
+    : '';
+  return [filePath, oldString, newString].filter(Boolean).join('\n');
+}
+
+function summarizeTodos(todos) {
+  if (!Array.isArray(todos) || todos.length === 0) return 'No todos';
+  return todos.map((todo) => {
+    const icon = todo.status === 'completed' ? 'complete' : todo.status === 'in_progress' ? 'in progress' : 'pending';
+    return `- [${icon}] ${todo.content || '(untitled)'}`;
+  }).join('\n');
+}
+
+function summarizeToolDetails(toolName, input) {
+  const parsedInput = parseToolInput(input);
+
+  if (toolName === 'TodoWrite') {
+    return truncateText(summarizeTodos(parsedInput?.todos), 200);
+  }
+  if (toolName === 'Bash') {
+    const command = parsedInput?.command ?? parsedInput?.cmd ?? input;
+    return truncateText(String(command || '').trim(), 200);
+  }
+  if (toolName === 'Write' || toolName === 'NotebookEdit') {
+    return truncateText(summarizeWriteDetails(parsedInput), 200);
+  }
+  if (toolName === 'Edit') {
+    return truncateText(summarizeEditDetails(parsedInput), 200);
+  }
+  if (toolName === 'Skill') {
+    return truncateText(
+      parsedInput?.skill_description
+      || parsedInput?.description
+      || parsedInput?.prompt
+      || summarizePrimitiveParams(parsedInput),
+      200,
+    );
+  }
+  if (toolName === 'WebFetch') {
+    return truncateText(String(parsedInput?.url || input || ''), 200);
+  }
+
+  return truncateText(summarizePrimitiveParams(parsedInput), 200);
+}
+
+function buildToolTitle(toolName, input) {
+  const parsedInput = parseToolInput(input);
+
+  if (toolName === 'TodoWrite') return 'Plan update';
+  if (toolName === 'Bash') {
+    const command = parsedInput?.command ?? parsedInput?.cmd ?? input;
+    return `Bash: ${firstNonFlagToken(command)}`;
+  }
+  if (toolName === 'Write' || toolName === 'Edit' || toolName === 'NotebookEdit') {
+    const filePath = parsedInput?.file_path || parsedInput?.notebook_path || 'unknown';
+    const baseName = String(filePath).split('/').filter(Boolean).pop() || filePath;
+    return `${toolName}: ${baseName}`;
+  }
+  if (toolName === 'Skill') {
+    const skillName = parsedInput?.skill_name || parsedInput?.name || parsedInput?.skill || 'unknown';
+    return `Skill: ${skillName}`;
+  }
+  if (toolName === 'WebFetch') {
+    const url = parsedInput?.url || '';
+    try {
+      return `WebFetch: ${new URL(url).hostname || url}`;
+    } catch {
+      return `WebFetch: ${truncateText(url, 80) || 'unknown'}`;
+    }
+  }
+
+  return String(toolName || 'unknown');
+}
+
+function buildStatusText(toolName, input) {
+  const parsedInput = parseToolInput(input);
+
+  if (toolName === 'TodoWrite') return 'updating plan';
+  if (toolName === 'Bash') {
+    const command = truncateText(String(parsedInput?.command ?? parsedInput?.cmd ?? input ?? '').trim(), 80);
+    return command ? `running: ${command}` : 'running bash';
+  }
+  if (toolName === 'Write' || toolName === 'NotebookEdit') {
+    const filePath = parsedInput?.file_path || parsedInput?.notebook_path || 'unknown';
+    return `writing: ${String(filePath).split('/').filter(Boolean).pop() || filePath}`;
+  }
+  if (toolName === 'Edit') {
+    const filePath = parsedInput?.file_path || 'unknown';
+    return `editing: ${String(filePath).split('/').filter(Boolean).pop() || filePath}`;
+  }
+  if (toolName === 'Skill') {
+    const skillName = parsedInput?.skill_name || parsedInput?.name || parsedInput?.skill || 'skill';
+    return `using skill: ${truncateText(String(skillName), 40)}`;
+  }
+  if (toolName === 'WebFetch') {
+    const url = parsedInput?.url || '';
+    try {
+      return `fetching: ${new URL(url).hostname || url}`;
+    } catch {
+      return `fetching: ${truncateText(String(url), 60) || 'url'}`;
+    }
+  }
+  if (toolName === 'WebSearch') return 'searching web';
+  if (toolName === 'Task' || toolName === 'Agent') return 'delegating task';
+
+  return `working: ${truncateText(String(toolName || 'task'), 40)}`;
+}
+
+function extractToolResultText(content) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return stringifyToolValue(content);
+  return content.map((item) => {
+    if (typeof item === 'string') return item;
+    if (item?.type === 'text' && typeof item.text === 'string') return item.text;
+    return stringifyToolValue(item);
+  }).filter(Boolean).join('\n');
+}
+
 function runClaudeInteractive(args, initialContent, workspace) {
   const child = spawn(CLAUDE_PATH, args, {
     cwd: workspace,
@@ -299,6 +501,7 @@ function runClaudeInteractive(args, initialContent, workspace) {
   let pendingTimer = null;
   let closed = false;
   let turnOpen = true;
+  const pendingTaskCards = new Map();
 
   const queueIntermediate = (text) => {
     if (!text?.trim() || !onIntermediateText) return;
@@ -342,10 +545,36 @@ function runClaudeInteractive(args, initialContent, workspace) {
         if (block.type === 'tool_use') {
           totalToolCount++;
           lastTool = block.name || null;
+          ipcSend({
+            type: 'status_update',
+            text: buildStatusText(block.name, block.input),
+          }).catch(() => {});
+          if (TASK_CARD_TOOLS.has(block.name) && block.id) {
+            pendingTaskCards.set(block.id, { toolName: block.name });
+            ipcSend({
+              type: 'tool_call',
+              task_id: block.id,
+              tool_name: block.name,
+              title: buildToolTitle(block.name, block.input),
+              details: summarizeToolDetails(block.name, block.input),
+            }).catch(() => {});
+          }
           if (block.name === 'TodoWrite' && Array.isArray(block.input?.todos)) {
             ipcSend({ type: 'progress_update', text: renderTodos(block.input.todos) }).catch(() => {});
           }
         }
+      }
+    }
+    if (msg.type === 'user' && Array.isArray(msg.message?.content)) {
+      for (const block of msg.message.content) {
+        if (!block?.tool_use_id || !pendingTaskCards.has(block.tool_use_id)) continue;
+        ipcSend({
+          type: 'tool_result',
+          task_id: block.tool_use_id,
+          status: block.is_error ? 'error' : 'complete',
+          output: truncateText(extractToolResultText(block.content), 500),
+        }).catch(() => {});
+        pendingTaskCards.delete(block.tool_use_id);
       }
     }
     if (msg.type === 'result') {
@@ -376,6 +605,7 @@ function runClaudeInteractive(args, initialContent, workspace) {
       } else if (!lastTurnText && turnText) {
         lastTurnText = turnText;
       }
+      ipcSend({ type: 'status_update', text: '' }).catch(() => {});
       deliveredTexts = [];
       accumulatedDelivered = '';
       turnBuffer = [];

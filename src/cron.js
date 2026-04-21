@@ -337,14 +337,54 @@ export class CronScheduler {
     info(TAG, `executing job ${job.id} "${job.name}" (profile=${job.profileName})`);
 
     try {
-      const responseText = await this._spawnCronWorker(job, paths);
+      const deliver = job.deliver || null;
+      const nativeTaskCardEnabled = job.enableTaskCard !== false;
+      const scheduler = globalThis.__orbSchedulerInstance;
+      let responseText = '';
+      let deliveredByScheduler = false;
+
+      if (
+        nativeTaskCardEnabled
+        && deliver?.platform === 'slack'
+        && deliver?.channel
+        && typeof scheduler?.executeTask === 'function'
+      ) {
+        const result = await scheduler.executeTask({
+          userText: job.prompt,
+          fileContent: '',
+          imagePaths: [],
+          threadTs: `cron:${job.id}`,
+          deliveryThreadTs: deliver.threadTs || null,
+          channel: deliver.channel,
+          userId: null,
+          platform: deliver.platform,
+          threadHistory: null,
+          model: job.model || null,
+          effort: job.effort || null,
+          enableTaskCard: true,
+          forceNewWorker: true,
+          profile: {
+            name: job.profileName,
+            workspaceDir: paths.workspaceDir,
+            dataDir: paths.dataDir,
+            scriptsDir: paths.scriptsDir,
+          },
+        });
+        responseText = result?.text || '';
+        deliveredByScheduler = true;
+      } else {
+        responseText = await this._spawnCronWorker({ ...job, enableTaskCard: nativeTaskCardEnabled }, paths);
+      }
+
       const silent = responseText?.startsWith('[SILENT]');
 
       job.lastRunAt = now.toISOString();
       job.lastStatus = 'ok';
       job.lastError = null;
 
-      if (!silent && responseText && job.deliver) {
+      if (deliveredByScheduler) {
+        job.lastDeliveryError = null;
+      } else if (!silent && responseText && job.deliver) {
         try {
           await this._deliverResult(job, responseText);
           job.lastDeliveryError = null;

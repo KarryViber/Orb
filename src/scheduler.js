@@ -7,6 +7,7 @@ import { taskQueue } from './queue.js';
 import { sanitizeErrorText } from './format-utils.js';
 import { listFacts, storeLesson, storeCorrectionLesson, purgeTransient, lintMemory } from './memory.js';
 import { spawnWorker } from './spawn.js';
+import { buildPlanBlock, extractSuggestedPrompts } from './adapters/slack-format.js';
 const TAG = 'scheduler';
 const DRAIN_TIMEOUT = 30_000;
 const SKILL_REVIEW_THRESHOLD = 10;   // cumulative tool uses before triggering review
@@ -70,6 +71,7 @@ export class Scheduler {
     this._permissionApprovalMode = process.env.ORB_PERMISSION_APPROVAL_MODE || 'auto-allow';
     this._permissionSocketPath = join(tmpdir(), `orb-permission-scheduler-${process.pid}.sock`);
     this._permissionServer = null;
+    globalThis.__orbSchedulerInstance = this;
     this._startPermissionServer();
     this._restoreShutdownQueues();
   }
@@ -80,6 +82,13 @@ export class Scheduler {
       this.replayQueuedTasks().catch((err) => {
         warn(TAG, `startup replay dispatch failed: ${err.message}`);
       });
+    });
+  }
+
+  async executeTask(task) {
+    return new Promise((resolve, reject) => {
+      const wrappedTask = { ...task, silentQueueing: true, _completion: { resolve, reject } };
+      this.submit(wrappedTask).catch(reject);
     });
   }
 
@@ -327,7 +336,7 @@ export class Scheduler {
       return;
     }
 
-    if (this.activeWorkers.has(threadTs)) {
+    if (!task.forceNewWorker && this.activeWorkers.has(threadTs)) {
       const entry = this.activeWorkers.get(threadTs);
       try {
         entry.worker.send({ type: 'inject', userText: task.userText, fileContent: task.fileContent, imagePaths: task.imagePaths });
@@ -341,13 +350,36 @@ export class Scheduler {
       }
     }
 
+    if (task.forceNewWorker && this.activeWorkers.has(threadTs)) {
+      if (!this.threadQueues.has(threadTs)) this.threadQueues.set(threadTs, []);
+      this.threadQueues.get(threadTs).push(task);
+      info(TAG, `force-new worker queued behind active thread=${threadTs}`);
+      return;
+    }
+
     if (this.activeWorkers.size >= this.maxWorkers) {
-      if (taskQueue.hasThread(threadTs) || !taskQueue.enqueue(task)) {
-        await adapter.sendReply(channel, threadTs,
-          `队列已满（${taskQueue.size}条排队中），请稍等。`);
+      const alreadyQueued = taskQueue.hasThread(threadTs);
+      if (alreadyQueued && task.silentQueueing) {
+        if (!this.threadQueues.has(threadTs)) this.threadQueues.set(threadTs, []);
+        this.threadQueues.get(threadTs).push(task);
+        info(TAG, `thread-local queue: thread=${threadTs} size=${this.threadQueues.get(threadTs).length}`);
+        return;
+      }
+
+      if (alreadyQueued || !taskQueue.enqueue(task)) {
+        if (task._completion && task.silentQueueing) {
+          task._completion.reject(new Error(alreadyQueued ? `task already queued for thread=${threadTs}` : 'global queue full'));
+          return;
+        }
+        if (!task.silentQueueing) {
+          await adapter.sendReply(channel, threadTs,
+            `队列已满（${taskQueue.size}条排队中），请稍等。`);
+        }
       } else {
-        await adapter.sendReply(channel, threadTs,
-          `已加入队列（${taskQueue.size}条排队中），会按顺序处理。`);
+        if (!task.silentQueueing) {
+          await adapter.sendReply(channel, threadTs,
+            `已加入队列（${taskQueue.size}条排队中），会按顺序处理。`);
+        }
       }
       info(TAG, `global queue: size=${taskQueue.size} thread=${threadTs}`);
       return;
@@ -408,16 +440,18 @@ export class Scheduler {
     const adapter = this._getAdapter(platform);
     if (!adapter && platform !== 'system') {
       logError(TAG, `spawn failed: no adapter for platform=${platform} thread=${threadTs}`);
+      task._completion?.reject?.(new Error(`no adapter for platform=${platform}`));
       return;
     }
 
     // Resolve profile for this user
     let profile;
     try {
-      profile = this.getProfile(userId);
+      profile = task.profile || this.getProfile(userId);
     } catch (err) {
       logError(TAG, `profile resolution failed for user=${userId}: ${err.message}`);
-      await adapter.sendReply(channel, threadTs, `:warning: 未识别的用户，无法处理请求。`).catch(() => {});
+      await adapter?.sendReply(channel, threadTs, `:warning: 未识别的用户，无法处理请求。`).catch(() => {});
+      task._completion?.reject?.(err);
       return;
     }
     info(TAG, `profile resolved: user=${userId} → ${profile.name} (${profile.workspaceDir})`);
@@ -447,38 +481,160 @@ export class Scheduler {
     if (!effectiveEffort) effectiveEffort = 'low';
 
     let typingInterval = null;
+    let responded = false;
+    let turnDelivered = false;
+    let pendingAutoContinue = null;
+    let effectiveThreadTs = task.deliveryThreadTs === undefined ? (threadTs || null) : task.deliveryThreadTs;
+    let pendingThreadStatus = '';
+    let turnCount = 0;
+    let metadataUpdatedForTurn = false;
+    let finalResultText = '';
+    let workerFailure = null;
+    let completionSettled = false;
+    let worker;
+    const canManageThreadStatus = platform === 'slack' && channel != null && typeof adapter?.setThreadStatus === 'function';
+    const taskCardState = {
+      enabled: platform === 'slack' && channel != null
+        && task.enableTaskCard !== false
+        && typeof adapter?.startStream === 'function'
+        && typeof adapter?.appendStream === 'function'
+        && typeof adapter?.stopStream === 'function',
+      streamId: null,
+      taskCards: new Map(),
+      failed: false,
+      failureNotified: false,
+    };
+
+    const settleCompletion = (method, payload) => {
+      if (completionSettled) return;
+      completionSettled = true;
+      task._completion?.[method]?.(payload);
+    };
+
+    const applyThreadStatus = async (status) => {
+      pendingThreadStatus = String(status || '');
+      if (!canManageThreadStatus || !effectiveThreadTs) return;
+      try {
+        await adapter.setThreadStatus(channel, effectiveThreadTs, pendingThreadStatus);
+      } catch (err) {
+        warn(TAG, `failed to set thread status: ${err.message}`);
+      }
+    };
+
     const startTyping = async () => {
+      if (canManageThreadStatus) {
+        if (!pendingThreadStatus) await applyThreadStatus('thinking');
+        return;
+      }
       if (typingInterval) return;
-      try { await adapter.setTyping(channel, threadTs, 'is thinking…'); } catch (_) {}
+      try { await adapter.setTyping(channel, effectiveThreadTs, 'is thinking…'); } catch (_) {}
       typingInterval = setInterval(async () => {
-        try { await adapter.setTyping(channel, threadTs, 'is thinking…'); } catch (_) {}
+        try { await adapter.setTyping(channel, effectiveThreadTs, 'is thinking…'); } catch (_) {}
       }, 5_000);
     };
+
     const stopTyping = async () => {
+      if (canManageThreadStatus) return;
       if (typingInterval) {
         clearInterval(typingInterval);
         typingInterval = null;
       }
-      try { await adapter.setTyping(channel, threadTs, ''); } catch (_) {}
+      try { await adapter.setTyping(channel, effectiveThreadTs, ''); } catch (_) {}
     };
 
-    let responded = false;
-    let turnDelivered = false;
-    let pendingAutoContinue = null;
-    let worker;
+    const resetTaskCardState = () => {
+      taskCardState.streamId = null;
+      taskCardState.taskCards.clear();
+      taskCardState.failed = false;
+      taskCardState.failureNotified = false;
+    };
+
+    const failTaskCardStream = async (err) => {
+      if (taskCardState.failed && taskCardState.failureNotified) return;
+      taskCardState.failed = true;
+      taskCardState.streamId = null;
+      taskCardState.taskCards.clear();
+      logError(TAG, `[task_card] stream failed: ${err.message}`);
+      if (!taskCardState.failureNotified) {
+        taskCardState.failureNotified = true;
+        await adapter.sendReply(channel, effectiveThreadTs, `task_card stream failed: ${err.message}`).catch((sendErr) => {
+          warn(TAG, `failed to send task_card error reply: ${sendErr.message}`);
+        });
+      }
+    };
+
+    const ensureTaskCardStream = async () => {
+      if (!taskCardState.enabled || taskCardState.failed) return false;
+      if (taskCardState.streamId) return true;
+      try {
+        const stream = await adapter.startStream(channel, effectiveThreadTs, { task_display_mode: 'aggregated' });
+        taskCardState.streamId = stream?.stream_id || null;
+        if (!effectiveThreadTs && stream?.ts) effectiveThreadTs = stream.ts;
+        if (pendingThreadStatus) await applyThreadStatus(pendingThreadStatus);
+        return Boolean(taskCardState.streamId);
+      } catch (err) {
+        await failTaskCardStream(err);
+        return false;
+      }
+    };
+
+    const appendTaskCardPlan = async () => {
+      if (!taskCardState.streamId || taskCardState.failed) return false;
+      try {
+        await adapter.appendStream(taskCardState.streamId, [buildPlanBlock(taskCardState.taskCards)]);
+        return true;
+      } catch (err) {
+        await failTaskCardStream(err);
+        return false;
+      }
+    };
+
+    const buildFinalTextPayloads = (text) => {
+      const trimmed = String(text || '').trim();
+      if (!trimmed) return [];
+      return adapter.buildPayloads(trimmed).map((payload) => {
+        if (Array.isArray(payload.blocks) && payload.blocks.length > 0) return payload;
+        return {
+          ...payload,
+          blocks: [{
+            type: 'section',
+            text: { type: 'mrkdwn', text: payload.text || trimmed },
+          }],
+        };
+      });
+    };
 
     // Rerun via 🔥 reaction: first emitted payload edits targetMessageTs,
     // subsequent payloads append as normal replies.
     let pendingEdit = task.targetMessageTs || null;
     // Phase ①: ts of the in-thread progress message (null until first TodoWrite)
     let progressTs = null;
+    const updateThreadMetadata = async (text) => {
+      if (metadataUpdatedForTurn) return;
+      if (platform !== 'slack' || !channel || !effectiveThreadTs || !text) return;
+      metadataUpdatedForTurn = true;
+      if (turnCount === 0 && typeof adapter?.setThreadTitle === 'function') {
+        const title = text.split('\n')[0].trim().slice(0, 60);
+        if (title) {
+          adapter.setThreadTitle(channel, effectiveThreadTs, title).catch((err) => warn(TAG, `setThreadTitle failed: ${err.message}`));
+        }
+      }
+      if (typeof adapter?.setSuggestedPrompts === 'function') {
+        const prompts = extractSuggestedPrompts(text);
+        if (prompts.length > 0) {
+          adapter.setSuggestedPrompts(channel, effectiveThreadTs, prompts).catch((err) => warn(TAG, `setSuggestedPrompts failed: ${err.message}`));
+        }
+      }
+      turnCount += 1;
+    };
+
     const emitPayload = async (payload) => {
       const extra = payload.blocks ? { blocks: payload.blocks } : {};
       if (pendingEdit) {
         await adapter.editMessage(channel, pendingEdit, payload.text, extra);
         pendingEdit = null;
       } else {
-        await adapter.sendReply(channel, threadTs, payload.text, extra);
+        await adapter.sendReply(channel, effectiveThreadTs, payload.text, extra);
       }
     };
 
@@ -513,9 +669,10 @@ export class Scheduler {
           info(TAG, `worker response: type=${msg.type} thread=${threadTs} textLen=${msg.text?.length || 0}`);
 
           if (msg.type === 'progress_update') {
+            if (taskCardState.enabled) return;
             try {
               if (!progressTs) {
-                const result = await adapter.sendReply(channel, threadTs, msg.text);
+                const result = await adapter.sendReply(channel, effectiveThreadTs, msg.text);
                 progressTs = result?.ts || null;
               } else {
                 await adapter.editMessage(channel, progressTs, msg.text);
@@ -526,7 +683,39 @@ export class Scheduler {
             return;
           }
 
+          if (msg.type === 'status_update') {
+            await applyThreadStatus(msg.text || '');
+            return;
+          }
+
+          if (msg.type === 'tool_call') {
+            if (!taskCardState.enabled || taskCardState.failed) return;
+            taskCardState.taskCards.set(msg.task_id, {
+              title: msg.title || msg.tool_name || 'Task',
+              details: msg.details || '',
+              status: 'in_progress',
+              output: '',
+            });
+            if (await ensureTaskCardStream()) {
+              await appendTaskCardPlan();
+            }
+            return;
+          }
+
+          if (msg.type === 'tool_result') {
+            if (taskCardState.failed) return;
+            const taskCard = taskCardState.taskCards.get(msg.task_id);
+            if (!taskCard) return;
+            taskCard.status = msg.status || 'complete';
+            taskCard.output = msg.output || '';
+            if (taskCardState.streamId) {
+              await appendTaskCardPlan();
+            }
+            return;
+          }
+
           if (msg.type === 'turn_start') {
+            metadataUpdatedForTurn = false;
             await startTyping();
             return;
           }
@@ -537,11 +726,12 @@ export class Scheduler {
           }
 
           if (msg.type === 'intermediate_text') {
+            if (taskCardState.streamId && !taskCardState.failed) return;
             if (msg.text?.trim()) {
               try {
                 const payloads = adapter.buildPayloads(msg.text);
                 for (const payload of payloads) {
-                  await adapter.sendReply(channel, threadTs, payload.text, payload.blocks ? { blocks: payload.blocks } : {});
+                  await adapter.sendReply(channel, effectiveThreadTs, payload.text, payload.blocks ? { blocks: payload.blocks } : {});
                 }
               } catch (err) {
                 warn(TAG, `failed to send intermediate text: ${err.message}`);
@@ -556,6 +746,20 @@ export class Scheduler {
             // 中间轮次完成 — worker 已裁剪掉经 intermediate_text 投递过的部分
             try {
               const text = (typeof msg.undeliveredText === 'string' ? msg.undeliveredText : msg.text)?.trim();
+              if (taskCardState.streamId && !taskCardState.failed) {
+                const finalPayloads = buildFinalTextPayloads(text);
+                const primaryPayload = finalPayloads.shift() || null;
+                const finalBlocks = [buildPlanBlock(taskCardState.taskCards)];
+                if (primaryPayload?.blocks?.length) finalBlocks.push(...primaryPayload.blocks);
+                await adapter.stopStream(taskCardState.streamId, { final_blocks: finalBlocks });
+                resetTaskCardState();
+                turnDelivered = true;
+                for (const payload of finalPayloads) {
+                  await emitPayload(payload);
+                }
+                await updateThreadMetadata(text);
+                return;
+              }
               if (text) {
                 turnDelivered = true;
                 const payloads = adapter.buildPayloads(text);
@@ -563,23 +767,62 @@ export class Scheduler {
                   await emitPayload(payload);
                 }
               }
+              await updateThreadMetadata(text);
+              resetTaskCardState();
             } catch (err) {
+              if (taskCardState.streamId) await failTaskCardStream(err);
               logError(TAG, `failed to send turn_complete: ${err.message}`);
+              const fallbackText = (typeof msg.undeliveredText === 'string' ? msg.undeliveredText : msg.text)?.trim();
+              if (fallbackText) {
+                turnDelivered = true;
+                const payloads = adapter.buildPayloads(fallbackText);
+                for (const payload of payloads) {
+                  await emitPayload(payload);
+                }
+              }
+              await updateThreadMetadata(fallbackText);
+              resetTaskCardState();
             }
             return;
           }
 
           if (msg.type === 'result') {
             let text = msg.text?.trim() || null;
+            finalResultText = text || '';
             try {
+              if (taskCardState.streamId && !taskCardState.failed && !turnDelivered) {
+                const finalPayloads = buildFinalTextPayloads(text);
+                const primaryPayload = finalPayloads.shift() || null;
+                const finalBlocks = [buildPlanBlock(taskCardState.taskCards)];
+                if (primaryPayload?.blocks?.length) finalBlocks.push(...primaryPayload.blocks);
+                await adapter.stopStream(taskCardState.streamId, { final_blocks: finalBlocks });
+                resetTaskCardState();
+                turnDelivered = true;
+                for (const payload of finalPayloads) {
+                  await emitPayload(payload);
+                }
+              }
               if (!text) {
                 const retries = this._autoContinueCount.get(threadTs) || 0;
                 if (retries < MAX_AUTO_CONTINUE) {
                   this._autoContinueCount.set(threadTs, retries + 1);
                   warn(TAG, `empty result, auto-continue ${retries + 1}/${MAX_AUTO_CONTINUE} for thread=${threadTs}`);
-                  await adapter.sendReply(channel, threadTs, `⏳ 回合上限已达${msg.stopReason === 'tool_use' ? '（任务执行中）' : msg.lastTool ? '（正在: ' + msg.lastTool + '）' : ''}，自动续接中 (${retries + 1}/${MAX_AUTO_CONTINUE})…`).catch(() => {});
+                  await adapter.sendReply(channel, effectiveThreadTs, `⏳ 回合上限已达${msg.stopReason === 'tool_use' ? '（任务执行中）' : msg.lastTool ? '（正在: ' + msg.lastTool + '）' : ''}，自动续接中 (${retries + 1}/${MAX_AUTO_CONTINUE})…`).catch(() => {});
                   // Defer submit to onExit — avoid race with worker's process.exit(0)
-                  pendingAutoContinue = { userText: '继续', fileContent: '', threadTs, channel, userId, platform, threadHistory: task.threadHistory };
+                  pendingAutoContinue = {
+                    userText: '继续',
+                    fileContent: '',
+                    imagePaths: [],
+                    threadTs,
+                    deliveryThreadTs: effectiveThreadTs,
+                    channel,
+                    userId,
+                    platform,
+                    threadHistory: task.threadHistory,
+                    profile,
+                    enableTaskCard: task.enableTaskCard,
+                    _completion: task._completion,
+                  };
                   return;
                 }
                 warn(TAG, `empty result after ${MAX_AUTO_CONTINUE} auto-continues for thread=${threadTs}`);
@@ -596,6 +839,7 @@ export class Scheduler {
               } else {
                 turnDelivered = false;
               }
+              await updateThreadMetadata(text);
               await stopTyping();
               if (text) {
                 const errorPatterns = /(?:error|failed|permission denied|ENOENT|not found|timed?\s*out|EACCES)/i;
@@ -624,7 +868,7 @@ export class Scheduler {
             } catch (err) {
               await stopTyping();
               logError(TAG, `failed to send result: ${err.message}`);
-              await adapter.sendReply(channel, threadTs, ':warning: 回复发送失败。').catch(() => {});
+              await adapter.sendReply(channel, effectiveThreadTs, ':warning: 回复发送失败。').catch(() => {});
             }
             if (msg.toolCount > 0) {
               try { this._checkSkillReview(profile.name, msg.toolCount, task, text); } catch (_) {}
@@ -632,9 +876,10 @@ export class Scheduler {
             }
           } else if (msg.type === 'error') {
             const safeError = sanitizeErrorText(msg.error || '未知错误');
+            workerFailure = new Error(safeError);
             logError(TAG, `worker error for thread=${threadTs}: ${safeError}`);
             await stopTyping();
-            await adapter.sendReply(channel, threadTs, `:warning: 出错了: ${safeError}`).catch(() => {});
+            await adapter.sendReply(channel, effectiveThreadTs, `:warning: 出错了: ${safeError}`).catch(() => {});
             storeLesson({
               userText: msg.errorContext?.userText || '',
               errorText: msg.error || '',
@@ -647,6 +892,7 @@ export class Scheduler {
         },
         onExit: async (code, signal) => {
           await stopTyping();
+          await applyThreadStatus('');
           this.activeWorkers.delete(threadTs);
 
           const next = taskQueue.dequeue();
@@ -660,7 +906,7 @@ export class Scheduler {
           if (!responded) {
             logError(TAG, `worker exited without response: thread=${threadTs} code=${code} signal=${signal}`);
             this._autoContinueCount.delete(threadTs);
-            await adapter.cleanupIndicator(channel, threadTs, false, '处理过程中出错，请重试。');
+            await adapter.cleanupIndicator(channel, effectiveThreadTs, false, '处理过程中出错，请重试。');
           }
 
           await this.processNextQueued(threadTs);
@@ -670,14 +916,24 @@ export class Scheduler {
             pendingAutoContinue = null;
             info(TAG, `auto-continue dispatched after worker exit: thread=${cont.threadTs}`);
             await this.submit(cont);
+            return;
+          }
+
+          if (workerFailure) {
+            settleCompletion('reject', workerFailure);
+          } else if (!responded) {
+            settleCompletion('reject', new Error(signal ? `worker killed: ${signal}` : `worker exited with code ${code}`));
+          } else {
+            settleCompletion('resolve', { text: finalResultText, threadTs: effectiveThreadTs });
           }
         },
       }));
     } catch (err) {
       logError(TAG, `fork failed: ${err.message}`);
       await stopTyping();
-      await adapter.cleanupIndicator(channel, threadTs, false, 'Worker 启动失败。');
+      await adapter.cleanupIndicator(channel, effectiveThreadTs, false, 'Worker 启动失败。');
       await this.processNextQueued(threadTs);
+      settleCompletion('reject', err);
       return;
     }
 
