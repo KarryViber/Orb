@@ -1274,6 +1274,7 @@ export class SlackAdapter extends PlatformAdapter {
   }
 
   async setThreadStatus(channel, threadTs, status) {
+    if (!channel || !channel.startsWith('D')) return;
     if (!channel || !threadTs) return;
     await this._slack.apiCall('assistant.threads.setStatus', {
       channel_id: channel,
@@ -1283,6 +1284,7 @@ export class SlackAdapter extends PlatformAdapter {
   }
 
   async setThreadTitle(channel, threadTs, title) {
+    if (!channel || !channel.startsWith('D')) return;
     if (!channel || !threadTs || !title) return;
     await this._slack.apiCall('assistant.threads.setTitle', {
       channel_id: channel,
@@ -1292,6 +1294,7 @@ export class SlackAdapter extends PlatformAdapter {
   }
 
   async setSuggestedPrompts(channel, threadTs, prompts) {
+    if (!channel || !channel.startsWith('D')) return;
     if (!channel || !threadTs || !Array.isArray(prompts) || prompts.length === 0) return;
     const normalizedPrompts = prompts
       .filter((prompt) => prompt?.title && prompt?.message)
