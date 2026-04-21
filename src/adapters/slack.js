@@ -389,7 +389,6 @@ export class SlackAdapter extends PlatformAdapter {
     this._pendingApprovals = new Map();
     this._blockActionInFlight = new Set();
     this._streams = new Map();
-    this._typingIndicators = new Map();
     this._teamId = null;
 
     // Reaction dedupe (30s per ts+reaction, avoids add/remove/add loops)
@@ -1330,27 +1329,28 @@ export class SlackAdapter extends PlatformAdapter {
   }
 
   async setThreadStatus(channel, threadTs, status) {
-    if (!channel || !channel.startsWith('D')) return;
     if (!channel || !threadTs) return;
-    await this._slack.apiCall('assistant.threads.setStatus', {
-      channel_id: channel,
-      thread_ts: threadTs,
-      status: String(status || ''),
-    });
+    try {
+      await this._slack.apiCall('assistant.threads.setStatus', {
+        channel_id: channel,
+        thread_ts: threadTs,
+        status: String(status || ''),
+      });
+    } catch (_) {}
   }
 
   async setThreadTitle(channel, threadTs, title) {
-    if (!channel || !channel.startsWith('D')) return;
     if (!channel || !threadTs || !title) return;
-    await this._slack.apiCall('assistant.threads.setTitle', {
-      channel_id: channel,
-      thread_ts: threadTs,
-      title: String(title).trim().slice(0, 60),
-    });
+    try {
+      await this._slack.apiCall('assistant.threads.setTitle', {
+        channel_id: channel,
+        thread_ts: threadTs,
+        title: String(title).trim().slice(0, 60),
+      });
+    } catch (_) {}
   }
 
   async setSuggestedPrompts(channel, threadTs, prompts) {
-    if (!channel || !channel.startsWith('D')) return;
     if (!channel || !threadTs || !Array.isArray(prompts) || prompts.length === 0) return;
     const normalizedPrompts = prompts
       .filter((prompt) => prompt?.title && prompt?.message)
@@ -1360,11 +1360,13 @@ export class SlackAdapter extends PlatformAdapter {
         message: String(prompt.message).trim().slice(0, 200),
       }));
     if (normalizedPrompts.length === 0) return;
-    await this._slack.apiCall('assistant.threads.setSuggestedPrompts', {
-      channel_id: channel,
-      thread_ts: threadTs,
-      prompts: normalizedPrompts,
-    });
+    try {
+      await this._slack.apiCall('assistant.threads.setSuggestedPrompts', {
+        channel_id: channel,
+        thread_ts: threadTs,
+        prompts: normalizedPrompts,
+      });
+    } catch (_) {}
   }
 
   async setTyping(channel, threadTs, status) {
@@ -1377,47 +1379,12 @@ export class SlackAdapter extends PlatformAdapter {
 
   async startTypingIndicator(channel, threadTs) {
     if (!channel || !threadTs) return;
-    if (String(channel).startsWith('D')) {
-      await this.setThreadStatus(channel, threadTs, 'thinking');
-      return;
-    }
-
-    const key = `${channel}:${threadTs}`;
-    if (this._typingIndicators.has(key)) return;
-
-    const result = await this._slack.chat.postMessage({
-      channel,
-      thread_ts: threadTs,
-      text: '⏳ thinking',
-    });
-    if (result?.ts) {
-      this._typingIndicators.set(key, { channel, threadTs, ts: result.ts });
-    }
+    await this.setThreadStatus(channel, threadTs, 'thinking');
   }
 
   async stopTypingIndicator(channel, threadTs) {
     if (!channel || !threadTs) return;
-    if (String(channel).startsWith('D')) {
-      try {
-        await this.setThreadStatus(channel, threadTs, '');
-      } catch (_) {}
-      return;
-    }
-
-    const key = `${channel}:${threadTs}`;
-    const indicator = this._typingIndicators.get(key);
-    if (!indicator?.ts) return;
-    this._typingIndicators.delete(key);
-
-    try {
-      await this._slack.chat.delete({
-        channel: indicator.channel,
-        ts: indicator.ts,
-      });
-    } catch (err) {
-      if (err?.data?.error === 'message_not_found') return;
-      throw err;
-    }
+    await this.setThreadStatus(channel, threadTs, '');
   }
 
   buildPayloads(text) {
