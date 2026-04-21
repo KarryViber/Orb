@@ -1236,7 +1236,7 @@ export class SlackAdapter extends PlatformAdapter {
     }
   }
 
-  async startStream(channel, threadTs, { task_display_mode = 'aggregated', initial_chunks = [] } = {}) {
+  async startStream(channel, threadTs, { task_display_mode = 'timeline', initial_chunks = [] } = {}) {
     const normalizedTaskDisplayMode = this.normalizeTaskDisplayMode(task_display_mode);
     const initialChunks = this.normalizeStreamChunks(initial_chunks);
     const chunks = [];
