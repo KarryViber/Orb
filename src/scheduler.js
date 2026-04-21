@@ -7,7 +7,7 @@ import { taskQueue } from './queue.js';
 import { sanitizeErrorText } from './format-utils.js';
 import { listFacts, storeLesson, storeCorrectionLesson, purgeTransient, lintMemory } from './memory.js';
 import { spawnWorker } from './spawn.js';
-import { buildPlanBlock, extractSuggestedPrompts } from './adapters/slack-format.js';
+import { buildPlanBlock, buildTaskUpdateChunks, extractSuggestedPrompts } from './adapters/slack-format.js';
 const TAG = 'scheduler';
 const DRAIN_TIMEOUT = 30_000;
 const SKILL_REVIEW_THRESHOLD = 10;   // cumulative tool uses before triggering review
@@ -581,7 +581,7 @@ export class Scheduler {
     const appendTaskCardPlan = async () => {
       if (!taskCardState.streamId || taskCardState.failed) return false;
       try {
-        await adapter.appendStream(taskCardState.streamId, [buildPlanBlock(taskCardState.taskCards)]);
+        await adapter.appendStream(taskCardState.streamId, buildTaskUpdateChunks(taskCardState.taskCards));
         return true;
       } catch (err) {
         await failTaskCardStream(err);
