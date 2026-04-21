@@ -710,6 +710,7 @@ export class Scheduler {
           }
 
           if (msg.type === 'status_update') {
+            if (taskCardState.enabled) return;
             await applyThreadStatus(msg.text || '');
             return;
           }
