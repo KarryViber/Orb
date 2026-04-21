@@ -571,6 +571,22 @@ export function buildPlanBlock(taskCardsMap) {
   };
 }
 
+export function buildTaskUpdateChunks(taskCardsMap) {
+  return [...(taskCardsMap?.entries?.() || [])].map(([task_id, card]) => {
+    const chunk = {
+      type: 'task_update',
+      id: String(task_id || ''),
+      title: String(card?.title || 'Task').slice(0, 255),
+      status: card?.status || 'in_progress',
+    };
+    const details = String(card?.details || '').trim();
+    const output = String(card?.output || '').trim();
+    if (details) chunk.details = details.slice(0, 255);
+    if (output) chunk.output = output.slice(0, 255);
+    return chunk;
+  }).filter((chunk) => chunk.id);
+}
+
 
 
 export { sanitizeErrorText } from '../format-utils.js';
