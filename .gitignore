@@ -28,6 +28,7 @@ profiles/*/venvs/
 .DS_Store
 *.log
 logs/
+logs/handlers/
 *.db
 *.db-wal
 *.db-shm

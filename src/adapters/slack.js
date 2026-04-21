@@ -1,8 +1,10 @@
 import { WebClient } from '@slack/web-api';
 import { SocketModeClient } from '@slack/socket-mode';
-import { createReadStream, mkdirSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { spawn } from 'node:child_process';
+import { appendFileSync, closeSync, createReadStream, existsSync, mkdirSync, openSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { info, error as logError, warn } from '../log.js';
 import { isSafeUrl } from '../format-utils.js';
 import { buildSendPayloads } from './slack-format.js';
@@ -11,6 +13,7 @@ import { downloadAndCacheImage, cleanImageCache, IMAGE_EXTENSIONS } from './imag
 
 const TAG = 'slack';
 const MAX_USERNAME_CACHE = 500;
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // --- Slack thread URL parsing ---
 
@@ -329,6 +332,19 @@ const TEXT_EXTENSIONS = new Set([
   'rb', 'go', 'rs', 'java', 'kt', 'swift', 'c', 'cpp', 'h', 'hpp', 'cfg',
 ]);
 const MAX_FILE_SIZE = 100 * 1024; // 100KB
+const BLOCK_ACTION_HANDLER_RE = /^[a-z][a-z0-9_]{0,63}$/;
+const HANDLER_EXTENSIONS = ['.py', '.sh', '.js'];
+const HANDLER_DEDUP_TTL = 10 * 60 * 1000;
+const HANDLER_LOG_DIR = join(__dirname, '..', '..', 'logs', 'handlers');
+const HANDLER_PID_LOG = join(HANDLER_LOG_DIR, 'pids.log');
+
+export class StreamAPIError extends Error {
+  constructor(message, cause) {
+    super(message);
+    this.name = 'StreamAPIError';
+    this.cause = cause;
+  }
+}
 
 export class SlackAdapter extends PlatformAdapter {
   constructor({ botToken, appToken, allowBots, replyBroadcast, freeResponseChannels, freeResponseUsers, dmRouting, getProfilePaths }) {
@@ -371,6 +387,9 @@ export class SlackAdapter extends PlatformAdapter {
 
     // Pending approvals
     this._pendingApprovals = new Map();
+    this._blockActionInFlight = new Set();
+    this._streams = new Map();
+    this._teamId = null;
 
     // Reaction dedupe (30s per ts+reaction, avoids add/remove/add loops)
     this._reactionDedupCache = new Map();
@@ -862,35 +881,230 @@ export class SlackAdapter extends PlatformAdapter {
     const actionId = action.id || action.action_id;
     const userId = body.user?.id;
 
-    if (!approvalId || !this._pendingApprovals.has(approvalId)) return;
+    if (approvalId && this._pendingApprovals.has(approvalId)) {
+      const pending = this._pendingApprovals.get(approvalId);
+      this._pendingApprovals.delete(approvalId);
+      clearTimeout(pending.timeoutHandle); // #22: cancel timeout if user acted early
 
-    const pending = this._pendingApprovals.get(approvalId);
-    this._pendingApprovals.delete(approvalId);
-    clearTimeout(pending.timeoutHandle); // #22: cancel timeout if user acted early
+      const approvalMap = {
+        orb_approve_once: { approved: true, scope: 'once', label: '✅ Allowed Once' },
+        orb_approve_session: { approved: true, scope: 'session', label: '✅ Allowed (Session)' },
+        orb_approve_always: { approved: true, scope: 'always', label: '✅ Always Allowed' },
+        orb_deny: { approved: false, scope: 'once', label: '❌ Denied' },
+      };
+      const decision = approvalMap[actionId] || { approved: false, scope: 'once', label: '❌ Denied' };
+      const { approved, scope, label } = decision;
 
-    const approvalMap = {
-      orb_approve_once: { approved: true, scope: 'once', label: '✅ Allowed Once' },
-      orb_approve_session: { approved: true, scope: 'session', label: '✅ Allowed (Session)' },
-      orb_approve_always: { approved: true, scope: 'always', label: '✅ Always Allowed' },
-      orb_deny: { approved: false, scope: 'once', label: '❌ Denied' },
-    };
-    const decision = approvalMap[actionId] || { approved: false, scope: 'once', label: '❌ Denied' };
-    const { approved, scope, label } = decision;
+      try {
+        const updatedBlocks = this._buildApprovalStatusBlocks(pending, label, `by <@${userId}>`);
 
-    try {
-      const updatedBlocks = this._buildApprovalStatusBlocks(pending, label, `by <@${userId}>`);
+        await this._slack.chat.update({
+          channel: pending.channel,
+          ts: pending.messageTs,
+          blocks: updatedBlocks,
+          text: label,
+        });
+      } catch (err) {
+        logError(TAG, `failed to update approval message: ${err.message}`);
+      }
 
-      await this._slack.chat.update({
-        channel: pending.channel,
-        ts: pending.messageTs,
-        blocks: updatedBlocks,
-        text: label,
-      });
-    } catch (err) {
-      logError(TAG, `failed to update approval message: ${err.message}`);
+      pending.resolve({ approved, scope, userId });
+      return;
     }
 
-    pending.resolve({ approved, scope, userId });
+    await this._dispatchBlockActionHandler({ body, action, actionId });
+  }
+
+  _rememberBlockActionMessage(messageTs) {
+    this._blockActionInFlight.add(messageTs);
+    const timer = setTimeout(() => {
+      this._blockActionInFlight.delete(messageTs);
+    }, HANDLER_DEDUP_TTL);
+    timer.unref?.();
+  }
+
+  _releaseBlockActionMessage(messageTs) {
+    if (!messageTs) return;
+    this._blockActionInFlight.delete(messageTs);
+  }
+
+  _isBlockActionProcessingMessage(message) {
+    if (!message) return false;
+    const text = [message.text || '', extractBlockKitText(message.blocks)]
+      .filter(Boolean)
+      .join('\n');
+    return text.includes('⏳ 处理中…');
+  }
+
+  _handleMessageChanged(event) {
+    const messageTs = event?.message?.ts || event?.previous_message?.ts;
+    if (!messageTs || !this._blockActionInFlight.has(messageTs)) return;
+    if (this._isBlockActionProcessingMessage(event.message)) return;
+    this._releaseBlockActionMessage(messageTs);
+    info(TAG, `block_action released: message_ts=${messageTs}`);
+  }
+
+  async _updateBlockActionCard(channel, messageTs, text) {
+    const safeText = String(text || '');
+    return this._slack.chat.update({
+      channel,
+      ts: messageTs,
+      text: safeText,
+      blocks: [
+        {
+          type: 'section',
+          text: { type: 'mrkdwn', text: safeText },
+        },
+      ],
+    });
+  }
+
+  _resolveHandlerScript(profilePaths, actionId) {
+    if (!profilePaths?.scriptsDir) return null;
+    const handlersDir = join(profilePaths.scriptsDir, 'handlers');
+    for (const ext of HANDLER_EXTENSIONS) {
+      const candidate = join(handlersDir, `${actionId}${ext}`);
+      if (existsSync(candidate)) return candidate;
+    }
+    return null;
+  }
+
+  _getHandlerCommand(handlerPath) {
+    if (handlerPath.endsWith('.py')) return { command: 'python3', args: [handlerPath] };
+    if (handlerPath.endsWith('.sh')) return { command: '/bin/bash', args: [handlerPath] };
+    return { command: process.execPath, args: [handlerPath] };
+  }
+
+  async _dispatchBlockActionHandler({ body, action, actionId }) {
+    const channel = body.channel?.id || body.container?.channel_id;
+    const messageTs = body.container?.message_ts || body.message?.ts;
+    const threadTs = body.message?.thread_ts || messageTs || null;
+    const userId = body.user?.id || '';
+    const rawActionId = String(actionId || '');
+
+    if (!channel || !messageTs) {
+      warn(TAG, `block_action missing channel/message_ts: action_id=${rawActionId || 'unknown'}`);
+      return;
+    }
+
+    if (!BLOCK_ACTION_HANDLER_RE.test(rawActionId)) {
+      warn(TAG, `rejected block_action with invalid action_id: ${rawActionId || 'unknown'}`);
+      try {
+        await this._updateBlockActionCard(
+          channel,
+          messageTs,
+          `⚠️ 未注册 handler: ${formatSlackInlineCode(rawActionId || 'unknown')} · <@${userId || 'unknown'}>`
+        );
+      } catch (err) {
+        logError(TAG, `failed to update invalid handler message: ${err.message}`);
+      }
+      return;
+    }
+
+    let profilePaths = null;
+    try {
+      profilePaths = this._getProfilePaths ? this._getProfilePaths(userId) : null;
+    } catch (err) {
+      logError(TAG, `profile resolution failed for handler user=${userId}: ${err.message}`);
+    }
+    const profileName = profilePaths?.name || 'unknown';
+
+    const handlerPath = this._resolveHandlerScript(profilePaths, rawActionId);
+    if (!handlerPath) {
+      warn(TAG, `unregistered handler: action_id=${rawActionId} profile=${profileName}`);
+      try {
+        await this._updateBlockActionCard(
+          channel,
+          messageTs,
+          `⚠️ 未注册 handler: ${formatSlackInlineCode(rawActionId)} · <@${userId || 'unknown'}>`
+        );
+      } catch (err) {
+        logError(TAG, `failed to update unregistered handler message: ${err.message}`);
+      }
+      return;
+    }
+
+    if (this._blockActionInFlight.has(messageTs)) {
+      info(TAG, `block_action dedup: action_id=${rawActionId || 'unknown'} message_ts=${messageTs}`);
+      return;
+    }
+    this._rememberBlockActionMessage(messageTs);
+
+    const processingText = `⏳ 处理中… <@${userId}> clicked ${formatSlackInlineCode(rawActionId)}`;
+    try {
+      await this._updateBlockActionCard(channel, messageTs, processingText);
+    } catch (err) {
+      logError(TAG, `failed to update handler processing message: ${err.message}`);
+    }
+
+    const responseUrl = body.response_url || body.response_urls?.[0]?.response_url || null;
+    const context = {
+      action_id: rawActionId,
+      value: action.value ?? null,
+      user_id: userId,
+      channel,
+      message_ts: messageTs,
+      thread_ts: threadTs,
+      profile: profilePaths?.name || null,
+      response_url: responseUrl,
+    };
+
+    mkdirSync(HANDLER_LOG_DIR, { recursive: true });
+    const logPath = join(
+      HANDLER_LOG_DIR,
+      `${rawActionId}-${Date.now()}-${String(messageTs).replace(/[^\d]+/g, '_') || 'message'}.log`
+    );
+    writeFileSync(
+      logPath,
+      `${new Date().toISOString()} action_id=${rawActionId} profile=${profileName} user_id=${userId || 'unknown'}\n${JSON.stringify(context)}\n\n`,
+      { flag: 'a' },
+    );
+
+    let logFd = null;
+    try {
+      const { command, args } = this._getHandlerCommand(handlerPath);
+      logFd = openSync(logPath, 'a');
+      const child = spawn(command, args, {
+        cwd: profilePaths?.scriptsDir || undefined,
+        detached: true,
+        stdio: ['pipe', logFd, logFd],
+      });
+
+      child.on('error', (err) => {
+        this._releaseBlockActionMessage(messageTs);
+        logError(TAG, `handler spawn error: action_id=${rawActionId} message_ts=${messageTs} error=${err.message}`);
+        this._updateBlockActionCard(
+          channel,
+          messageTs,
+          `⚠️ handler 启动失败: ${formatSlackInlineCode(rawActionId)}`
+        ).catch((updateErr) => {
+          logError(TAG, `failed to update handler spawn error message: ${updateErr.message}`);
+        });
+      });
+      child.stdin.on('error', () => {});
+      child.stdin.write(`${JSON.stringify(context)}\n`);
+      child.stdin.end();
+      child.unref();
+      closeSync(logFd);
+      logFd = null;
+
+      appendFileSync(
+        HANDLER_PID_LOG,
+        `${new Date().toISOString()} pid=${child.pid} profile=${profileName} action_id=${rawActionId} message_ts=${messageTs}\n`,
+        'utf-8',
+      );
+      info(TAG, `handler spawned: pid=${child.pid} profile=${profileName} action_id=${rawActionId} message_ts=${messageTs} log=${logPath}`);
+    } catch (err) {
+      this._releaseBlockActionMessage(messageTs);
+      logError(TAG, `failed to spawn handler: action_id=${rawActionId} message_ts=${messageTs} error=${err.message}`);
+      try {
+        await this._updateBlockActionCard(channel, messageTs, `⚠️ handler 启动失败: ${formatSlackInlineCode(rawActionId)}`);
+      } catch (updateErr) {
+        logError(TAG, `failed to update handler launch error message: ${updateErr.message}`);
+      }
+    } finally {
+      if (logFd != null) closeSync(logFd);
+    }
   }
 
   // --- Reply / Edit helpers ---
@@ -912,8 +1126,6 @@ export class SlackAdapter extends PlatformAdapter {
     return this._slack.chat.update(params);
   }
 
-  // --- PlatformAdapter interface ---
-
   async sendReply(channel, threadTs, text, extra = {}) {
     return this._postReply(channel, threadTs, text, extra);
   }
@@ -921,6 +1133,133 @@ export class SlackAdapter extends PlatformAdapter {
   async editMessage(channel, ts, text, extra = {}) {
     return this._editMessage(channel, ts, text, extra);
   }
+
+  // --- Streaming helpers ---
+
+  normalizeTaskDisplayMode(mode) {
+    return mode === 'aggregated' || mode === 'plan' ? 'plan' : 'timeline';
+  }
+
+  normalizeStreamChunks(chunks) {
+    const normalized = [];
+    const blocks = [];
+
+    for (const chunk of Array.isArray(chunks) ? chunks : []) {
+      if (!chunk || typeof chunk !== 'object') continue;
+      if (chunk.type === 'markdown_text' || chunk.type === 'task_update' || chunk.type === 'plan_update' || chunk.type === 'blocks') {
+        normalized.push(chunk);
+        continue;
+      }
+      if (chunk.type === 'text') {
+        normalized.push({ type: 'markdown_text', text: String(chunk.text || '').trim() || ' ' });
+        continue;
+      }
+      blocks.push(chunk);
+    }
+
+    if (blocks.length > 0) normalized.push({ type: 'blocks', blocks });
+    return normalized;
+  }
+
+  _getStreamHandle(streamId) {
+    const stream = this._streams.get(streamId);
+    if (!stream) throw new StreamAPIError(`unknown stream id: ${streamId}`);
+    return stream;
+  }
+
+  async _resolveStreamRecipient(channel, threadTs) {
+    if (!channel || !threadTs || String(channel).startsWith('D')) return {};
+    if (!this._teamId) throw new StreamAPIError('missing Slack team_id for streaming API');
+
+    try {
+      const result = await this._slack.conversations.replies({
+        channel,
+        ts: threadTs,
+        limit: 1,
+        inclusive: true,
+      });
+      const recipientUserId = result?.messages?.[0]?.user;
+      if (!recipientUserId) {
+        throw new StreamAPIError(`failed to resolve recipient_user_id for thread ${threadTs}`);
+      }
+      return {
+        recipient_user_id: recipientUserId,
+        recipient_team_id: this._teamId,
+      };
+    } catch (err) {
+      if (err instanceof StreamAPIError) throw err;
+      throw new StreamAPIError(`failed to resolve stream recipient: ${err.message}`, err);
+    }
+  }
+
+  async startStream(channel, threadTs, { task_display_mode = 'aggregated' } = {}) {
+    const params = {
+      channel,
+      markdown_text: ' ',
+      task_display_mode: this.normalizeTaskDisplayMode(task_display_mode),
+      chunks: [{ type: 'plan_update', title: 'Task progress' }],
+      ...(await this._resolveStreamRecipient(channel, threadTs)),
+    };
+    if (threadTs) params.thread_ts = threadTs;
+
+    let result;
+    try {
+      result = await this._slack.apiCall('chat.startStream', params);
+    } catch (err) {
+      throw new StreamAPIError(`chat.startStream failed: ${err.data?.error || err.message}`, err);
+    }
+    if (!result?.ok || !result?.ts) {
+      throw new StreamAPIError(`chat.startStream failed: ${result?.error || 'missing ts'}`);
+    }
+
+    const streamId = `${channel}:${result.ts}`;
+    this._streams.set(streamId, { channel, ts: result.ts });
+    return { stream_id: streamId, ts: result.ts };
+  }
+
+  async appendStream(streamId, chunks) {
+    const stream = this._getStreamHandle(streamId);
+    const normalizedChunks = this.normalizeStreamChunks(chunks);
+    if (normalizedChunks.length === 0) return;
+
+    let result;
+    try {
+      result = await this._slack.apiCall('chat.appendStream', {
+        channel: stream.channel,
+        ts: stream.ts,
+        markdown_text: ' ',
+        chunks: normalizedChunks,
+      });
+    } catch (err) {
+      throw new StreamAPIError(`chat.appendStream failed: ${err.data?.error || err.message}`, err);
+    }
+    if (!result?.ok) {
+      throw new StreamAPIError(`chat.appendStream failed: ${result?.error || 'unknown_error'}`);
+    }
+  }
+
+  async stopStream(streamId, { final_blocks } = {}) {
+    const stream = this._getStreamHandle(streamId);
+
+    let result;
+    try {
+      result = await this._slack.apiCall('chat.stopStream', {
+        channel: stream.channel,
+        ts: stream.ts,
+        markdown_text: ' ',
+        ...(Array.isArray(final_blocks) && final_blocks.length > 0 ? { blocks: final_blocks } : {}),
+      });
+    } catch (err) {
+      throw new StreamAPIError(`chat.stopStream failed: ${err.data?.error || err.message}`, err);
+    } finally {
+      this._streams.delete(streamId);
+    }
+    if (!result?.ok) {
+      throw new StreamAPIError(`chat.stopStream failed: ${result?.error || 'unknown_error'}`);
+    }
+  }
+
+  // --- PlatformAdapter interface ---
 
   async uploadFile(channel, threadTs, filePath, filename) {
     try {
@@ -937,13 +1276,44 @@ export class SlackAdapter extends PlatformAdapter {
     }
   }
 
+  async setThreadStatus(channel, threadTs, status) {
+    if (!channel || !threadTs) return;
+    await this._slack.apiCall('assistant.threads.setStatus', {
+      channel_id: channel,
+      thread_ts: threadTs,
+      status: String(status || ''),
+    });
+  }
+
+  async setThreadTitle(channel, threadTs, title) {
+    if (!channel || !threadTs || !title) return;
+    await this._slack.apiCall('assistant.threads.setTitle', {
+      channel_id: channel,
+      thread_ts: threadTs,
+      title: String(title).trim().slice(0, 60),
+    });
+  }
+
+  async setSuggestedPrompts(channel, threadTs, prompts) {
+    if (!channel || !threadTs || !Array.isArray(prompts) || prompts.length === 0) return;
+    const normalizedPrompts = prompts
+      .filter((prompt) => prompt?.title && prompt?.message)
+      .slice(0, 4)
+      .map((prompt) => ({
+        title: String(prompt.title).trim().slice(0, 60),
+        message: String(prompt.message).trim().slice(0, 200),
+      }));
+    if (normalizedPrompts.length === 0) return;
+    await this._slack.apiCall('assistant.threads.setSuggestedPrompts', {
+      channel_id: channel,
+      thread_ts: threadTs,
+      prompts: normalizedPrompts,
+    });
+  }
+
   async setTyping(channel, threadTs, status) {
     try {
-      await this._slack.apiCall('assistant.threads.setStatus', {
-        channel_id: channel,
-        thread_ts: threadTs,
-        status,
-      });
+      await this.setThreadStatus(channel, threadTs, status);
     } catch (_) {}
   }
 
@@ -1169,6 +1539,11 @@ export class SlackAdapter extends PlatformAdapter {
       return;
     }
 
+    if (event.subtype === 'message_changed') {
+      this._handleMessageChanged(event);
+      return;
+    }
+
     // Bot message filtering
     if (event.bot_id) {
       if (event.bot_id === this._botId) return;
@@ -1367,6 +1742,7 @@ export class SlackAdapter extends PlatformAdapter {
     const auth = await this._slack.auth.test();
     this._botUserId = auth.user_id;
     this._botId = auth.bot_id;
+    this._teamId = auth.team_id || null;
     info(TAG, `booted as @${auth.user} (${this._botUserId}, bot=${this._botId})`);
 
     this._socket.on('message', (evt) => this._handleMessage(evt));
