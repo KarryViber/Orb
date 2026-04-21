@@ -591,7 +591,7 @@ export class Scheduler {
       if (taskCardState.streamId) return true;
       try {
         const stream = await adapter.startStream(channel, effectiveThreadTs, {
-          task_display_mode: 'aggregated',
+          task_display_mode: 'timeline',
           initial_chunks: buildTaskUpdateChunks(taskCardState.taskCards),
         });
         taskCardState.streamId = stream?.stream_id || null;
