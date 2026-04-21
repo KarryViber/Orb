@@ -1379,7 +1379,7 @@ export class SlackAdapter extends PlatformAdapter {
 
   async startTypingIndicator(channel, threadTs) {
     if (!channel || !threadTs) return;
-    await this.setThreadStatus(channel, threadTs, 'thinking');
+    await this.setThreadStatus(channel, threadTs, 'Orb thinking…');
   }
 
   async stopTypingIndicator(channel, threadTs) {
