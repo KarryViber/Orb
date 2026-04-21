@@ -527,8 +527,8 @@ export class Scheduler {
     const startTyping = async () => {
       if (canUseTypingIndicator) {
         if (platform === 'slack' && String(channel || '').startsWith('D')) {
-          if (!pendingThreadStatus) pendingThreadStatus = 'thinking';
-          if (pendingThreadStatus !== 'thinking') return;
+          if (!pendingThreadStatus) pendingThreadStatus = 'Orb thinking…';
+          if (pendingThreadStatus !== 'Orb thinking…') return;
         }
         try {
           await adapter.startTypingIndicator(channel, effectiveThreadTs);
@@ -538,13 +538,13 @@ export class Scheduler {
         return;
       }
       if (canManageThreadStatus) {
-        if (!pendingThreadStatus) await applyThreadStatus('thinking');
+        if (!pendingThreadStatus) await applyThreadStatus('Orb thinking…');
         return;
       }
       if (typingInterval) return;
-      try { await adapter.setTyping(channel, effectiveThreadTs, 'is thinking…'); } catch (_) {}
+      try { await adapter.setTyping(channel, effectiveThreadTs, 'Orb thinking…'); } catch (_) {}
       typingInterval = setInterval(async () => {
-        try { await adapter.setTyping(channel, effectiveThreadTs, 'is thinking…'); } catch (_) {}
+        try { await adapter.setTyping(channel, effectiveThreadTs, 'Orb thinking…'); } catch (_) {}
       }, 5_000);
     };
 
