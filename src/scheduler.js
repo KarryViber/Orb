@@ -493,6 +493,9 @@ export class Scheduler {
     let completionSettled = false;
     let worker;
     const canManageThreadStatus = platform === 'slack' && channel != null && typeof adapter?.setThreadStatus === 'function';
+    const canUseTypingIndicator = platform === 'slack'
+      && typeof adapter?.startTypingIndicator === 'function'
+      && typeof adapter?.stopTypingIndicator === 'function';
     const taskCardState = {
       enabled: platform === 'slack' && channel != null
         && task.enableTaskCard !== false
@@ -522,6 +525,18 @@ export class Scheduler {
     };
 
     const startTyping = async () => {
+      if (canUseTypingIndicator) {
+        if (platform === 'slack' && String(channel || '').startsWith('D')) {
+          if (!pendingThreadStatus) pendingThreadStatus = 'thinking';
+          if (pendingThreadStatus !== 'thinking') return;
+        }
+        try {
+          await adapter.startTypingIndicator(channel, effectiveThreadTs);
+        } catch (err) {
+          warn(TAG, `failed to start typing indicator: ${err.message}`);
+        }
+        return;
+      }
       if (canManageThreadStatus) {
         if (!pendingThreadStatus) await applyThreadStatus('thinking');
         return;
@@ -534,6 +549,14 @@ export class Scheduler {
     };
 
     const stopTyping = async () => {
+      if (canUseTypingIndicator) {
+        try {
+          await adapter.stopTypingIndicator(channel, effectiveThreadTs);
+        } catch (err) {
+          warn(TAG, `failed to stop typing indicator: ${err.message}`);
+        }
+        return;
+      }
       if (canManageThreadStatus) return;
       if (typingInterval) {
         clearInterval(typingInterval);
@@ -567,7 +590,10 @@ export class Scheduler {
       if (!taskCardState.enabled || taskCardState.failed) return false;
       if (taskCardState.streamId) return true;
       try {
-        const stream = await adapter.startStream(channel, effectiveThreadTs, { task_display_mode: 'aggregated' });
+        const stream = await adapter.startStream(channel, effectiveThreadTs, {
+          task_display_mode: 'aggregated',
+          initial_chunks: buildTaskUpdateChunks(taskCardState.taskCards),
+        });
         taskCardState.streamId = stream?.stream_id || null;
         if (!effectiveThreadTs && stream?.ts) effectiveThreadTs = stream.ts;
         if (pendingThreadStatus) await applyThreadStatus(pendingThreadStatus);
@@ -696,7 +722,8 @@ export class Scheduler {
               status: 'in_progress',
               output: '',
             });
-            if (await ensureTaskCardStream()) {
+            const hadStream = Boolean(taskCardState.streamId);
+            if (await ensureTaskCardStream() && hadStream) {
               await appendTaskCardPlan();
             }
             return;
@@ -743,6 +770,7 @@ export class Scheduler {
           responded = true;
 
           if (msg.type === 'turn_complete') {
+            await stopTyping();
             // 中间轮次完成 — worker 已裁剪掉经 intermediate_text 投递过的部分
             try {
               const text = (typeof msg.undeliveredText === 'string' ? msg.undeliveredText : msg.text)?.trim();
