@@ -557,7 +557,7 @@ export function buildPlanBlock(taskCardsMap) {
       type: 'task_card',
       task_id,
       title: String(card?.title || 'Task').slice(0, 255),
-      status: card?.status || 'in_progress',
+      status: normalizeTaskStatus(card?.status, 'in_progress'),
     };
     if (card?.details) task.details = richTextFromString(card.details);
     if (card?.output) task.output = richTextFromString(card.output);
@@ -571,13 +571,19 @@ export function buildPlanBlock(taskCardsMap) {
   };
 }
 
+function normalizeTaskStatus(status, fallback = 'in_progress') {
+  if (status === 'completed') return 'complete';
+  if (status === 'pending' || status === 'in_progress' || status === 'complete' || status === 'error') return status;
+  return fallback;
+}
+
 export function buildTaskUpdateChunks(taskCardsMap) {
   return [...(taskCardsMap?.entries?.() || [])].map(([task_id, card]) => {
     const chunk = {
       type: 'task_update',
       id: String(task_id || ''),
       title: String(card?.title || 'Task').slice(0, 255),
-      status: card?.status || 'in_progress',
+      status: normalizeTaskStatus(card?.status, 'in_progress'),
     };
     const details = String(card?.details || '').trim();
     const output = String(card?.output || '').trim();

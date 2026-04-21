@@ -389,6 +389,7 @@ export class SlackAdapter extends PlatformAdapter {
     this._pendingApprovals = new Map();
     this._blockActionInFlight = new Set();
     this._streams = new Map();
+    this._typingIndicators = new Map();
     this._teamId = null;
 
     // Reaction dedupe (30s per ts+reaction, avoids add/remove/add loops)
@@ -1143,11 +1144,55 @@ export class SlackAdapter extends PlatformAdapter {
   normalizeStreamChunks(chunks) {
     const normalized = [];
     const blocks = [];
+    const pushTaskUpdate = (taskLike) => {
+      if (!taskLike || typeof taskLike !== 'object') return;
+      const id = String(taskLike.id || taskLike.task_id || '').trim();
+      const title = String(taskLike.title || taskLike.text || '').trim();
+      if (!id || !title) return;
+
+      const chunk = {
+        type: 'task_update',
+        id,
+        title: title.slice(0, 255),
+        status: taskLike.status === 'completed' ? 'complete' : taskLike.status,
+      };
+
+      if (!['pending', 'in_progress', 'complete', 'error'].includes(chunk.status)) {
+        chunk.status = 'in_progress';
+      }
+
+      const details = typeof taskLike.details === 'string' ? taskLike.details.trim() : '';
+      const output = typeof taskLike.output === 'string' ? taskLike.output.trim() : '';
+      if (details) chunk.details = details.slice(0, 255);
+      if (output) chunk.output = output.slice(0, 255);
+      if (Array.isArray(taskLike.sources) && taskLike.sources.length > 0) {
+        chunk.sources = taskLike.sources;
+      }
+      normalized.push(chunk);
+    };
 
     for (const chunk of Array.isArray(chunks) ? chunks : []) {
       if (!chunk || typeof chunk !== 'object') continue;
-      if (chunk.type === 'markdown_text' || chunk.type === 'task_update' || chunk.type === 'plan_update' || chunk.type === 'blocks') {
-        normalized.push(chunk);
+      if (chunk.type === 'markdown_text') {
+        const text = String(chunk.text || chunk.markdown_text || '').trim();
+        if (text) normalized.push({ type: 'markdown_text', text });
+        continue;
+      }
+      if (chunk.type === 'task_update') {
+        pushTaskUpdate(chunk.task && typeof chunk.task === 'object' ? chunk.task : chunk);
+        continue;
+      }
+      if (chunk.type === 'task') {
+        pushTaskUpdate(chunk);
+        continue;
+      }
+      if (chunk.type === 'plan_update') {
+        const title = String(chunk.title || '').trim();
+        if (title) normalized.push({ type: 'plan_update', title: title.slice(0, 255) });
+        continue;
+      }
+      if (chunk.type === 'blocks') {
+        if (Array.isArray(chunk.blocks) && chunk.blocks.length > 0) normalized.push(chunk);
         continue;
       }
       if (chunk.type === 'text') {
@@ -1192,13 +1237,22 @@ export class SlackAdapter extends PlatformAdapter {
     }
   }
 
-  async startStream(channel, threadTs, { task_display_mode = 'aggregated' } = {}) {
+  async startStream(channel, threadTs, { task_display_mode = 'aggregated', initial_chunks = [] } = {}) {
+    const normalizedTaskDisplayMode = this.normalizeTaskDisplayMode(task_display_mode);
+    const initialChunks = this.normalizeStreamChunks(initial_chunks);
+    const chunks = [];
+    if (normalizedTaskDisplayMode === 'plan') {
+      chunks.push({ type: 'plan_update', title: 'Task progress' });
+    }
+    if (initialChunks.length > 0) chunks.push(...initialChunks);
+
     const params = {
       channel,
-      task_display_mode: this.normalizeTaskDisplayMode(task_display_mode),
-      chunks: [{ type: 'plan_update', title: 'Task progress' }],
+      task_display_mode: normalizedTaskDisplayMode,
       ...(await this._resolveStreamRecipient(channel, threadTs)),
     };
+    if (chunks.length > 0) params.chunks = chunks;
+    else params.markdown_text = ' ';
     if (threadTs) params.thread_ts = threadTs;
 
     let result;
@@ -1234,6 +1288,8 @@ export class SlackAdapter extends PlatformAdapter {
     if (!result?.ok) {
       throw new StreamAPIError(`chat.appendStream failed: ${result?.error || 'unknown_error'}`);
     }
+    info(TAG, `[stream-debug] append result: ${JSON.stringify(result)}`);
+    info(TAG, `[stream-debug] sent chunks: ${JSON.stringify(normalizedChunks)}`);
   }
 
   async stopStream(streamId, { final_blocks } = {}) {
@@ -1312,9 +1368,56 @@ export class SlackAdapter extends PlatformAdapter {
   }
 
   async setTyping(channel, threadTs, status) {
+    if (status) {
+      await this.startTypingIndicator(channel, threadTs).catch(() => {});
+      return;
+    }
+    await this.stopTypingIndicator(channel, threadTs).catch(() => {});
+  }
+
+  async startTypingIndicator(channel, threadTs) {
+    if (!channel || !threadTs) return;
+    if (String(channel).startsWith('D')) {
+      await this.setThreadStatus(channel, threadTs, 'thinking');
+      return;
+    }
+
+    const key = `${channel}:${threadTs}`;
+    if (this._typingIndicators.has(key)) return;
+
+    const result = await this._slack.chat.postMessage({
+      channel,
+      thread_ts: threadTs,
+      text: '⏳ thinking',
+    });
+    if (result?.ts) {
+      this._typingIndicators.set(key, { channel, threadTs, ts: result.ts });
+    }
+  }
+
+  async stopTypingIndicator(channel, threadTs) {
+    if (!channel || !threadTs) return;
+    if (String(channel).startsWith('D')) {
+      try {
+        await this.setThreadStatus(channel, threadTs, '');
+      } catch (_) {}
+      return;
+    }
+
+    const key = `${channel}:${threadTs}`;
+    const indicator = this._typingIndicators.get(key);
+    if (!indicator?.ts) return;
+    this._typingIndicators.delete(key);
+
     try {
-      await this.setThreadStatus(channel, threadTs, status);
-    } catch (_) {}
+      await this._slack.chat.delete({
+        channel: indicator.channel,
+        ts: indicator.ts,
+      });
+    } catch (err) {
+      if (err?.data?.error === 'message_not_found') return;
+      throw err;
+    }
   }
 
   buildPayloads(text) {
@@ -1322,13 +1425,7 @@ export class SlackAdapter extends PlatformAdapter {
   }
 
   async cleanupIndicator(channel, threadTs, typingSet, errorMsg) {
-    if (typingSet) {
-      try {
-        await this._slack.apiCall('assistant.threads.setStatus', {
-          channel_id: channel, thread_ts: threadTs, status: '',
-        });
-      } catch (_) {}
-    }
+    if (typingSet) await this.stopTypingIndicator(channel, threadTs).catch(() => {});
     try {
       await this._postReply(channel, threadTs, `:warning: ${errorMsg}`);
     } catch (err) {
