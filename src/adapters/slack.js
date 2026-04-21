@@ -389,7 +389,6 @@ export class SlackAdapter extends PlatformAdapter {
     this._pendingApprovals = new Map();
     this._blockActionInFlight = new Set();
     this._streams = new Map();
-    this._typingIndicators = new Map();
     this._teamId = null;
 
     // Reaction dedupe (30s per ts+reaction, avoids add/remove/add loops)
@@ -1379,19 +1378,6 @@ export class SlackAdapter extends PlatformAdapter {
     if (!channel || !threadTs) return;
     if (String(channel).startsWith('D')) {
       await this.setThreadStatus(channel, threadTs, 'thinking');
-      return;
-    }
-
-    const key = `${channel}:${threadTs}`;
-    if (this._typingIndicators.has(key)) return;
-
-    const result = await this._slack.chat.postMessage({
-      channel,
-      thread_ts: threadTs,
-      text: '⏳ thinking',
-    });
-    if (result?.ts) {
-      this._typingIndicators.set(key, { channel, threadTs, ts: result.ts });
     }
   }
 
@@ -1401,22 +1387,6 @@ export class SlackAdapter extends PlatformAdapter {
       try {
         await this.setThreadStatus(channel, threadTs, '');
       } catch (_) {}
-      return;
-    }
-
-    const key = `${channel}:${threadTs}`;
-    const indicator = this._typingIndicators.get(key);
-    if (!indicator?.ts) return;
-    this._typingIndicators.delete(key);
-
-    try {
-      await this._slack.chat.delete({
-        channel: indicator.channel,
-        ts: indicator.ts,
-      });
-    } catch (err) {
-      if (err?.data?.error === 'message_not_found') return;
-      throw err;
     }
   }
 
