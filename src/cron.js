@@ -361,7 +361,7 @@ export class CronScheduler {
           threadHistory: null,
           model: job.model || null,
           effort: job.effort || null,
-          enableTaskCard: true,
+          enableTaskCard: false,
           forceNewWorker: true,
           profile: {
             name: job.profileName,
