@@ -522,8 +522,10 @@ export function extractSuggestedPrompts(text) {
   const prompts = [];
   const seen = new Set();
   const pushPrompt = (action) => {
-    const message = buildPromptMessage(action);
-    const title = buildPromptTitle(action);
+    const trimmed = String(action || '').trim();
+    if (!trimmed || trimmed.length > 40 || /[。；;，,、\n]/.test(trimmed)) return;
+    const message = buildPromptMessage(trimmed);
+    const title = buildPromptTitle(trimmed);
     if (!message || !title) return;
     const key = `${title}::${message}`;
     if (seen.has(key)) return;
@@ -531,12 +533,12 @@ export function extractSuggestedPrompts(text) {
     prompts.push({ title, message });
   };
 
-  for (const match of source.matchAll(/要我(.+?)吗[？?]/g)) {
+  for (const match of source.matchAll(/要我([^。；;，,、\n]+?)吗[？?]/g)) {
     pushPrompt(match[1]);
     if (prompts.length >= 4) return prompts;
   }
 
-  for (const match of source.matchAll(/需要(?:我)?(.+?)吗[？?]/g)) {
+  for (const match of source.matchAll(/需要(?:我)?([^。；;，,、\n]+?)吗[？?]/g)) {
     pushPrompt(match[1]);
     if (prompts.length >= 4) return prompts;
   }
