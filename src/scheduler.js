@@ -585,6 +585,7 @@ export class Scheduler {
     let turnCount = 0;
     let metadataUpdatedForTurn = false;
     let finalResultText = '';
+    let finalStopReason = null;
     let workerFailure = null;
     let completionSettled = false;
     let worker;
@@ -992,6 +993,7 @@ export class Scheduler {
           threadHistory: task.threadHistory,
           model: effectiveModel,
           effort: effectiveEffort,
+          maxTurns: task.maxTurns || null,
           profile: {
             name: profile.name,
             scriptsDir: profile.scriptsDir,
@@ -1092,23 +1094,44 @@ export class Scheduler {
 
           if (msg.type === 'intermediate_text') {
             if (deferDeliveryUntilResult) return;
-            if (turn.taskCardState.streamId && !turn.taskCardState.failed) return;
-            if (msg.text?.trim()) {
-              if (!turn.egress.admit(msg.text, 'intermediate')) {
-                // Already sent via another path — skip duplicate send but keep the flag
-                // so later final-text paths still dedupe correctly.
-                turn.intermediateDeliveredThisTurn = true;
-                return;
-              }
+            if (!msg.text?.trim()) return;
+
+            // task-card stream 开着时：把 Orb 的中间 text 作为 markdown_text chunk
+            // append 进流里，形成段落间意图说明的叙事节奏。
+            if (turn.taskCardState.streamId && !turn.taskCardState.failed) {
               try {
-                const payloads = adapter.buildPayloads(msg.text);
-                for (const payload of payloads) {
-                  await adapter.sendReply(channel, effectiveThreadTs, payload.text, payload.blocks ? { blocks: payload.blocks } : {});
-                }
+                await adapter.appendStream(turn.taskCardState.streamId, [
+                  { type: 'markdown_text', text: msg.text.trim() },
+                ]);
                 turn.intermediateDeliveredThisTurn = true;
+                turn.egress.admit(msg.text, 'intermediate'); // 让 turn_complete 能正确 dedupe
+                return;
               } catch (err) {
-                warn(TAG, `failed to send intermediate text: ${err.message}`);
+                // ownership / stream-state 错误：标记 failed 并 fall through 到 sendReply
+                const code = err?.data?.error || err?.code || '';
+                if (code === 'message_not_in_streaming_state' || code === 'message_not_owned_by_app') {
+                  warn(TAG, `stream ownership lost, degrading to sendReply: ${code}`);
+                  turn.taskCardState.failed = true;
+                } else {
+                  warn(TAG, `failed to append intermediate markdown_text to stream: ${err.message}`);
+                  return;
+                }
               }
+            }
+
+            // stream 未开或刚 failed：走原 sendReply 路径
+            if (!turn.egress.admit(msg.text, 'intermediate')) {
+              turn.intermediateDeliveredThisTurn = true;
+              return;
+            }
+            try {
+              const payloads = adapter.buildPayloads(msg.text);
+              for (const payload of payloads) {
+                await adapter.sendReply(channel, effectiveThreadTs, payload.text, payload.blocks ? { blocks: payload.blocks } : {});
+              }
+              turn.intermediateDeliveredThisTurn = true;
+            } catch (err) {
+              warn(TAG, `failed to send intermediate text: ${err.message}`);
             }
             return;
           }
@@ -1116,6 +1139,7 @@ export class Scheduler {
           responded = true;
 
           if (msg.type === 'turn_complete') {
+            finalStopReason = msg.stopReason || finalStopReason;
             await stopTyping();
             // 中间轮次完成 — worker 已裁剪掉经 intermediate_text 投递过的部分
             try {
@@ -1175,6 +1199,7 @@ export class Scheduler {
             let text = msg.text?.trim() || null;
             const silentDeferredResult = deferDeliveryUntilResult && isSilentResultText(text);
             finalResultText = text || '';
+            finalStopReason = msg.stopReason || finalStopReason;
             try {
               if (turn.taskCardState.streamId && !turn.taskCardState.failed && !turnDelivered) {
                 await stopTaskCardStream(text);
@@ -1212,6 +1237,7 @@ export class Scheduler {
                     teamId: task.teamId || null,
                     threadHistory: task.threadHistory,
                     profile,
+                    maxTurns: task.maxTurns || null,
                     enableTaskCard: task.enableTaskCard,
                     deferDeliveryUntilResult,
                     _completion: task._completion,
@@ -1334,7 +1360,7 @@ export class Scheduler {
           } else if (!responded) {
             settleCompletion('reject', new Error(signal ? `worker killed: ${signal}` : `worker exited with code ${code}`));
           } else {
-            settleCompletion('resolve', { text: finalResultText, threadTs: effectiveThreadTs });
+            settleCompletion('resolve', { text: finalResultText, threadTs: effectiveThreadTs, stopReason: finalStopReason });
           }
         },
       }));
@@ -1469,6 +1495,7 @@ export class Scheduler {
         threadHistory: null,
         model: 'haiku',
         effort: 'low',
+        maxTurns: null,
         disablePermissionPrompt: true,
         mode: 'skill-review',
         priorConversation: priorMessages,

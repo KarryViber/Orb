@@ -118,6 +118,8 @@ async function start() {
     spawnCronWorker: (job, profilePaths) => {
       return new Promise((resolve, reject) => {
         let settled = false;
+        let responseText = '';
+        let stopReason = null;
         const settle = (fn, val) => { if (!settled) { settled = true; fn(val); } };
 
         try {
@@ -131,6 +133,7 @@ async function start() {
               platform: 'cron',
               model: job.model || null,
               effort: job.effort || null,
+              maxTurns: job.maxTurns || null,
               profile: {
                 name: job.profileName,
                 workspaceDir: profilePaths.workspaceDir,
@@ -141,12 +144,22 @@ async function start() {
             timeout: 600_000,
             label: `cron:${job.id}`,
             onMessage: (msg) => {
-              if (msg?.type === 'result') settle(resolve, msg.text || '');
+              if (msg?.type === 'turn_complete') {
+                responseText = typeof msg.undeliveredText === 'string' ? msg.undeliveredText : (msg.text || responseText);
+                stopReason = msg.stopReason || stopReason;
+              }
+              else if (msg?.type === 'result') {
+                responseText = msg.text || responseText;
+                stopReason = msg.stopReason || stopReason;
+                settle(resolve, { text: responseText, stopReason });
+              }
               else if (msg?.type === 'error') settle(reject, new Error(msg.error || 'worker error'));
             },
             onExit: (code, signal) => {
               if (code !== 0 || signal) {
                 settle(reject, new Error(signal ? `cron worker killed: ${signal}` : `worker exited with code ${code}`));
+              } else {
+                settle(resolve, { text: responseText, stopReason });
               }
             },
           });

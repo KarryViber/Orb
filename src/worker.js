@@ -13,7 +13,7 @@ import { storeConversation } from './memory.js';
  * Scheduler -> Worker:
  *   { type: 'task', userText, fileContent, imagePaths, threadTs, channel,
  *                   userId, platform, threadHistory, profile, model, effort,
- *                   mode?, priorConversation?, disablePermissionPrompt? }
+ *                   mode?, priorConversation?, disablePermissionPrompt?, maxTurns? }
  *     - mode: 'skill-review' enters a dedicated branch that requires
  *       priorConversation; context.js injects it as "## 待审查会话".
  *     - priorConversation: [{role: 'user'|'assistant', content: string}, ...]
@@ -91,7 +91,7 @@ process.on('message', async (msg) => {
   _lastEmittedTurnText = null;
   await ipcSend({ type: 'turn_start' }).catch(() => {});
 
-  let { userText, fileContent, imagePaths, threadTs, channel, userId, platform, profile, threadHistory, model, effort, mode, priorConversation, disablePermissionPrompt } = msg;
+  let { userText, fileContent, imagePaths, threadTs, channel, userId, platform, profile, threadHistory, model, effort, mode, priorConversation, disablePermissionPrompt, maxTurns } = msg;
 
   // Fail-fast: skill-review mode without context produces "no skill" noise.
   // Without real content to review the worker is just burning tokens on nothing.
@@ -164,8 +164,9 @@ process.on('message', async (msg) => {
     });
 
     // ── CLI args for interactive stream-json mode ──
+    const turns = Number.isFinite(maxTurns) && maxTurns > 0 ? maxTurns : MAX_TURNS;
     const streamArgs = [
-      '--max-turns', String(MAX_TURNS),
+      '--max-turns', String(turns),
       ...(model || process.env.CLAUDE_MODEL ? ['--model', model || process.env.CLAUDE_MODEL] : []),
       ...(effort || process.env.CLAUDE_EFFORT ? ['--effort', effort || process.env.CLAUDE_EFFORT] : []),
       '--input-format', 'stream-json',
@@ -528,12 +529,14 @@ function runClaudeInteractive(args, initialContent, workspace) {
   let taskCardEmittedInTurn = false;
   let taskCardChunkType = 'plan';
   let taskCardDisplayMode = 'timeline';
+  let turnStopReasonOverride = null;
   const pendingTaskCards = new Map();
 
   const resetTurnStreamingState = () => {
     taskCardEmittedInTurn = false;
     taskCardChunkType = 'plan';
     taskCardDisplayMode = 'timeline';
+    turnStopReasonOverride = null;
   };
 
   const queueIntermediate = (text) => {
@@ -568,7 +571,21 @@ function runClaudeInteractive(args, initialContent, workspace) {
     }
   });
 
+  function hasAttachmentType(node, targetType) {
+    if (!node || typeof node !== 'object') return false;
+    if (Array.isArray(node)) return node.some((item) => hasAttachmentType(item, targetType));
+    if (node.type === targetType) return true;
+    if (node.attachment?.type === targetType) return true;
+    for (const value of Object.values(node)) {
+      if (hasAttachmentType(value, targetType)) return true;
+    }
+    return false;
+  }
+
   function handleStreamMsg(msg) {
+    if (hasAttachmentType(msg, 'max_turns_reached')) {
+      turnStopReasonOverride = 'max_turns_reached';
+    }
     if (msg.type === 'assistant' && msg.message?.content) {
       for (const block of msg.message.content) {
         if (block.type === 'text') {
@@ -623,7 +640,7 @@ function runClaudeInteractive(args, initialContent, workspace) {
     }
     if (msg.type === 'result') {
       lastSessionId = msg.session_id || lastSessionId;
-      lastStopReason = msg.stop_reason || msg.subtype || null;
+      lastStopReason = turnStopReasonOverride || msg.stop_reason || msg.subtype || null;
       const turnText = msg.result || turnBuffer.join('\n');
       if (turnOpen && onTurnEnd) {
         turnOpen = false;
@@ -698,7 +715,7 @@ function runClaudeInteractive(args, initialContent, workspace) {
         sessionId: lastSessionId,
         toolCount: totalToolCount,
         lastTool,
-        stopReason: lastStopReason,
+        stopReason: turnStopReasonOverride || lastStopReason,
         lastTurnText,
       });
     });

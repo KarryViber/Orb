@@ -97,6 +97,7 @@ Job format:
 Optional fields:
 - `"model"`: `"haiku"` | `"sonnet"` | `"opus"` (default: system default, usually opus)
 - `"effort"`: `"low"` | `"medium"` | `"high"` | `"xhigh"` | `"max"` (Opus defaults xhigh)
+- `"maxTurns"`: positive integer override for Claude CLI `--max-turns`, e.g. `"maxTurns": 60`
 
 Token tier guidelines:
 | Task type | model | effort |
@@ -148,7 +149,7 @@ Scheduler ↔ Worker communication via Node IPC (process.send/on('message')):
 
 | Direction | Type | Payload | Notes |
 |-----------|------|---------|-------|
-| Scheduler → Worker | `task` | `{ type: 'task', userText, fileContent, imagePaths, threadTs, channel, userId, platform, threadHistory, profile, model, effort, mode?, priorConversation? }` | Initial task for a thread. `mode: 'skill-review'` requires `priorConversation`, which `context.js` injects as review context. |
+| Scheduler → Worker | `task` | `{ type: 'task', userText, fileContent, imagePaths, threadTs, channel, userId, platform, threadHistory, profile, model, effort, maxTurns?, mode?, priorConversation? }` | Initial task for a thread. `maxTurns` overrides Claude CLI `--max-turns` for that task only. `mode: 'skill-review'` requires `priorConversation`, which `context.js` injects as review context. |
 | Scheduler → Worker | `inject` | `{ type: 'inject', userText, fileContent?, imagePaths? }` | Injects a follow-up user message into the active same-thread Claude CLI session without spawning a new worker. When `imagePaths` is present the worker attaches them as image content blocks before sending the turn. |
 | Worker → Scheduler | `result` | `{ type: 'result', text, toolCount, lastTool?, stopReason? }` | Final payload emitted when the worker is about to exit. |
 | Worker → Scheduler | `error` | `{ type: 'error', error, errorContext? }` | Terminal failure payload. |
