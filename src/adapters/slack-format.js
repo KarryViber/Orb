@@ -618,16 +618,20 @@ function normalizeTaskStatus(status, fallback = 'in_progress') {
   return fallback;
 }
 
-export function buildTaskUpdateChunks(taskCardsMap) {
+export function buildTaskUpdateChunks(taskCardsMap, { updateOnly = false } = {}) {
   return [...(taskCardsMap?.entries?.() || [])].map(([task_id, card]) => {
     const chunk = {
       type: 'task_update',
       id: String(task_id || ''),
-      title: String(card?.title || 'Task').slice(0, 256),
       status: normalizeTaskStatus(card?.status, 'in_progress'),
     };
-    const details = String(card?.details || '').trim();
     const output = String(card?.output || '').trim();
+    if (updateOnly) {
+      if (output) chunk.output = output.slice(0, 256);
+      return chunk;
+    }
+    chunk.title = String(card?.title || 'Task').slice(0, 256);
+    const details = String(card?.details || '').trim();
     if (details) chunk.details = details.slice(0, 256);
     if (output) chunk.output = output.slice(0, 256);
     return chunk;
