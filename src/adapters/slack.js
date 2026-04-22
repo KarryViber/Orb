@@ -1426,7 +1426,9 @@ export class SlackAdapter extends PlatformAdapter {
         payload.loading_messages = loadingMessages.slice(0, 10).map(String);
       }
       await this._slack.apiCall('assistant.threads.setStatus', payload);
-    } catch (_) {}
+    } catch (err) {
+      warn(TAG, `setThreadStatus failed: ${err.message}`);
+    }
   }
 
   async setThreadTitle(channel, threadTs, title) {
@@ -1437,7 +1439,9 @@ export class SlackAdapter extends PlatformAdapter {
         thread_ts: threadTs,
         title: String(title).trim().slice(0, 60),
       });
-    } catch (_) {}
+    } catch (err) {
+      warn(TAG, `setThreadTitle failed: ${err.message}`);
+    }
   }
 
   async setSuggestedPrompts(channel, threadTs, prompts) {
@@ -1456,7 +1460,9 @@ export class SlackAdapter extends PlatformAdapter {
         thread_ts: threadTs,
         prompts: normalizedPrompts,
       });
-    } catch (_) {}
+    } catch (err) {
+      warn(TAG, `setSuggestedPrompts failed: ${err.message}`);
+    }
   }
 
   async setTyping(channel, threadTs, status) {
