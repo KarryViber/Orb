@@ -212,7 +212,7 @@ export class CronScheduler {
   /**
    * @param {object} opts
    * @param {Function} opts.getProfilePaths - (profileName) => { dataDir, workspaceDir, scriptsDir }
-   * @param {Function} opts.spawnCronWorker - (job, profilePaths) => Promise<string> (response text)
+   * @param {Function} opts.spawnCronWorker - (job, profilePaths) => Promise<{ text: string, stopReason?: string | null }>
    * @param {Function} opts.deliverResult - (job, text) => Promise<void>
    */
   constructor({ getProfilePaths, spawnCronWorker, deliverResult }) {
@@ -341,6 +341,7 @@ export class CronScheduler {
       const nativeTaskCardEnabled = job.enableTaskCard !== false;
       const scheduler = globalThis.__orbSchedulerInstance;
       let responseText = '';
+      let stopReason = null;
       let deliveredByScheduler = false;
 
       if (
@@ -361,6 +362,7 @@ export class CronScheduler {
           threadHistory: null,
           model: job.model || null,
           effort: job.effort || null,
+          maxTurns: job.maxTurns || null,
           enableTaskCard: false,
           forceNewWorker: true,
           profile: {
@@ -371,16 +373,24 @@ export class CronScheduler {
           },
         });
         responseText = result?.text || '';
+        stopReason = result?.stopReason || null;
         deliveredByScheduler = true;
       } else {
-        responseText = await this._spawnCronWorker({ ...job, enableTaskCard: nativeTaskCardEnabled }, paths);
+        const result = await this._spawnCronWorker({ ...job, enableTaskCard: nativeTaskCardEnabled, maxTurns: job.maxTurns || null }, paths);
+        responseText = result?.text || '';
+        stopReason = result?.stopReason || null;
       }
 
       const silent = responseText?.startsWith('[SILENT]');
 
       job.lastRunAt = now.toISOString();
-      job.lastStatus = 'ok';
-      job.lastError = null;
+      if (stopReason === 'max_turns_reached') {
+        job.lastStatus = 'error';
+        job.lastError = 'max_turns_reached';
+      } else {
+        job.lastStatus = 'ok';
+        job.lastError = null;
+      }
 
       if (deliveredByScheduler) {
         job.lastDeliveryError = null;
