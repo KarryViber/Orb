@@ -124,14 +124,60 @@ export function markdownToMrkdwn(text) {
 }
 
 /**
+ * Walk a Block Kit block tree in-place and translate any markdown-bearing
+ * text fields to Slack mrkdwn. Covers the surfaces agents actually populate
+ * (section/header/context + section.fields); leaves rich_text/table/actions
+ * alone because those carry their own styled-element structure.
+ */
+function convertBlockTextFields(block) {
+  if (!block || typeof block !== 'object') return;
+  switch (block.type) {
+    case 'section': {
+      const t = block.text;
+      if (t && t.type === 'mrkdwn' && typeof t.text === 'string') {
+        t.text = markdownToMrkdwn(t.text);
+      }
+      if (Array.isArray(block.fields)) {
+        for (const field of block.fields) {
+          if (field && field.type === 'mrkdwn' && typeof field.text === 'string') {
+            field.text = markdownToMrkdwn(field.text);
+          }
+        }
+      }
+      break;
+    }
+    case 'header': {
+      const t = block.text;
+      if (t && typeof t.text === 'string') {
+        t.text = stripMarkdown(t.text);
+      }
+      break;
+    }
+    case 'context': {
+      if (Array.isArray(block.elements)) {
+        for (const el of block.elements) {
+          if (el && el.type === 'mrkdwn' && typeof el.text === 'string') {
+            el.text = markdownToMrkdwn(el.text);
+          }
+        }
+      }
+      break;
+    }
+  }
+}
+
+/**
  * Try to parse explicit Block Kit JSON from agent output.
+ * Applies markdown→mrkdwn translation to block text fields and cleans the
+ * fallback text so we never ship raw `**bold**` / inline code to Slack.
  */
 export function parseBlockKit(text) {
   if (!text || !text.trimStart().startsWith('{')) return null;
   try {
     const parsed = JSON.parse(text);
     if (parsed.blocks && Array.isArray(parsed.blocks) && parsed.text) {
-      return { blocks: parsed.blocks, text: parsed.text };
+      for (const block of parsed.blocks) convertBlockTextFields(block);
+      return { blocks: parsed.blocks, text: buildFallbackText(parsed.text) };
     }
   } catch (_) {}
   return null;
