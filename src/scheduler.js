@@ -711,16 +711,7 @@ export class Scheduler {
     const buildFinalTextPayloads = (text) => {
       const trimmed = String(text || '').trim();
       if (!trimmed) return [];
-      return adapter.buildPayloads(trimmed).map((payload) => {
-        if (Array.isArray(payload.blocks) && payload.blocks.length > 0) return payload;
-        return {
-          ...payload,
-          blocks: [{
-            type: 'section',
-            text: { type: 'mrkdwn', text: payload.text || trimmed },
-          }],
-        };
-      });
+      return adapter.buildPayloads(trimmed);
     };
 
     const stopTaskCardStream = async (text) => {
