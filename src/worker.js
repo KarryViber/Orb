@@ -66,12 +66,16 @@ const TASK_CARD_TOOLS = new Set([
 ]);
 
 let _activeCli = null;   // reference to active interactive CLI session
+// Last text emitted via turn_complete IPC. Exit path compares against exitResult.lastTurnText
+// and suppresses duplicate result text that the scheduler already tendered through stopStream.
+let _lastEmittedTurnText = null;
 
 process.on('message', async (msg) => {
   if (msg.type === 'inject') {
     if (_activeCli) {
       const injected = _activeCli.inject(msg.userText, msg.fileContent, msg.imagePaths);
       if (injected) {
+        _lastEmittedTurnText = null;
         await ipcSend({ type: 'turn_start' }).catch(() => {});
         console.log(`[worker] injected: "${(msg.userText || '').slice(0, 60)}"`);
       } else {
@@ -84,6 +88,7 @@ process.on('message', async (msg) => {
   }
   if (msg.type !== 'task') return;
 
+  _lastEmittedTurnText = null;
   await ipcSend({ type: 'turn_start' }).catch(() => {});
 
   let { userText, fileContent, imagePaths, threadTs, channel, userId, platform, profile, threadHistory, model, effort, mode, priorConversation, disablePermissionPrompt } = msg;
@@ -193,6 +198,7 @@ process.on('message', async (msg) => {
       // Each turn completed → send to scheduler for delivery
       cli.setOnTurnComplete(async (turn) => {
         if (turn.text?.trim()) {
+          _lastEmittedTurnText = turn.undeliveredText || turn.text || '';
           await ipcSend({ type: 'turn_complete', text: turn.text, toolCount: turn.toolCount, lastTool: turn.lastTool, stopReason: turn.stopReason, deliveredTexts: turn.deliveredTexts || [] });
         }
       });
@@ -251,10 +257,14 @@ process.on('message', async (msg) => {
       await updateSession(dataDir, sessionKey, { sessionId: exitResult.sessionId, userId });
     }
 
-    // Send final result (last turn's output)
+    // Send final result (last turn's output).
+    // Suppress text if it matches what turn_complete already delivered — prevents the
+    // canvas stopStream + exit-path sendReply from posting the same text twice.
+    const exitText = exitResult.lastTurnText || '';
+    const shouldSuppressText = !!exitText && exitText.trim() === (_lastEmittedTurnText || '').trim();
     await ipcSend({
       type: 'result',
-      text: exitResult.lastTurnText || '',
+      text: shouldSuppressText ? '' : exitText,
       toolCount: exitResult.toolCount,
       lastTool: exitResult.lastTool,
       stopReason: exitResult.stopReason,
