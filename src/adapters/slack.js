@@ -1376,14 +1376,8 @@ export class SlackAdapter extends PlatformAdapter {
   }
 
   async setThreadStatus(channel, threadTs, status) {
-    if (!channel || !threadTs) return;
-    try {
-      await this._slack.apiCall('assistant.threads.setStatus', {
-        channel_id: channel,
-        thread_ts: threadTs,
-        status: String(status || ''),
-      });
-    } catch (_) {}
+    // Intentionally disabled: make Slack thread status updates a no-op.
+    return;
   }
 
   async setThreadTitle(channel, threadTs, title) {
