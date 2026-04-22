@@ -15,6 +15,7 @@ const MEMORY_SYNC_THRESHOLD = 20;    // cumulative tool uses before memory/user 
 const MEMORY_SYNC_INTERVAL = 6 * 60 * 60 * 1000;  // min 6h between syncs per profile
 const MAX_AUTO_CONTINUE = 2;  // max auto-retries on empty result (context overflow)
 const PERMISSION_APPROVAL_TIMEOUT_MS = parseInt(process.env.ORB_PERMISSION_TIMEOUT_MS, 10) || 300_000;
+const STREAM_KEEPALIVE_MS = 20_000;
 const SHUTDOWN_QUEUE_FILE = 'shutdown-queue.json';
 const SHUTDOWN_QUEUE_VERSION = 2;
 const SILENT_PREFIX = '[SILENT]';
@@ -615,6 +616,34 @@ export class Scheduler {
       await applyThreadStatus('');
     };
 
+    let keepaliveTimer = null;
+    const clearKeepalive = () => {
+      if (keepaliveTimer) {
+        clearTimeout(keepaliveTimer);
+        keepaliveTimer = null;
+      }
+    };
+    const armKeepalive = () => {
+      clearKeepalive();
+      if (!taskCardState.streamId || taskCardState.failed) return;
+      keepaliveTimer = setTimeout(async () => {
+        keepaliveTimer = null;
+        if (!taskCardState.streamId || taskCardState.failed) return;
+        const chunks = buildTaskCardChunks();
+        if (!chunks.length) {
+          armKeepalive();
+          return;
+        }
+        try {
+          await adapter.appendStream(taskCardState.streamId, chunks);
+          armKeepalive();
+        } catch (err) {
+          warn(TAG, `[task_card] keepalive failed: ${err.message}`);
+          await failTaskCardStream(err);
+        }
+      }, STREAM_KEEPALIVE_MS);
+    };
+
     const resetTaskCardState = () => {
       // Slack streaming is per-message; every turn starts a fresh stream.
       taskCardState.streamId = null;
@@ -624,6 +653,7 @@ export class Scheduler {
       taskCardState.failed = false;
       taskCardState.failureNotified = false;
       taskCardState.bubbleCleared = false;
+      clearKeepalive();
     };
 
     const failTaskCardStream = async (err) => {
@@ -634,6 +664,7 @@ export class Scheduler {
         : '';
       taskCardState.failed = true;
       taskCardState.streamId = null;
+      clearKeepalive();
       taskCardState.chunkType = null;
       taskCardState.displayMode = null;
       if (fallbackMarkdown) {
@@ -661,6 +692,7 @@ export class Scheduler {
       taskCardState.chunkType = null;
       taskCardState.displayMode = null;
       taskCardState.taskCards.clear();
+      clearKeepalive();
     };
 
     const buildTaskCardChunks = () => {
@@ -682,6 +714,7 @@ export class Scheduler {
         });
         taskCardState.streamId = stream?.stream_id || null;
         if (!effectiveThreadTs && stream?.ts) effectiveThreadTs = stream.ts;
+        if (taskCardState.streamId) armKeepalive();
         return Boolean(taskCardState.streamId);
       } catch (err) {
         await failTaskCardStream(err);
@@ -693,6 +726,7 @@ export class Scheduler {
       if (!taskCardState.streamId || taskCardState.failed) return false;
       try {
         await adapter.appendStream(taskCardState.streamId, buildTaskCardChunks());
+        armKeepalive();
         return true;
       } catch (err) {
         await failTaskCardStream(err);
@@ -720,6 +754,7 @@ export class Scheduler {
 
     const stopTaskCardStream = async (text) => {
       if (!taskCardState.streamId || taskCardState.failed) return false;
+      clearKeepalive();
       finalizePendingTaskCards();
       const finalText = String(text || '').trim();
       const finalPayloads = buildFinalTextPayloads(finalText);
