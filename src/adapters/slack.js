@@ -1370,6 +1370,9 @@ export class SlackAdapter extends PlatformAdapter {
         ? final_blocks
         : null;
     const finalText = typeof markdown_text === 'string' ? markdown_text.trim() : '';
+    if (finalText) {
+      info(TAG, `[slack:stopStream] emitting markdown_text as implicit post (len=${finalText.length}, channel=${stream.channel}, ts=${stream.ts})`);
+    }
 
     // Slack rejects markdown_text + chunks in the same call; fold final text
     // into chunks to match startStream behavior.

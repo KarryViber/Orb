@@ -622,6 +622,10 @@ export class Scheduler {
       }
     };
     const armStatusRefresh = () => {
+      if (turn.taskCardState.keepaliveTimer) {
+        warn(TAG, '[invariant] armStatusRefresh called while keepaliveTimer active — clearing peer');
+        clearKeepalive();
+      }
       clearStatusRefresh();
       if (!canManageThreadStatus || !effectiveThreadTs) return;
       if (!turn.pendingThreadStatus) return;
@@ -676,6 +680,10 @@ export class Scheduler {
       }
     };
     const armKeepalive = () => {
+      if (turn.statusRefreshTimer) {
+        warn(TAG, '[invariant] armKeepalive called while statusRefreshTimer active — clearing peer');
+        clearStatusRefresh();
+      }
       clearKeepalive();
       if (!turn.taskCardState.streamId || turn.taskCardState.failed) return;
       turn.taskCardState.keepaliveTimer = setTimeout(async () => {
