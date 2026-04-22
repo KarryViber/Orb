@@ -1338,6 +1338,14 @@ export class SlackAdapter extends PlatformAdapter {
       : Array.isArray(final_blocks) && final_blocks.length > 0
         ? final_blocks
         : null;
+    const finalText = typeof markdown_text === 'string' ? markdown_text.trim() : '';
+
+    // Slack rejects markdown_text + chunks in the same call; fold final text
+    // into chunks to match startStream behavior.
+    if (finalText && normalizedChunks.length > 0) {
+      normalizedChunks.push({ type: 'markdown_text', text: finalText });
+    }
+    const sendMarkdownTop = Boolean(finalText) && normalizedChunks.length === 0;
 
     let result;
     try {
@@ -1345,7 +1353,7 @@ export class SlackAdapter extends PlatformAdapter {
         channel: stream.channel,
         ts: stream.ts,
         ...(normalizedChunks.length > 0 ? { chunks: normalizedChunks } : {}),
-        ...(typeof markdown_text === 'string' && markdown_text.trim() ? { markdown_text: markdown_text.trim() } : {}),
+        ...(sendMarkdownTop ? { markdown_text: finalText } : {}),
         ...(finalBlocks ? { blocks: finalBlocks } : {}),
       });
     } catch (err) {
