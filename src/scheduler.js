@@ -192,6 +192,10 @@ export class Scheduler {
 
       this._handlePermissionRequest(msg, socket).catch((err) => {
         logError(TAG, `permission request failed: ${err.message}`);
+        const key = this._permissionRequestKey(String(msg?.threadTs || ''), String(msg?.requestId || ''));
+        if (this._pendingPermissionRequests.has(key)) {
+          this._pendingPermissionRequests.delete(key);
+        }
         this._writePermissionSocketResponse(socket, { allow: false, reason: `permission request failed: ${err.message}` });
       });
     });
