@@ -416,6 +416,7 @@ export class SlackAdapter extends PlatformAdapter {
 
     // Thread context cache (60s TTL, avoids hammering Slack API)
     this._threadCtxCache = new Map();
+    this._assistantThreadRootCache = new Map();
     this._THREAD_CTX_TTL = 60 * 1000;
     this._cleanupInterval = null;
 
@@ -505,6 +506,9 @@ export class SlackAdapter extends PlatformAdapter {
     for (const [key, entry] of this._threadCtxCache) {
       if (now - entry.fetchedAt > this._THREAD_CTX_TTL) this._threadCtxCache.delete(key);
     }
+    for (const [key, entry] of this._assistantThreadRootCache) {
+      if (now - entry.fetchedAt > this._THREAD_CTX_TTL) this._assistantThreadRootCache.delete(key);
+    }
     // Evict expired reaction dedupe entries
     for (const [key, t] of this._reactionDedupCache) {
       if (now - t > this._REACTION_DEDUP_TTL) this._reactionDedupCache.delete(key);
@@ -519,6 +523,35 @@ export class SlackAdapter extends PlatformAdapter {
 
   _isBotThread(threadTs) {
     return this._botMessageTs.has(threadTs);
+  }
+
+  async _isAssistantThreadRoot(channel, threadTs) {
+    if (!channel || !threadTs) return false;
+    const cacheKey = `${channel}:${threadTs}`;
+    const cached = this._assistantThreadRootCache.get(cacheKey);
+    if (cached && (Date.now() - cached.fetchedAt < this._THREAD_CTX_TTL)) {
+      return cached.value;
+    }
+
+    let value = false;
+    try {
+      const resp = await this._slack.conversations.replies({
+        channel,
+        ts: threadTs,
+        limit: 1,
+        inclusive: true,
+      });
+      const root = resp.messages?.[0];
+      const rootText = [root?.text || '', extractBlockKitText(root?.blocks)]
+        .filter(Boolean)
+        .join('\n');
+      value = Boolean(root?.bot_id === this._botId && /assistant thread/i.test(rootText));
+    } catch (err) {
+      warn(TAG, `assistant thread root lookup failed for ${cacheKey}: ${err.message}`);
+    }
+
+    this._assistantThreadRootCache.set(cacheKey, { value, fetchedAt: Date.now() });
+    return value;
   }
 
   // --- Thread history ---
@@ -1673,10 +1706,19 @@ export class SlackAdapter extends PlatformAdapter {
     const threadTs = event.thread_ts || event.ts;
     const tracked = this._isTrackedThread(threadTs);
     const isBotThread = event.thread_ts && this._isBotThread(event.thread_ts);
+    let isAssistantThread = false;
+    if (isDM && channelType === 'im' && event.thread_ts && !event.bot_id && !isBotThread) {
+      const assistantThreadRoot = event.assistant_thread
+        ? true
+        : await this._isAssistantThreadRoot(event.channel, event.thread_ts);
+      // Slack AI Assistant roots are server-created, so Orb never tracks them
+      // via chat.postMessage; fall back to the human DM thread heuristic.
+      isAssistantThread = assistantThreadRoot || Boolean(event.user);
+    }
 
-    // DM content-based routing (v2) — only for 1:1 DMs, not thread replies
-    // (thread follow-ups should go through the existing worker path).
-    if (isDM && channelType === 'im' && !event.thread_ts && this._dmRouting?.enabled) {
+    // DM content-based routing (v2) — allow Slack AI Assistant threads through,
+    // but keep Orb-created worker threads on the normal worker path.
+    if (isDM && channelType === 'im' && (!event.thread_ts || isAssistantThread) && this._dmRouting?.enabled) {
       const outcome = await this._routeDMMessage(event);
       if (outcome.routed) return;
       if (outcome.fallback === 'silent') {
