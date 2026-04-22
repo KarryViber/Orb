@@ -339,11 +339,45 @@ const HANDLER_LOG_DIR = join(__dirname, '..', '..', 'logs', 'handlers');
 const HANDLER_PID_LOG = join(HANDLER_LOG_DIR, 'pids.log');
 
 export class StreamAPIError extends Error {
-  constructor(message, cause) {
+  constructor(message, cause, slackErrorCode = null) {
     super(message);
     this.name = 'StreamAPIError';
     this.cause = cause;
+    this.slackErrorCode = slackErrorCode || getSlackStreamErrorCode(cause) || null;
   }
+}
+
+function getSlackStreamErrorCode(value) {
+  if (!value || typeof value !== 'object') return null;
+  if (typeof value.error === 'string' && value.error) return value.error;
+  if (typeof value.data?.error === 'string' && value.data.error) return value.data.error;
+  return null;
+}
+
+function isStreamingStateError(value) {
+  return getSlackStreamErrorCode(value) === 'message_not_in_streaming_state';
+}
+
+const STREAM_TASK_FIELD_LIMIT = 256;
+
+function buildStreamAPIError(method, codeOrMessage, cause, details = '') {
+  const code = typeof codeOrMessage === 'string' && /^[a-z_]+$/.test(codeOrMessage) ? codeOrMessage : getSlackStreamErrorCode(cause);
+  const message = details || codeOrMessage || 'unknown_error';
+  return new StreamAPIError(`chat.${method} failed: ${message}`, cause, code);
+}
+
+function assertStreamTaskField(fieldName, value) {
+  if (value == null) return '';
+  const text = String(value).trim();
+  if (text.length > STREAM_TASK_FIELD_LIMIT) {
+    throw buildStreamAPIError(
+      'appendStream',
+      'invalid_chunks',
+      null,
+      `invalid_chunks (${fieldName} exceeds ${STREAM_TASK_FIELD_LIMIT} chars)`,
+    );
+  }
+  return text;
 }
 
 export class SlackAdapter extends PlatformAdapter {
@@ -1146,13 +1180,13 @@ export class SlackAdapter extends PlatformAdapter {
     const pushTaskUpdate = (taskLike) => {
       if (!taskLike || typeof taskLike !== 'object') return;
       const id = String(taskLike.id || taskLike.task_id || '').trim();
-      const title = String(taskLike.title || taskLike.text || '').trim();
+      const title = assertStreamTaskField('title', taskLike.title || taskLike.text || '');
       if (!id || !title) return;
 
       const chunk = {
         type: 'task_update',
         id,
-        title: title.slice(0, 255),
+        title,
         status: taskLike.status === 'completed' ? 'complete' : taskLike.status,
       };
 
@@ -1160,10 +1194,10 @@ export class SlackAdapter extends PlatformAdapter {
         chunk.status = 'in_progress';
       }
 
-      const details = typeof taskLike.details === 'string' ? taskLike.details.trim() : '';
-      const output = typeof taskLike.output === 'string' ? taskLike.output.trim() : '';
-      if (details) chunk.details = details.slice(0, 255);
-      if (output) chunk.output = output.slice(0, 255);
+      const details = typeof taskLike.details === 'string' ? assertStreamTaskField('details', taskLike.details) : '';
+      const output = typeof taskLike.output === 'string' ? assertStreamTaskField('output', taskLike.output) : '';
+      if (details) chunk.details = details;
+      if (output) chunk.output = output;
       if (Array.isArray(taskLike.sources) && taskLike.sources.length > 0) {
         chunk.sources = taskLike.sources;
       }
@@ -1187,7 +1221,7 @@ export class SlackAdapter extends PlatformAdapter {
       }
       if (chunk.type === 'plan_update') {
         const title = String(chunk.title || '').trim();
-        if (title) normalized.push({ type: 'plan_update', title: title.slice(0, 255) });
+        if (title) normalized.push({ type: 'plan_update', title: title.slice(0, STREAM_TASK_FIELD_LIMIT) });
         continue;
       }
       if (chunk.type === 'blocks') {
@@ -1211,9 +1245,10 @@ export class SlackAdapter extends PlatformAdapter {
     return stream;
   }
 
-  async _resolveStreamRecipient(channel, threadTs) {
+  async _resolveStreamRecipient(channel, threadTs, teamId = null) {
     if (!channel || !threadTs || String(channel).startsWith('D')) return {};
-    if (!this._teamId) throw new StreamAPIError('missing Slack team_id for streaming API');
+    const resolvedTeamId = this._teamId || teamId || null;
+    if (!resolvedTeamId) throw new StreamAPIError('missing Slack team_id for streaming API');
 
     try {
       const result = await this._slack.conversations.replies({
@@ -1228,7 +1263,7 @@ export class SlackAdapter extends PlatformAdapter {
       }
       return {
         recipient_user_id: recipientUserId,
-        recipient_team_id: this._teamId,
+        recipient_team_id: resolvedTeamId,
       };
     } catch (err) {
       if (err instanceof StreamAPIError) throw err;
@@ -1236,32 +1271,30 @@ export class SlackAdapter extends PlatformAdapter {
     }
   }
 
-  async startStream(channel, threadTs, { task_display_mode = 'timeline', initial_chunks = [] } = {}) {
+  async startStream(channel, threadTs, { task_display_mode = 'timeline', initial_chunks = [], team_id = null } = {}) {
+    if (!threadTs) throw new StreamAPIError('chat.startStream requires thread_ts');
+
     const normalizedTaskDisplayMode = this.normalizeTaskDisplayMode(task_display_mode);
     const initialChunks = this.normalizeStreamChunks(initial_chunks);
-    const chunks = [];
-    if (normalizedTaskDisplayMode === 'plan') {
-      chunks.push({ type: 'plan_update', title: 'Task progress' });
-    }
-    if (initialChunks.length > 0) chunks.push(...initialChunks);
 
     const params = {
       channel,
+      thread_ts: threadTs,
       task_display_mode: normalizedTaskDisplayMode,
-      ...(await this._resolveStreamRecipient(channel, threadTs)),
+      // Keep all initial text inside chunks so Slack never sees both
+      // top-level markdown_text and markdown_text chunks in one request.
+      chunks: initialChunks.length > 0 ? initialChunks : [{ type: 'markdown_text', text: ' ' }],
+      ...(await this._resolveStreamRecipient(channel, threadTs, team_id)),
     };
-    if (chunks.length > 0) params.chunks = chunks;
-    else params.markdown_text = ' ';
-    if (threadTs) params.thread_ts = threadTs;
 
     let result;
     try {
       result = await this._slack.apiCall('chat.startStream', params);
     } catch (err) {
-      throw new StreamAPIError(`chat.startStream failed: ${err.data?.error || err.message}`, err);
+      throw buildStreamAPIError('startStream', err.data?.error || err.message, err);
     }
     if (!result?.ok || !result?.ts) {
-      throw new StreamAPIError(`chat.startStream failed: ${result?.error || 'missing ts'}`);
+      throw buildStreamAPIError('startStream', result?.error || 'missing_ts');
     }
 
     const streamId = `${channel}:${result.ts}`;
@@ -1282,32 +1315,46 @@ export class SlackAdapter extends PlatformAdapter {
         chunks: normalizedChunks,
       });
     } catch (err) {
-      throw new StreamAPIError(`chat.appendStream failed: ${err.data?.error || err.message}`, err);
+      if (isStreamingStateError(err) || getSlackStreamErrorCode(err) === 'message_not_owned_by_app') {
+        this._streams.delete(streamId);
+      }
+      throw buildStreamAPIError('appendStream', err.data?.error || err.message, err);
     }
     if (!result?.ok) {
-      throw new StreamAPIError(`chat.appendStream failed: ${result?.error || 'unknown_error'}`);
+      if (isStreamingStateError(result) || getSlackStreamErrorCode(result) === 'message_not_owned_by_app') {
+        this._streams.delete(streamId);
+      }
+      throw buildStreamAPIError('appendStream', result?.error || 'unknown_error');
     }
     info(TAG, `[stream-debug] append result: ${JSON.stringify(result)}`);
     info(TAG, `[stream-debug] sent chunks: ${JSON.stringify(normalizedChunks)}`);
   }
 
-  async stopStream(streamId, { final_blocks } = {}) {
+  async stopStream(streamId, { markdown_text, blocks, chunks, final_blocks } = {}) {
     const stream = this._getStreamHandle(streamId);
+    const normalizedChunks = this.normalizeStreamChunks(chunks);
+    const finalBlocks = Array.isArray(blocks) && blocks.length > 0
+      ? blocks
+      : Array.isArray(final_blocks) && final_blocks.length > 0
+        ? final_blocks
+        : null;
 
     let result;
     try {
       result = await this._slack.apiCall('chat.stopStream', {
         channel: stream.channel,
         ts: stream.ts,
-        ...(Array.isArray(final_blocks) && final_blocks.length > 0 ? { blocks: final_blocks } : {}),
+        ...(normalizedChunks.length > 0 ? { chunks: normalizedChunks } : {}),
+        ...(typeof markdown_text === 'string' && markdown_text.trim() ? { markdown_text: markdown_text.trim() } : {}),
+        ...(finalBlocks ? { blocks: finalBlocks } : {}),
       });
     } catch (err) {
-      throw new StreamAPIError(`chat.stopStream failed: ${err.data?.error || err.message}`, err);
+      throw buildStreamAPIError('stopStream', err.data?.error || err.message, err);
     } finally {
       this._streams.delete(streamId);
     }
     if (!result?.ok) {
-      throw new StreamAPIError(`chat.stopStream failed: ${result?.error || 'unknown_error'}`);
+      throw buildStreamAPIError('stopStream', result?.error || 'unknown_error');
     }
   }
 
@@ -1379,7 +1426,7 @@ export class SlackAdapter extends PlatformAdapter {
 
   async startTypingIndicator(channel, threadTs) {
     if (!channel || !threadTs) return;
-    await this.setThreadStatus(channel, threadTs, 'Orb thinking…');
+    await this.setThreadStatus(channel, threadTs, 'Orb is thinking…');
   }
 
   async stopTypingIndicator(channel, threadTs) {
@@ -1582,6 +1629,7 @@ export class SlackAdapter extends PlatformAdapter {
           channel: rule.target.channel,
           userId: event.user,
           platform: 'slack',
+          teamId: event.team || event.team_id || null,
           threadHistory: null,
         };
         this.onMessage(task);
@@ -1688,7 +1736,17 @@ export class SlackAdapter extends PlatformAdapter {
 
     info(TAG, `msg: ch=${channel} thread=${threadTs} user=${userId} text="${(userText || '[files only]').slice(0, 80)}"`);
 
-    const task = { userText, fileContent: fileContent + linkedContext, imagePaths, threadTs, channel, userId, platform: 'slack', threadHistory: null };
+    const task = {
+      userText,
+      fileContent: fileContent + linkedContext,
+      imagePaths,
+      threadTs,
+      channel,
+      userId,
+      platform: 'slack',
+      teamId: event.team || event.team_id || null,
+      threadHistory: null,
+    };
 
     // Fetch thread history (only for thread replies, not new conversations)
     if (event.thread_ts) {
@@ -1749,6 +1807,7 @@ export class SlackAdapter extends PlatformAdapter {
         targetMessageTs: targetTs,
         userText: `[effort:xhigh] ${userText}`,
         userId,
+        teamId: event.team || event.team_id || null,
         threadHistory: null,
         rerun: true,
       });

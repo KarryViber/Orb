@@ -7,7 +7,7 @@ import { taskQueue } from './queue.js';
 import { sanitizeErrorText } from './format-utils.js';
 import { listFacts, storeLesson, storeCorrectionLesson, purgeTransient, lintMemory } from './memory.js';
 import { spawnWorker } from './spawn.js';
-import { buildPlanBlock, buildTaskUpdateChunks, extractSuggestedPrompts } from './adapters/slack-format.js';
+import { buildTaskUpdateChunks, extractSuggestedPrompts } from './adapters/slack-format.js';
 const TAG = 'scheduler';
 const DRAIN_TIMEOUT = 30_000;
 const SKILL_REVIEW_THRESHOLD = 10;   // cumulative tool uses before triggering review
@@ -17,6 +17,8 @@ const MAX_AUTO_CONTINUE = 2;  // max auto-retries on empty result (context overf
 const PERMISSION_APPROVAL_TIMEOUT_MS = parseInt(process.env.ORB_PERMISSION_TIMEOUT_MS, 10) || 300_000;
 const SHUTDOWN_QUEUE_FILE = 'shutdown-queue.json';
 const SHUTDOWN_QUEUE_VERSION = 2;
+const SILENT_PREFIX = '[SILENT]';
+const THINKING_STATUS = 'Orb is thinking…';
 
 // --- Effort escalation keywords ---
 // 命中任一关键词且消息长度 > 20 字 → 升到 xhigh
@@ -53,6 +55,49 @@ function shouldEscalateEffort(text) {
   return false;
 }
 
+function isSilentResultText(text) {
+  return typeof text === 'string' && text.startsWith(SILENT_PREFIX);
+}
+
+function getTaskCardStreamErrorCode(err) {
+  if (!err) return null;
+  if (typeof err.slackErrorCode === 'string' && err.slackErrorCode) return err.slackErrorCode;
+  const match = String(err.message || '').match(/chat\.(?:start|append|stop)Stream failed: ([a-z_]+)/);
+  return match?.[1] || null;
+}
+
+function classifyTaskCardStreamError(err) {
+  const code = getTaskCardStreamErrorCode(err);
+  if (code === 'invalid_chunks' || code === 'invalid_auth') {
+    return { code, level: 'error' };
+  }
+  if (code === 'message_not_in_streaming_state' || code === 'message_not_owned_by_app') {
+    return { code, level: 'warn' };
+  }
+  return { code, level: 'error' };
+}
+
+function resolveTaskCardDisplayMode(chunkType, fallback = 'timeline') {
+  if (chunkType === 'task') return 'timeline';
+  return fallback;
+}
+
+function buildTaskCardFallbackMarkdown(taskCards) {
+  if (!(taskCards instanceof Map) || taskCards.size === 0) return '';
+  const lines = [];
+  for (const taskCard of taskCards.values()) {
+    const statusIcon = taskCard.status === 'complete'
+      ? '✅'
+      : taskCard.status === 'error'
+        ? '❌'
+        : '⏳';
+    const title = String(taskCard.title || 'Task').trim();
+    const details = String(taskCard.details || '').trim();
+    lines.push(details ? `${statusIcon} ${title}: ${details}` : `${statusIcon} ${title}`);
+  }
+  return lines.join('\n');
+}
+
 export class Scheduler {
   constructor({ maxWorkers, timeoutMs, getProfile }) {
     this.maxWorkers = maxWorkers || 3;
@@ -87,7 +132,12 @@ export class Scheduler {
 
   async executeTask(task) {
     return new Promise((resolve, reject) => {
-      const wrappedTask = { ...task, silentQueueing: true, _completion: { resolve, reject } };
+      const wrappedTask = {
+        ...task,
+        silentQueueing: true,
+        deferDeliveryUntilResult: true,
+        _completion: { resolve, reject },
+      };
       this.submit(wrappedTask).catch(reject);
     });
   }
@@ -437,6 +487,7 @@ export class Scheduler {
 
   async _spawnWorker(task) {
     const { userText, fileContent, imagePaths, threadTs, channel, userId, platform } = task;
+    const deferDeliveryUntilResult = task.deferDeliveryUntilResult === true;
     const adapter = this._getAdapter(platform);
     if (!adapter && platform !== 'system') {
       logError(TAG, `spawn failed: no adapter for platform=${platform} thread=${threadTs}`);
@@ -481,6 +532,7 @@ export class Scheduler {
     if (!effectiveEffort) effectiveEffort = 'low';
 
     let typingInterval = null;
+    let typingActive = false;
     let responded = false;
     let turnDelivered = false;
     let pendingAutoContinue = null;
@@ -492,20 +544,34 @@ export class Scheduler {
     let workerFailure = null;
     let completionSettled = false;
     let worker;
-    const canManageThreadStatus = platform === 'slack' && channel != null && typeof adapter?.setThreadStatus === 'function';
+    const hasTaskCardThread = () => effectiveThreadTs != null;
+    const canManageThreadStatus = !deferDeliveryUntilResult
+      && platform === 'slack'
+      && channel != null
+      && typeof adapter?.setThreadStatus === 'function';
     const canUseTypingIndicator = platform === 'slack'
+      && !deferDeliveryUntilResult
       && typeof adapter?.startTypingIndicator === 'function'
       && typeof adapter?.stopTypingIndicator === 'function';
     const taskCardState = {
-      enabled: platform === 'slack' && channel != null
+      enabled: !deferDeliveryUntilResult
+        && platform === 'slack' && channel != null && hasTaskCardThread()
         && task.enableTaskCard !== false
         && typeof adapter?.startStream === 'function'
         && typeof adapter?.appendStream === 'function'
         && typeof adapter?.stopStream === 'function',
+      deferred: deferDeliveryUntilResult
+        && platform === 'slack' && channel != null && hasTaskCardThread()
+        && task.enableTaskCard !== false
+        && typeof adapter?.startStream === 'function'
+        && typeof adapter?.stopStream === 'function',
       streamId: null,
+      chunkType: null,
+      displayMode: null,
       taskCards: new Map(),
       failed: false,
       failureNotified: false,
+      missingThreadWarned: false,
     };
 
     const settleCompletion = (method, payload) => {
@@ -524,49 +590,73 @@ export class Scheduler {
       }
     };
 
+    const startThreadStatusRefresh = async (status = THINKING_STATUS) => {
+      if (!canManageThreadStatus) return;
+      await applyThreadStatus(status);
+      if (typingInterval) return;
+      typingInterval = setInterval(async () => {
+        await applyThreadStatus(pendingThreadStatus || status);
+      }, 5_000);
+    };
+
     const startTyping = async () => {
+      if (deferDeliveryUntilResult) return;
+      await startThreadStatusRefresh();
+      if (typingActive) return;
       if (canUseTypingIndicator) {
         if (platform === 'slack' && String(channel || '').startsWith('D')) {
-          if (!pendingThreadStatus) pendingThreadStatus = 'Orb thinking…';
-          if (pendingThreadStatus !== 'Orb thinking…') return;
+          if (!pendingThreadStatus) pendingThreadStatus = THINKING_STATUS;
+          if (pendingThreadStatus !== THINKING_STATUS) return;
         }
         try {
           await adapter.startTypingIndicator(channel, effectiveThreadTs);
+          typingActive = true;
         } catch (err) {
           warn(TAG, `failed to start typing indicator: ${err.message}`);
         }
         return;
       }
       if (canManageThreadStatus) {
-        if (!pendingThreadStatus) await applyThreadStatus('Orb thinking…');
+        typingActive = true;
         return;
       }
       if (typingInterval) return;
-      try { await adapter.setTyping(channel, effectiveThreadTs, 'Orb thinking…'); } catch (_) {}
+      try { await adapter.setTyping(channel, effectiveThreadTs, THINKING_STATUS); } catch (_) {}
+      typingActive = true;
       typingInterval = setInterval(async () => {
-        try { await adapter.setTyping(channel, effectiveThreadTs, 'Orb thinking…'); } catch (_) {}
+        try { await adapter.setTyping(channel, effectiveThreadTs, THINKING_STATUS); } catch (_) {}
       }, 5_000);
     };
 
     const stopTyping = async () => {
+      if (deferDeliveryUntilResult) return;
+      if (!typingActive && !typingInterval) return;
       if (canUseTypingIndicator) {
         try {
           await adapter.stopTypingIndicator(channel, effectiveThreadTs);
         } catch (err) {
           warn(TAG, `failed to stop typing indicator: ${err.message}`);
         }
-        return;
+        typingActive = false;
       }
-      if (canManageThreadStatus) return;
       if (typingInterval) {
         clearInterval(typingInterval);
         typingInterval = null;
       }
+      if (canManageThreadStatus) {
+        typingActive = false;
+        await applyThreadStatus('');
+        return;
+      }
+      typingActive = false;
       try { await adapter.setTyping(channel, effectiveThreadTs, ''); } catch (_) {}
     };
 
     const resetTaskCardState = () => {
+      // Slack streaming is per-message; every turn starts a fresh stream.
       taskCardState.streamId = null;
+      taskCardState.chunkType = null;
+      taskCardState.displayMode = null;
       taskCardState.taskCards.clear();
       taskCardState.failed = false;
       taskCardState.failureNotified = false;
@@ -574,25 +664,57 @@ export class Scheduler {
 
     const failTaskCardStream = async (err) => {
       if (taskCardState.failed && taskCardState.failureNotified) return;
+      const failure = classifyTaskCardStreamError(err);
+      const fallbackMarkdown = failure.level === 'warn'
+        ? buildTaskCardFallbackMarkdown(taskCardState.taskCards)
+        : '';
       taskCardState.failed = true;
       taskCardState.streamId = null;
-      taskCardState.taskCards.clear();
-      logError(TAG, `[task_card] stream failed: ${err.message}`);
-      if (!taskCardState.failureNotified) {
-        taskCardState.failureNotified = true;
-        await adapter.sendReply(channel, effectiveThreadTs, `task_card stream failed: ${err.message}`).catch((sendErr) => {
-          warn(TAG, `failed to send task_card error reply: ${sendErr.message}`);
-        });
+      taskCardState.chunkType = null;
+      taskCardState.displayMode = null;
+      if (fallbackMarkdown) {
+        try {
+          await adapter.sendReply(channel, effectiveThreadTs, fallbackMarkdown);
+        } catch (sendErr) {
+          warn(TAG, `[task_card] fallback delivery failed: ${sendErr.message}`);
+        }
       }
+      taskCardState.taskCards.clear();
+      const detail = failure.code ? `${failure.code}: ${err.message}` : err.message;
+      if (failure.level === 'warn') warn(TAG, `[task_card] stream degraded: ${detail}`);
+      else logError(TAG, `[task_card] stream failed: ${detail}`);
+      taskCardState.failureNotified = true;
+    };
+
+    const disableTaskCardStreaming = (mode) => {
+      if (!taskCardState.missingThreadWarned) {
+        warn(TAG, `[task_card] skipping ${mode} stream: missing delivery thread ts`);
+        taskCardState.missingThreadWarned = true;
+      }
+      taskCardState.enabled = false;
+      taskCardState.deferred = false;
+      taskCardState.streamId = null;
+      taskCardState.chunkType = null;
+      taskCardState.displayMode = null;
+      taskCardState.taskCards.clear();
+    };
+
+    const buildTaskCardChunks = () => {
+      return buildTaskUpdateChunks(taskCardState.taskCards);
     };
 
     const ensureTaskCardStream = async () => {
       if (!taskCardState.enabled || taskCardState.failed) return false;
+      if (!hasTaskCardThread()) {
+        disableTaskCardStreaming('live');
+        return false;
+      }
       if (taskCardState.streamId) return true;
       try {
         const stream = await adapter.startStream(channel, effectiveThreadTs, {
-          task_display_mode: 'timeline',
-          initial_chunks: buildTaskUpdateChunks(taskCardState.taskCards),
+          task_display_mode: taskCardState.displayMode || resolveTaskCardDisplayMode(taskCardState.chunkType, 'timeline'),
+          initial_chunks: buildTaskCardChunks(),
+          team_id: task.teamId || null,
         });
         taskCardState.streamId = stream?.stream_id || null;
         if (!effectiveThreadTs && stream?.ts) effectiveThreadTs = stream.ts;
@@ -607,12 +729,24 @@ export class Scheduler {
     const appendTaskCardPlan = async () => {
       if (!taskCardState.streamId || taskCardState.failed) return false;
       try {
-        await adapter.appendStream(taskCardState.streamId, buildTaskUpdateChunks(taskCardState.taskCards));
+        await adapter.appendStream(taskCardState.streamId, buildTaskCardChunks());
         return true;
       } catch (err) {
         await failTaskCardStream(err);
         return false;
       }
+    };
+
+    const finalizePendingTaskCards = () => {
+      let changed = false;
+      for (const taskCard of taskCardState.taskCards.values()) {
+        if (taskCard.status === 'in_progress') {
+          taskCard.status = 'error';
+          taskCard.output = taskCard.output || '(no result from tool)';
+          changed = true;
+        }
+      }
+      return changed;
     };
 
     const buildFinalTextPayloads = (text) => {
@@ -628,6 +762,25 @@ export class Scheduler {
           }],
         };
       });
+    };
+
+    const stopTaskCardStream = async (text) => {
+      if (!taskCardState.streamId || taskCardState.failed) return false;
+      finalizePendingTaskCards();
+      const finalText = String(text || '').trim();
+      const finalPayloads = buildFinalTextPayloads(finalText);
+      const primaryPayload = finalPayloads.shift() || null;
+      const stopPayload = {
+        chunks: buildTaskCardChunks(),
+        ...(finalText ? { markdown_text: finalText } : {}),
+        ...(primaryPayload?.blocks?.length ? { blocks: primaryPayload.blocks } : {}),
+      };
+      await adapter.stopStream(taskCardState.streamId, stopPayload);
+      resetTaskCardState();
+      for (const payload of finalPayloads) {
+        await emitPayload(payload);
+      }
+      return true;
     };
 
     // Rerun via 🔥 reaction: first emitted payload edits targetMessageTs,
@@ -664,6 +817,48 @@ export class Scheduler {
       }
     };
 
+    const deliverDeferredFinalResult = async (text) => {
+      if (!text) return false;
+      if (taskCardState.deferred && taskCardState.taskCards.size > 0) {
+        if (!hasTaskCardThread()) {
+          disableTaskCardStreaming('deferred');
+        } else {
+          try {
+            finalizePendingTaskCards();
+            const finalPayloads = buildFinalTextPayloads(text);
+            const primaryPayload = finalPayloads.shift() || null;
+            const stream = await adapter.startStream(channel, effectiveThreadTs, {
+              task_display_mode: taskCardState.displayMode || resolveTaskCardDisplayMode(taskCardState.chunkType, 'timeline'),
+              initial_chunks: buildTaskCardChunks(),
+              team_id: task.teamId || null,
+            });
+            if (!effectiveThreadTs && stream?.ts) effectiveThreadTs = stream.ts;
+            const stopPayload = {
+              chunks: buildTaskCardChunks(),
+              markdown_text: text,
+              ...(primaryPayload?.blocks?.length ? { blocks: primaryPayload.blocks } : {}),
+            };
+            await adapter.stopStream(stream?.stream_id, stopPayload);
+            for (const payload of finalPayloads) {
+              await emitPayload(payload);
+            }
+            resetTaskCardState();
+            return true;
+          } catch (err) {
+            const failure = classifyTaskCardStreamError(err);
+            if (failure.level === 'warn') warn(TAG, `deferred task_card delivery degraded: ${err.message}`);
+            else logError(TAG, `deferred task_card delivery failed: ${err.message}`);
+          }
+        }
+      }
+
+      const payloads = adapter.buildPayloads(text);
+      for (const payload of payloads) {
+        await emitPayload(payload);
+      }
+      return true;
+    };
+
     try {
       ({ worker } = spawnWorker({
         task: {
@@ -675,6 +870,7 @@ export class Scheduler {
           channel,
           userId,
           platform,
+          teamId: task.teamId || null,
           threadHistory: task.threadHistory,
           model: effectiveModel,
           effort: effectiveEffort,
@@ -695,6 +891,7 @@ export class Scheduler {
           info(TAG, `worker response: type=${msg.type} thread=${threadTs} textLen=${msg.text?.length || 0}`);
 
           if (msg.type === 'progress_update') {
+            if (deferDeliveryUntilResult) return;
             if (taskCardState.enabled) return;
             try {
               if (!progressTs) {
@@ -710,19 +907,30 @@ export class Scheduler {
           }
 
           if (msg.type === 'status_update') {
+            if (deferDeliveryUntilResult) return;
             if (taskCardState.enabled) return;
             await applyThreadStatus(msg.text || '');
             return;
           }
 
           if (msg.type === 'tool_call') {
-            if (!taskCardState.enabled || taskCardState.failed) return;
+            if ((!taskCardState.enabled && !taskCardState.deferred) || taskCardState.failed) return;
+            if (!taskCardState.chunkType && typeof msg.chunk_type === 'string') {
+              taskCardState.chunkType = msg.chunk_type;
+            }
+            if (!taskCardState.displayMode && typeof msg.display_mode === 'string') {
+              taskCardState.displayMode = msg.display_mode;
+            }
+            if (!taskCardState.displayMode && taskCardState.chunkType) {
+              taskCardState.displayMode = resolveTaskCardDisplayMode(taskCardState.chunkType);
+            }
             taskCardState.taskCards.set(msg.task_id, {
               title: msg.title || msg.tool_name || 'Task',
               details: msg.details || '',
               status: 'in_progress',
               output: '',
             });
+            if (!taskCardState.enabled) return;
             const hadStream = Boolean(taskCardState.streamId);
             if (await ensureTaskCardStream() && hadStream) {
               await appendTaskCardPlan();
@@ -736,6 +944,7 @@ export class Scheduler {
             if (!taskCard) return;
             taskCard.status = msg.status || 'complete';
             taskCard.output = msg.output || '';
+            if (!taskCardState.enabled) return;
             if (taskCardState.streamId) {
               await appendTaskCardPlan();
             }
@@ -744,6 +953,11 @@ export class Scheduler {
 
           if (msg.type === 'turn_start') {
             metadataUpdatedForTurn = false;
+            if (taskCardState.enabled) {
+              await startThreadStatusRefresh();
+              await startTyping();
+              return;
+            }
             await startTyping();
             return;
           }
@@ -754,6 +968,7 @@ export class Scheduler {
           }
 
           if (msg.type === 'intermediate_text') {
+            if (deferDeliveryUntilResult) return;
             if (taskCardState.streamId && !taskCardState.failed) return;
             if (msg.text?.trim()) {
               try {
@@ -775,25 +990,26 @@ export class Scheduler {
             // 中间轮次完成 — worker 已裁剪掉经 intermediate_text 投递过的部分
             try {
               const text = (typeof msg.undeliveredText === 'string' ? msg.undeliveredText : msg.text)?.trim();
-              if (taskCardState.streamId && !taskCardState.failed) {
-                const finalPayloads = buildFinalTextPayloads(text);
-                const primaryPayload = finalPayloads.shift() || null;
-                const finalBlocks = [buildPlanBlock(taskCardState.taskCards)];
-                if (primaryPayload?.blocks?.length) finalBlocks.push(...primaryPayload.blocks);
-                await adapter.stopStream(taskCardState.streamId, { final_blocks: finalBlocks });
-                resetTaskCardState();
+              if (deferDeliveryUntilResult && isSilentResultText(text)) {
+                info(TAG, `silent deferred turn suppressed: thread=${threadTs}`);
                 turnDelivered = true;
-                for (const payload of finalPayloads) {
-                  await emitPayload(payload);
-                }
+                resetTaskCardState();
+                return;
+              }
+              if (taskCardState.streamId && !taskCardState.failed) {
+                await stopTaskCardStream(text);
+                turnDelivered = true;
                 await updateThreadMetadata(text);
                 return;
               }
               if (text) {
                 turnDelivered = true;
-                const payloads = adapter.buildPayloads(text);
-                for (const payload of payloads) {
-                  await emitPayload(payload);
+                if (deferDeliveryUntilResult) await deliverDeferredFinalResult(text);
+                else {
+                  const payloads = adapter.buildPayloads(text);
+                  for (const payload of payloads) {
+                    await emitPayload(payload);
+                  }
                 }
               }
               await updateThreadMetadata(text);
@@ -802,14 +1018,21 @@ export class Scheduler {
               if (taskCardState.streamId) await failTaskCardStream(err);
               logError(TAG, `failed to send turn_complete: ${err.message}`);
               const fallbackText = (typeof msg.undeliveredText === 'string' ? msg.undeliveredText : msg.text)?.trim();
-              if (fallbackText) {
+              const silentDeferredFallback = deferDeliveryUntilResult && isSilentResultText(fallbackText);
+              if (silentDeferredFallback) {
+                info(TAG, `silent deferred turn suppressed after delivery failure: thread=${threadTs}`);
                 turnDelivered = true;
-                const payloads = adapter.buildPayloads(fallbackText);
-                for (const payload of payloads) {
-                  await emitPayload(payload);
+              } else if (fallbackText) {
+                turnDelivered = true;
+                if (deferDeliveryUntilResult) await deliverDeferredFinalResult(fallbackText);
+                else {
+                  const payloads = adapter.buildPayloads(fallbackText);
+                  for (const payload of payloads) {
+                    await emitPayload(payload);
+                  }
                 }
               }
-              await updateThreadMetadata(fallbackText);
+              if (!silentDeferredFallback) await updateThreadMetadata(fallbackText);
               resetTaskCardState();
             }
             return;
@@ -817,26 +1040,21 @@ export class Scheduler {
 
           if (msg.type === 'result') {
             let text = msg.text?.trim() || null;
+            const silentDeferredResult = deferDeliveryUntilResult && isSilentResultText(text);
             finalResultText = text || '';
             try {
               if (taskCardState.streamId && !taskCardState.failed && !turnDelivered) {
-                const finalPayloads = buildFinalTextPayloads(text);
-                const primaryPayload = finalPayloads.shift() || null;
-                const finalBlocks = [buildPlanBlock(taskCardState.taskCards)];
-                if (primaryPayload?.blocks?.length) finalBlocks.push(...primaryPayload.blocks);
-                await adapter.stopStream(taskCardState.streamId, { final_blocks: finalBlocks });
-                resetTaskCardState();
+                await stopTaskCardStream(text);
                 turnDelivered = true;
-                for (const payload of finalPayloads) {
-                  await emitPayload(payload);
-                }
               }
               if (!text) {
                 const retries = this._autoContinueCount.get(threadTs) || 0;
                 if (retries < MAX_AUTO_CONTINUE) {
                   this._autoContinueCount.set(threadTs, retries + 1);
                   warn(TAG, `empty result, auto-continue ${retries + 1}/${MAX_AUTO_CONTINUE} for thread=${threadTs}`);
-                  await adapter.sendReply(channel, effectiveThreadTs, `⏳ 回合上限已达${msg.stopReason === 'tool_use' ? '（任务执行中）' : msg.lastTool ? '（正在: ' + msg.lastTool + '）' : ''}，自动续接中 (${retries + 1}/${MAX_AUTO_CONTINUE})…`).catch(() => {});
+                  if (!deferDeliveryUntilResult) {
+                    await adapter.sendReply(channel, effectiveThreadTs, `⏳ 回合上限已达${msg.stopReason === 'tool_use' ? '（任务执行中）' : msg.lastTool ? '（正在: ' + msg.lastTool + '）' : ''}，自动续接中 (${retries + 1}/${MAX_AUTO_CONTINUE})…`).catch(() => {});
+                  }
                   // Defer submit to onExit — avoid race with worker's process.exit(0)
                   pendingAutoContinue = {
                     userText: '继续',
@@ -847,9 +1065,11 @@ export class Scheduler {
                     channel,
                     userId,
                     platform,
+                    teamId: task.teamId || null,
                     threadHistory: task.threadHistory,
                     profile,
                     enableTaskCard: task.enableTaskCard,
+                    deferDeliveryUntilResult,
                     _completion: task._completion,
                   };
                   return;
@@ -859,16 +1079,25 @@ export class Scheduler {
               } else {
                 this._autoContinueCount.delete(threadTs);
               }
+              if (silentDeferredResult) {
+                info(TAG, `silent deferred result suppressed: thread=${threadTs}`);
+                turnDelivered = true;
+              }
               if (!turnDelivered) {
-                const payloads = adapter.buildPayloads(text || '⚠️ 多次续接仍未生成回复，任务可能需要拆分。请用更小的指令重试。');
-                info(TAG, `sending ${payloads.length} payload(s) to thread=${threadTs}`);
-                for (const payload of payloads) {
-                  await emitPayload(payload);
+                if (deferDeliveryUntilResult && text) {
+                  turnDelivered = await deliverDeferredFinalResult(text);
+                } else {
+                  const payloads = adapter.buildPayloads(text || '⚠️ 多次续接仍未生成回复，任务可能需要拆分。请用更小的指令重试。');
+                  info(TAG, `sending ${payloads.length} payload(s) to thread=${threadTs}`);
+                  for (const payload of payloads) {
+                    await emitPayload(payload);
+                  }
                 }
               } else {
                 turnDelivered = false;
               }
-              await updateThreadMetadata(text);
+              resetTaskCardState();
+              if (!silentDeferredResult) await updateThreadMetadata(text);
               await stopTyping();
               if (text) {
                 const errorPatterns = /(?:error|failed|permission denied|ENOENT|not found|timed?\s*out|EACCES)/i;
