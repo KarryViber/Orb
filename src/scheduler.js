@@ -576,6 +576,7 @@ export class Scheduler {
         && typeof adapter?.startStream === 'function'
         && typeof adapter?.stopStream === 'function',
       streamId: null,
+      streamTs: null,
       chunkType: null,
       displayMode: null,
       taskCards: new Map(),
@@ -676,6 +677,7 @@ export class Scheduler {
     const resetTaskCardState = () => {
       // Slack streaming is per-message; every turn starts a fresh stream.
       taskCardState.streamId = null;
+      taskCardState.streamTs = null;
       taskCardState.chunkType = null;
       taskCardState.displayMode = null;
       taskCardState.taskCards.clear();
@@ -691,16 +693,29 @@ export class Scheduler {
       const fallbackMarkdown = failure.level === 'warn'
         ? buildTaskCardFallbackMarkdown(taskCardState.taskCards)
         : '';
+      const editableTs = taskCardState.streamTs;
       taskCardState.failed = true;
       taskCardState.streamId = null;
+      taskCardState.streamTs = null;
       clearKeepalive();
       taskCardState.chunkType = null;
       taskCardState.displayMode = null;
       if (fallbackMarkdown) {
-        try {
-          await adapter.sendReply(channel, effectiveThreadTs, fallbackMarkdown);
-        } catch (sendErr) {
-          warn(TAG, `[task_card] fallback delivery failed: ${sendErr.message}`);
+        let edited = false;
+        if (editableTs && typeof adapter?.editMessage === 'function') {
+          try {
+            await adapter.editMessage(channel, editableTs, fallbackMarkdown);
+            edited = true;
+          } catch (editErr) {
+            warn(TAG, `[task_card] edit-over-canvas failed: ${editErr.message}`);
+          }
+        }
+        if (!edited) {
+          try {
+            await adapter.sendReply(channel, effectiveThreadTs, fallbackMarkdown);
+          } catch (sendErr) {
+            warn(TAG, `[task_card] fallback delivery failed: ${sendErr.message}`);
+          }
         }
       }
       taskCardState.taskCards.clear();
@@ -742,6 +757,7 @@ export class Scheduler {
           team_id: task.teamId || null,
         });
         taskCardState.streamId = stream?.stream_id || null;
+        taskCardState.streamTs = stream?.ts || null;
         if (!effectiveThreadTs && stream?.ts) effectiveThreadTs = stream.ts;
         if (taskCardState.streamId) armKeepalive();
         return Boolean(taskCardState.streamId);
@@ -801,8 +817,20 @@ export class Scheduler {
         if (failure.code === 'message_not_in_streaming_state' || failure.code === 'message_not_owned_by_app') {
           warn(TAG, `stopStream degraded to plain message: ${err.message}`);
           taskCardState.failed = true;
-          if (finalText && primaryPayload) await emitPayload(primaryPayload);
-          else if (finalText) await adapter.sendReply(channel, effectiveThreadTs, finalText);
+          const editableTs = taskCardState.streamTs;
+          let edited = false;
+          if (finalText && editableTs && typeof adapter?.editMessage === 'function') {
+            try {
+              await adapter.editMessage(channel, editableTs, finalText);
+              edited = true;
+            } catch (editErr) {
+              warn(TAG, `stopStream edit-over-canvas failed: ${editErr.message}`);
+            }
+          }
+          if (!edited) {
+            if (finalText && primaryPayload) await emitPayload(primaryPayload);
+            else if (finalText) await adapter.sendReply(channel, effectiveThreadTs, finalText);
+          }
           resetTaskCardState();
           for (const payload of finalPayloads) await emitPayload(payload);
           return true;
