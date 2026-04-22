@@ -7,6 +7,7 @@ import { taskQueue } from './queue.js';
 import { sanitizeErrorText } from './format-utils.js';
 import { listFacts, storeLesson, storeCorrectionLesson, purgeTransient, lintMemory } from './memory.js';
 import { spawnWorker } from './spawn.js';
+import { getDefaults } from './config.js';
 import { buildTaskUpdateChunks, extractSuggestedPrompts } from './adapters/slack-format.js';
 const TAG = 'scheduler';
 const DRAIN_TIMEOUT = 30_000;
@@ -541,8 +542,10 @@ export class Scheduler {
       info(TAG, `effort escalated to xhigh by keyword match`);
     }
 
-    // 默认 low（若前面都没设）
-    if (!effectiveEffort) effectiveEffort = 'low';
+    // Fallback: 前缀 > 关键词 > config.defaults > 内置兜底（getDefaults 已保证 effort 非空）
+    const defaults = getDefaults();
+    if (!effectiveModel) effectiveModel = defaults.model;
+    if (!effectiveEffort) effectiveEffort = defaults.effort;
 
     let typingActive = false;
     let responded = false;

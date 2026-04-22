@@ -43,6 +43,19 @@ function interpolateEnv(obj) {
 }
 
 /**
+ * Return scheduler-level defaults for Slack-triggered workers.
+ * `effort` falls back to `'low'` (preserving legacy behavior);
+ * `model` defaults to `null` so CLI's own default is used.
+ */
+export function getDefaults() {
+  const config = loadConfig();
+  return {
+    model: config.defaults?.model || null,
+    effort: config.defaults?.effort || 'low',
+  };
+}
+
+/**
  * Resolve a userId to a profile name.
  * Throws if no match — unmapped userIds are rejected.
  */
