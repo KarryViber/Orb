@@ -8,6 +8,7 @@ import { sanitizeErrorText } from './format-utils.js';
 import { listFacts, storeLesson, storeCorrectionLesson, purgeTransient, lintMemory } from './memory.js';
 import { spawnWorker } from './spawn.js';
 import { getDefaults } from './config.js';
+import { EgressGate } from './egress.js';
 import { buildTaskUpdateChunks, extractSuggestedPrompts } from './adapters/slack-format.js';
 const TAG = 'scheduler';
 const DRAIN_TIMEOUT = 30_000;
@@ -90,6 +91,36 @@ function classifyTaskCardStreamError(err) {
 function resolveTaskCardDisplayMode(chunkType, fallback = 'timeline') {
   if (chunkType === 'task') return 'timeline';
   return fallback;
+}
+
+function makeTaskCardState({ enabled = false, deferred = false } = {}) {
+  return {
+    enabled: Boolean(enabled),
+    deferred: Boolean(deferred),
+    streamId: null,
+    streamTs: null,
+    chunkType: null,
+    displayMode: null,
+    taskCards: new Map(),
+    failed: false,
+    failureNotified: false,
+    missingThreadWarned: false,
+    bubbleCleared: false,
+    keepaliveTimer: null,
+  };
+}
+
+function makeTurnState(log, taskCardConfig) {
+  return {
+    progressTs: null,
+    intermediateDeliveredThisTurn: false,
+    typingActive: false,
+    pendingThreadStatus: '',
+    pendingStatusLoadingMessages: null,
+    statusRefreshTimer: null,
+    egress: new EgressGate(log),
+    taskCardState: makeTaskCardState(taskCardConfig),
+  };
 }
 
 function buildTaskCardFallbackMarkdown(taskCards) {
@@ -547,15 +578,10 @@ export class Scheduler {
     if (!effectiveModel) effectiveModel = defaults.model;
     if (!effectiveEffort) effectiveEffort = defaults.effort;
 
-    let typingActive = false;
     let responded = false;
     let turnDelivered = false;
     let pendingAutoContinue = null;
     let effectiveThreadTs = task.deliveryThreadTs === undefined ? (threadTs || null) : task.deliveryThreadTs;
-    let pendingThreadStatus = '';
-    let intermediateDeliveredThisTurn = false;
-    let pendingStatusLoadingMessages = null;
-    let statusRefreshTimer = null;
     let turnCount = 0;
     let metadataUpdatedForTurn = false;
     let finalResultText = '';
@@ -567,7 +593,7 @@ export class Scheduler {
       && platform === 'slack'
       && channel != null
       && typeof adapter?.setThreadStatus === 'function';
-    const taskCardState = {
+    const taskCardConfig = {
       enabled: !deferDeliveryUntilResult
         && platform === 'slack' && channel != null && hasTaskCardThread()
         && task.enableTaskCard !== false
@@ -579,16 +605,9 @@ export class Scheduler {
         && task.enableTaskCard !== false
         && typeof adapter?.startStream === 'function'
         && typeof adapter?.stopStream === 'function',
-      streamId: null,
-      streamTs: null,
-      chunkType: null,
-      displayMode: null,
-      taskCards: new Map(),
-      failed: false,
-      failureNotified: false,
-      missingThreadWarned: false,
-      bubbleCleared: false,
     };
+    const turnLog = (m) => warn(TAG, m);
+    let turn = makeTurnState(turnLog, taskCardConfig);
 
     const settleCompletion = (method, payload) => {
       if (completionSettled) return;
@@ -597,20 +616,20 @@ export class Scheduler {
     };
 
     const clearStatusRefresh = () => {
-      if (statusRefreshTimer) {
-        clearTimeout(statusRefreshTimer);
-        statusRefreshTimer = null;
+      if (turn.statusRefreshTimer) {
+        clearTimeout(turn.statusRefreshTimer);
+        turn.statusRefreshTimer = null;
       }
     };
     const armStatusRefresh = () => {
       clearStatusRefresh();
       if (!canManageThreadStatus || !effectiveThreadTs) return;
-      if (!pendingThreadStatus) return;
-      statusRefreshTimer = setTimeout(async () => {
-        statusRefreshTimer = null;
-        if (!pendingThreadStatus || !canManageThreadStatus || !effectiveThreadTs) return;
+      if (!turn.pendingThreadStatus) return;
+      turn.statusRefreshTimer = setTimeout(async () => {
+        turn.statusRefreshTimer = null;
+        if (!turn.pendingThreadStatus || !canManageThreadStatus || !effectiveThreadTs) return;
         try {
-          await adapter.setThreadStatus(channel, effectiveThreadTs, pendingThreadStatus, pendingStatusLoadingMessages || undefined);
+          await adapter.setThreadStatus(channel, effectiveThreadTs, turn.pendingThreadStatus, turn.pendingStatusLoadingMessages || undefined);
           armStatusRefresh();
         } catch (err) {
           warn(TAG, `status refresh failed: ${err.message}`);
@@ -619,12 +638,12 @@ export class Scheduler {
     };
 
     const applyThreadStatus = async (status, loadingMessages) => {
-      pendingThreadStatus = String(status || '');
-      pendingStatusLoadingMessages = Array.isArray(loadingMessages) ? loadingMessages : null;
+      turn.pendingThreadStatus = String(status || '');
+      turn.pendingStatusLoadingMessages = Array.isArray(loadingMessages) ? loadingMessages : null;
       if (!canManageThreadStatus || !effectiveThreadTs) return;
       try {
-        await adapter.setThreadStatus(channel, effectiveThreadTs, pendingThreadStatus, loadingMessages);
-        if (pendingThreadStatus) armStatusRefresh();
+        await adapter.setThreadStatus(channel, effectiveThreadTs, turn.pendingThreadStatus, loadingMessages);
+        if (turn.pendingThreadStatus) armStatusRefresh();
         else clearStatusRefresh();
       } catch (err) {
         warn(TAG, `failed to set thread status: ${err.message}`);
@@ -640,36 +659,35 @@ export class Scheduler {
     const startTyping = async () => {
       if (deferDeliveryUntilResult) return;
       await startThreadStatusRefresh();
-      typingActive = true;
+      turn.typingActive = true;
     };
 
     const stopTyping = async () => {
       if (deferDeliveryUntilResult) return;
-      if (!typingActive) return;
-      typingActive = false;
+      if (!turn.typingActive) return;
+      turn.typingActive = false;
       await applyThreadStatus('');
     };
 
-    let keepaliveTimer = null;
     const clearKeepalive = () => {
-      if (keepaliveTimer) {
-        clearTimeout(keepaliveTimer);
-        keepaliveTimer = null;
+      if (turn.taskCardState.keepaliveTimer) {
+        clearTimeout(turn.taskCardState.keepaliveTimer);
+        turn.taskCardState.keepaliveTimer = null;
       }
     };
     const armKeepalive = () => {
       clearKeepalive();
-      if (!taskCardState.streamId || taskCardState.failed) return;
-      keepaliveTimer = setTimeout(async () => {
-        keepaliveTimer = null;
-        if (!taskCardState.streamId || taskCardState.failed) return;
+      if (!turn.taskCardState.streamId || turn.taskCardState.failed) return;
+      turn.taskCardState.keepaliveTimer = setTimeout(async () => {
+        turn.taskCardState.keepaliveTimer = null;
+        if (!turn.taskCardState.streamId || turn.taskCardState.failed) return;
         const chunks = buildTaskCardChunks();
         if (!chunks.length) {
           armKeepalive();
           return;
         }
         try {
-          await adapter.appendStream(taskCardState.streamId, chunks);
+          await adapter.appendStream(turn.taskCardState.streamId, chunks);
           armKeepalive();
         } catch (err) {
           warn(TAG, `[task_card] keepalive failed: ${err.message}`);
@@ -680,30 +698,30 @@ export class Scheduler {
 
     const resetTaskCardState = () => {
       // Slack streaming is per-message; every turn starts a fresh stream.
-      taskCardState.streamId = null;
-      taskCardState.streamTs = null;
-      taskCardState.chunkType = null;
-      taskCardState.displayMode = null;
-      taskCardState.taskCards.clear();
-      taskCardState.failed = false;
-      taskCardState.failureNotified = false;
-      taskCardState.bubbleCleared = false;
+      turn.taskCardState.streamId = null;
+      turn.taskCardState.streamTs = null;
+      turn.taskCardState.chunkType = null;
+      turn.taskCardState.displayMode = null;
+      turn.taskCardState.taskCards.clear();
+      turn.taskCardState.failed = false;
+      turn.taskCardState.failureNotified = false;
+      turn.taskCardState.bubbleCleared = false;
       clearKeepalive();
     };
 
     const failTaskCardStream = async (err) => {
-      if (taskCardState.failed && taskCardState.failureNotified) return;
+      if (turn.taskCardState.failed && turn.taskCardState.failureNotified) return;
       const failure = classifyTaskCardStreamError(err);
       const fallbackMarkdown = failure.level === 'warn'
-        ? buildTaskCardFallbackMarkdown(taskCardState.taskCards)
+        ? buildTaskCardFallbackMarkdown(turn.taskCardState.taskCards)
         : '';
-      const editableTs = taskCardState.streamTs;
-      taskCardState.failed = true;
-      taskCardState.streamId = null;
-      taskCardState.streamTs = null;
+      const editableTs = turn.taskCardState.streamTs;
+      turn.taskCardState.failed = true;
+      turn.taskCardState.streamId = null;
+      turn.taskCardState.streamTs = null;
       clearKeepalive();
-      taskCardState.chunkType = null;
-      taskCardState.displayMode = null;
+      turn.taskCardState.chunkType = null;
+      turn.taskCardState.displayMode = null;
       if (fallbackMarkdown) {
         let edited = false;
         if (editableTs && typeof adapter?.editMessage === 'function') {
@@ -722,52 +740,52 @@ export class Scheduler {
           }
         }
       }
-      taskCardState.taskCards.clear();
+      turn.taskCardState.taskCards.clear();
       const detail = failure.code ? `${failure.code}: ${err.message}` : err.message;
       if (failure.level === 'warn') warn(TAG, `[task_card] stream degraded: ${detail}`);
       else logError(TAG, `[task_card] stream failed: ${detail}`);
-      taskCardState.failureNotified = true;
-      if (typingActive) {
+      turn.taskCardState.failureNotified = true;
+      if (turn.typingActive) {
         await startThreadStatusRefresh().catch(() => {});
       }
     };
 
     const disableTaskCardStreaming = (mode) => {
-      if (!taskCardState.missingThreadWarned) {
+      if (!turn.taskCardState.missingThreadWarned) {
         warn(TAG, `[task_card] skipping ${mode} stream: missing delivery thread ts`);
-        taskCardState.missingThreadWarned = true;
+        turn.taskCardState.missingThreadWarned = true;
       }
-      taskCardState.enabled = false;
-      taskCardState.deferred = false;
-      taskCardState.streamId = null;
-      taskCardState.chunkType = null;
-      taskCardState.displayMode = null;
-      taskCardState.taskCards.clear();
+      turn.taskCardState.enabled = false;
+      turn.taskCardState.deferred = false;
+      turn.taskCardState.streamId = null;
+      turn.taskCardState.chunkType = null;
+      turn.taskCardState.displayMode = null;
+      turn.taskCardState.taskCards.clear();
       clearKeepalive();
     };
 
     const buildTaskCardChunks = () => {
-      return buildTaskUpdateChunks(taskCardState.taskCards);
+      return buildTaskUpdateChunks(turn.taskCardState.taskCards);
     };
 
     const ensureTaskCardStream = async () => {
-      if (!taskCardState.enabled || taskCardState.failed) return false;
+      if (!turn.taskCardState.enabled || turn.taskCardState.failed) return false;
       if (!hasTaskCardThread()) {
         disableTaskCardStreaming('live');
         return false;
       }
-      if (taskCardState.streamId) return true;
+      if (turn.taskCardState.streamId) return true;
       try {
         const stream = await adapter.startStream(channel, effectiveThreadTs, {
-          task_display_mode: taskCardState.displayMode || resolveTaskCardDisplayMode(taskCardState.chunkType, 'timeline'),
+          task_display_mode: turn.taskCardState.displayMode || resolveTaskCardDisplayMode(turn.taskCardState.chunkType, 'timeline'),
           initial_chunks: buildTaskCardChunks(),
           team_id: task.teamId || null,
         });
-        taskCardState.streamId = stream?.stream_id || null;
-        taskCardState.streamTs = stream?.ts || null;
+        turn.taskCardState.streamId = stream?.stream_id || null;
+        turn.taskCardState.streamTs = stream?.ts || null;
         if (!effectiveThreadTs && stream?.ts) effectiveThreadTs = stream.ts;
-        if (taskCardState.streamId) armKeepalive();
-        return Boolean(taskCardState.streamId);
+        if (turn.taskCardState.streamId) armKeepalive();
+        return Boolean(turn.taskCardState.streamId);
       } catch (err) {
         await failTaskCardStream(err);
         return false;
@@ -775,12 +793,12 @@ export class Scheduler {
     };
 
     const appendTaskCardPlan = async (task_id, updateOnly = false) => {
-      if (!taskCardState.streamId || taskCardState.failed) return false;
-      const card = taskCardState.taskCards.get(task_id);
+      if (!turn.taskCardState.streamId || turn.taskCardState.failed) return false;
+      const card = turn.taskCardState.taskCards.get(task_id);
       if (!card) return false;
       try {
         const single = new Map([[task_id, card]]);
-        await adapter.appendStream(taskCardState.streamId, buildTaskUpdateChunks(single, { updateOnly }));
+        await adapter.appendStream(turn.taskCardState.streamId, buildTaskUpdateChunks(single, { updateOnly }));
         armKeepalive();
         return true;
       } catch (err) {
@@ -791,7 +809,7 @@ export class Scheduler {
 
     const finalizePendingTaskCards = () => {
       let changed = false;
-      for (const taskCard of taskCardState.taskCards.values()) {
+      for (const taskCard of turn.taskCardState.taskCards.values()) {
         if (taskCard.status === 'in_progress') {
           taskCard.status = 'error';
           taskCard.output = taskCard.output || '(no result from tool)';
@@ -808,33 +826,43 @@ export class Scheduler {
     };
 
     const stopTaskCardStream = async (text) => {
-      if (!taskCardState.streamId || taskCardState.failed) return false;
+      if (!turn.taskCardState.streamId || turn.taskCardState.failed) return false;
       clearKeepalive();
       finalizePendingTaskCards();
       const finalText = String(text || '').trim();
       const finalPayloads = buildFinalTextPayloads(finalText);
       const primaryPayload = finalPayloads.shift() || null;
       const hasBlocks = !!primaryPayload?.blocks?.length;
+      const wantsMarkdownText = Boolean(finalText) && !hasBlocks;
+      const markdownAllowed = wantsMarkdownText
+        ? turn.egress.admit(finalText, 'stream-close')
+        : false;
       const stopPayload = {
         chunks: buildTaskCardChunks(),
-        ...(finalText && !hasBlocks ? { markdown_text: finalText } : {}),
+        ...(markdownAllowed ? { markdown_text: finalText } : {}),
         ...(hasBlocks ? { blocks: primaryPayload.blocks } : {}),
       };
       try {
-        await adapter.stopStream(taskCardState.streamId, stopPayload);
+        await adapter.stopStream(turn.taskCardState.streamId, stopPayload);
       } catch (err) {
         const failure = classifyTaskCardStreamError(err);
         if (failure.code === 'message_not_in_streaming_state' || failure.code === 'message_not_owned_by_app') {
           warn(TAG, `stopStream degraded to plain message: ${err.message}`);
-          taskCardState.failed = true;
-          const editableTs = taskCardState.streamTs;
+          turn.taskCardState.failed = true;
+          const editableTs = turn.taskCardState.streamTs;
           let edited = false;
           if (finalText && editableTs && typeof adapter?.editMessage === 'function') {
-            try {
-              await adapter.editMessage(channel, editableTs, finalText);
+            if (!turn.egress.admit(finalText, 'ssfe-edit')) {
+              // Already delivered via another path — skip the canvas edit
+              // and the raw-send fallback to avoid a duplicate message.
               edited = true;
-            } catch (editErr) {
-              warn(TAG, `stopStream edit-over-canvas failed: ${editErr.message}`);
+            } else {
+              try {
+                await adapter.editMessage(channel, editableTs, finalText);
+                edited = true;
+              } catch (editErr) {
+                warn(TAG, `stopStream edit-over-canvas failed: ${editErr.message}`);
+              }
             }
           }
           if (!edited) {
@@ -857,8 +885,6 @@ export class Scheduler {
     // Rerun via 🔥 reaction: first emitted payload edits targetMessageTs,
     // subsequent payloads append as normal replies.
     let pendingEdit = task.targetMessageTs || null;
-    // Phase ①: ts of the in-thread progress message (null until first TodoWrite)
-    let progressTs = null;
     const updateThreadMetadata = async (text) => {
       if (metadataUpdatedForTurn) return;
       if (platform !== 'slack' || !channel || !effectiveThreadTs || !text) return;
@@ -890,7 +916,7 @@ export class Scheduler {
 
     const deliverDeferredFinalResult = async (text) => {
       if (!text) return false;
-      if (taskCardState.deferred && taskCardState.taskCards.size > 0) {
+      if (turn.taskCardState.deferred && turn.taskCardState.taskCards.size > 0) {
         if (!hasTaskCardThread()) {
           disableTaskCardStreaming('deferred');
         } else {
@@ -899,7 +925,7 @@ export class Scheduler {
             const finalPayloads = buildFinalTextPayloads(text);
             const primaryPayload = finalPayloads.shift() || null;
             const stream = await adapter.startStream(channel, effectiveThreadTs, {
-              task_display_mode: taskCardState.displayMode || resolveTaskCardDisplayMode(taskCardState.chunkType, 'timeline'),
+              task_display_mode: turn.taskCardState.displayMode || resolveTaskCardDisplayMode(turn.taskCardState.chunkType, 'timeline'),
               initial_chunks: buildTaskCardChunks(),
               team_id: task.teamId || null,
             });
@@ -919,7 +945,7 @@ export class Scheduler {
             const failure = classifyTaskCardStreamError(err);
             if (failure.level === 'warn') {
               warn(TAG, `deferred task_card delivery degraded to plain message: ${err.message}`);
-              taskCardState.failed = true;
+              turn.taskCardState.failed = true;
               try {
                 const fallbackPayloads = buildFinalTextPayloads(text);
                 for (const payload of fallbackPayloads) await emitPayload(payload);
@@ -935,6 +961,7 @@ export class Scheduler {
         }
       }
 
+      if (!turn.egress.admit(text, 'deferred')) return true;
       const payloads = adapter.buildPayloads(text);
       for (const payload of payloads) {
         await emitPayload(payload);
@@ -975,13 +1002,13 @@ export class Scheduler {
 
           if (msg.type === 'progress_update') {
             if (deferDeliveryUntilResult) return;
-            if (taskCardState.enabled) return;
+            if (turn.taskCardState.enabled) return;
             try {
-              if (!progressTs) {
+              if (!turn.progressTs) {
                 const result = await adapter.sendReply(channel, effectiveThreadTs, msg.text);
-                progressTs = result?.ts || null;
+                turn.progressTs = result?.ts || null;
               } else {
-                await adapter.editMessage(channel, progressTs, msg.text);
+                await adapter.editMessage(channel, turn.progressTs, msg.text);
               }
             } catch (err) {
               warn(TAG, `progress message failed: ${err.message}`);
@@ -991,34 +1018,34 @@ export class Scheduler {
 
           if (msg.type === 'status_update') {
             if (deferDeliveryUntilResult) return;
-            if (taskCardState.streamId && !taskCardState.failed) return;
+            if (turn.taskCardState.streamId && !turn.taskCardState.failed) return;
             await applyThreadStatus(msg.text || '');
             return;
           }
 
           if (msg.type === 'tool_call') {
-            if ((!taskCardState.enabled && !taskCardState.deferred) || taskCardState.failed) return;
-            if (!taskCardState.chunkType && typeof msg.chunk_type === 'string') {
-              taskCardState.chunkType = msg.chunk_type;
+            if ((!turn.taskCardState.enabled && !turn.taskCardState.deferred) || turn.taskCardState.failed) return;
+            if (!turn.taskCardState.chunkType && typeof msg.chunk_type === 'string') {
+              turn.taskCardState.chunkType = msg.chunk_type;
             }
-            if (!taskCardState.displayMode && typeof msg.display_mode === 'string') {
-              taskCardState.displayMode = msg.display_mode;
+            if (!turn.taskCardState.displayMode && typeof msg.display_mode === 'string') {
+              turn.taskCardState.displayMode = msg.display_mode;
             }
-            if (!taskCardState.displayMode && taskCardState.chunkType) {
-              taskCardState.displayMode = resolveTaskCardDisplayMode(taskCardState.chunkType);
+            if (!turn.taskCardState.displayMode && turn.taskCardState.chunkType) {
+              turn.taskCardState.displayMode = resolveTaskCardDisplayMode(turn.taskCardState.chunkType);
             }
-            taskCardState.taskCards.set(msg.task_id, {
+            turn.taskCardState.taskCards.set(msg.task_id, {
               title: msg.title || msg.tool_name || 'Task',
               details: msg.details || '',
               status: 'in_progress',
               output: '',
             });
-            if (!taskCardState.enabled) return;
-            const hadStream = Boolean(taskCardState.streamId);
+            if (!turn.taskCardState.enabled) return;
+            const hadStream = Boolean(turn.taskCardState.streamId);
             const streamReady = await ensureTaskCardStream();
-            if (streamReady && !taskCardState.bubbleCleared) {
+            if (streamReady && !turn.taskCardState.bubbleCleared) {
               await applyThreadStatus('');
-              taskCardState.bubbleCleared = true;
+              turn.taskCardState.bubbleCleared = true;
             }
             if (streamReady && hadStream) {
               await appendTaskCardPlan(msg.task_id);
@@ -1027,22 +1054,25 @@ export class Scheduler {
           }
 
           if (msg.type === 'tool_result') {
-            if (taskCardState.failed) return;
-            const taskCard = taskCardState.taskCards.get(msg.task_id);
+            if (turn.taskCardState.failed) return;
+            const taskCard = turn.taskCardState.taskCards.get(msg.task_id);
             if (!taskCard) return;
             taskCard.status = msg.status || 'complete';
             taskCard.output = msg.output || '';
-            if (!taskCardState.enabled) return;
-            if (taskCardState.streamId) {
+            if (!turn.taskCardState.enabled) return;
+            if (turn.taskCardState.streamId) {
               await appendTaskCardPlan(msg.task_id, true);
             }
             return;
           }
 
           if (msg.type === 'turn_start') {
+            // Clear lingering per-turn timers from the previous turn
+            // (these close over `turn`, so run them before rebuilding state).
+            clearStatusRefresh();
+            clearKeepalive();
+            turn = makeTurnState(turnLog, taskCardConfig);
             metadataUpdatedForTurn = false;
-            progressTs = null;
-            intermediateDeliveredThisTurn = false;
             await startTyping();
             return;
           }
@@ -1054,14 +1084,20 @@ export class Scheduler {
 
           if (msg.type === 'intermediate_text') {
             if (deferDeliveryUntilResult) return;
-            if (taskCardState.streamId && !taskCardState.failed) return;
+            if (turn.taskCardState.streamId && !turn.taskCardState.failed) return;
             if (msg.text?.trim()) {
+              if (!turn.egress.admit(msg.text, 'intermediate')) {
+                // Already sent via another path — skip duplicate send but keep the flag
+                // so later final-text paths still dedupe correctly.
+                turn.intermediateDeliveredThisTurn = true;
+                return;
+              }
               try {
                 const payloads = adapter.buildPayloads(msg.text);
                 for (const payload of payloads) {
                   await adapter.sendReply(channel, effectiveThreadTs, payload.text, payload.blocks ? { blocks: payload.blocks } : {});
                 }
-                intermediateDeliveredThisTurn = true;
+                turn.intermediateDeliveredThisTurn = true;
               } catch (err) {
                 warn(TAG, `failed to send intermediate text: ${err.message}`);
               }
@@ -1082,7 +1118,7 @@ export class Scheduler {
                 resetTaskCardState();
                 return;
               }
-              if (taskCardState.streamId && !taskCardState.failed) {
+              if (turn.taskCardState.streamId && !turn.taskCardState.failed) {
                 await stopTaskCardStream(text);
                 turnDelivered = true;
                 await updateThreadMetadata(text);
@@ -1091,10 +1127,10 @@ export class Scheduler {
               if (text) {
                 turnDelivered = true;
                 if (deferDeliveryUntilResult) await deliverDeferredFinalResult(text);
-                else if (intermediateDeliveredThisTurn) {
+                else if (turn.intermediateDeliveredThisTurn) {
                   info(TAG, `turn_complete text already delivered via intermediate stream, skip sendReply`);
                 }
-                else {
+                else if (turn.egress.admit(text, 'final')) {
                   const payloads = adapter.buildPayloads(text);
                   for (const payload of payloads) {
                     await emitPayload(payload);
@@ -1104,7 +1140,7 @@ export class Scheduler {
               await updateThreadMetadata(text);
               resetTaskCardState();
             } catch (err) {
-              if (taskCardState.streamId) await failTaskCardStream(err);
+              if (turn.taskCardState.streamId) await failTaskCardStream(err);
               logError(TAG, `failed to send turn_complete: ${err.message}`);
               const fallbackText = (typeof msg.undeliveredText === 'string' ? msg.undeliveredText : msg.text)?.trim();
               const silentDeferredFallback = deferDeliveryUntilResult && isSilentResultText(fallbackText);
@@ -1114,7 +1150,7 @@ export class Scheduler {
               } else if (fallbackText) {
                 turnDelivered = true;
                 if (deferDeliveryUntilResult) await deliverDeferredFinalResult(fallbackText);
-                else {
+                else if (turn.egress.admit(fallbackText, 'fallback')) {
                   const payloads = adapter.buildPayloads(fallbackText);
                   for (const payload of payloads) {
                     await emitPayload(payload);
@@ -1132,7 +1168,7 @@ export class Scheduler {
             const silentDeferredResult = deferDeliveryUntilResult && isSilentResultText(text);
             finalResultText = text || '';
             try {
-              if (taskCardState.streamId && !taskCardState.failed && !turnDelivered) {
+              if (turn.taskCardState.streamId && !turn.taskCardState.failed && !turnDelivered) {
                 await stopTaskCardStream(text);
                 turnDelivered = true;
               }
@@ -1186,15 +1222,19 @@ export class Scheduler {
               if (!turnDelivered) {
                 if (deferDeliveryUntilResult && text) {
                   turnDelivered = await deliverDeferredFinalResult(text);
-                } else if (intermediateDeliveredThisTurn && text) {
+                } else if (turn.intermediateDeliveredThisTurn && text) {
                   info(TAG, `result text already delivered via intermediate stream, skip sendReply`);
                   turnDelivered = true;
                 } else {
-                  const payloads = adapter.buildPayloads(text || '⚠️ 多次续接仍未生成回复，任务可能需要拆分。请用更小的指令重试。');
-                  info(TAG, `sending ${payloads.length} payload(s) to thread=${threadTs}`);
-                  for (const payload of payloads) {
-                    await emitPayload(payload);
+                  const finalText = text || '⚠️ 多次续接仍未生成回复，任务可能需要拆分。请用更小的指令重试。';
+                  if (turn.egress.admit(finalText, 'result-final')) {
+                    const payloads = adapter.buildPayloads(finalText);
+                    info(TAG, `sending ${payloads.length} payload(s) to thread=${threadTs}`);
+                    for (const payload of payloads) {
+                      await emitPayload(payload);
+                    }
                   }
+                  turnDelivered = true;
                 }
               } else {
                 turnDelivered = false;
