@@ -550,6 +550,7 @@ export class Scheduler {
     let pendingAutoContinue = null;
     let effectiveThreadTs = task.deliveryThreadTs === undefined ? (threadTs || null) : task.deliveryThreadTs;
     let pendingThreadStatus = '';
+    let intermediateDeliveredThisTurn = false;
     let pendingStatusLoadingMessages = null;
     let statusRefreshTimer = null;
     let turnCount = 0;
@@ -1032,6 +1033,7 @@ export class Scheduler {
           if (msg.type === 'turn_start') {
             metadataUpdatedForTurn = false;
             progressTs = null;
+            intermediateDeliveredThisTurn = false;
             await startTyping();
             return;
           }
@@ -1050,6 +1052,7 @@ export class Scheduler {
                 for (const payload of payloads) {
                   await adapter.sendReply(channel, effectiveThreadTs, payload.text, payload.blocks ? { blocks: payload.blocks } : {});
                 }
+                intermediateDeliveredThisTurn = true;
               } catch (err) {
                 warn(TAG, `failed to send intermediate text: ${err.message}`);
               }
@@ -1079,6 +1082,9 @@ export class Scheduler {
               if (text) {
                 turnDelivered = true;
                 if (deferDeliveryUntilResult) await deliverDeferredFinalResult(text);
+                else if (intermediateDeliveredThisTurn) {
+                  info(TAG, `turn_complete text already delivered via intermediate stream, skip sendReply`);
+                }
                 else {
                   const payloads = adapter.buildPayloads(text);
                   for (const payload of payloads) {
@@ -1160,6 +1166,9 @@ export class Scheduler {
               if (!turnDelivered) {
                 if (deferDeliveryUntilResult && text) {
                   turnDelivered = await deliverDeferredFinalResult(text);
+                } else if (intermediateDeliveredThisTurn && text) {
+                  info(TAG, `result text already delivered via intermediate stream, skip sendReply`);
+                  turnDelivered = true;
                 } else {
                   const payloads = adapter.buildPayloads(text || '⚠️ 多次续接仍未生成回复，任务可能需要拆分。请用更小的指令重试。');
                   info(TAG, `sending ${payloads.length} payload(s) to thread=${threadTs}`);
