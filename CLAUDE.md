@@ -154,12 +154,29 @@ Scheduler ↔ Worker communication via Node IPC (process.send/on('message')):
 | Worker → Scheduler | `turn_end` | `{ type: 'turn_end' }` | Phase ②: emitted when Claude CLI produces a `result` event for the current turn; scheduler stops typing immediately. |
 | Worker → Scheduler | `turn_complete` | `{ type: 'turn_complete', text, toolCount, lastTool, stopReason, deliveredTexts, undeliveredText? }` | Signals that one Claude turn finished; scheduler can deliver it while keeping the worker alive for future `inject` messages. When `intermediate_text` already emitted partial content, `undeliveredText` contains only the remaining text that still needs delivery. |
 | Worker → Scheduler | `progress_update` | `{ type: 'progress_update', text }` | Phase ①: emitted on every TodoWrite event. Scheduler posts on first occurrence (stores `ts`), then edits in-place on subsequent ones. In Wave 2 this is only used outside the task-card path and for non-stream/error fallback scenarios. |
-| Worker → Scheduler | `tool_call` | `{ type: 'tool_call', task_id, tool_name, title, details }` | Task-card path: emitted for selected `tool_use` blocks so the scheduler can render/update Slack task cards. `task_id` is the Claude tool_use block id. |
+| Worker → Scheduler | `tool_call` | `{ type: 'tool_call', task_id, tool_name, title, details, chunk_type, display_mode? }` | Task-card path: emitted for selected `tool_use` blocks so the scheduler can render/update Slack task cards. `task_id` is the Claude tool_use block id. The first task-card event in a turn fixes `chunk_type: 'task' | 'plan'` for the whole turn and may carry `display_mode: 'timeline'`. |
 | Worker → Scheduler | `tool_result` | `{ type: 'tool_result', task_id, status, output }` | Task-card path: emitted from `tool_result` blocks. `status` is `complete` or `error`, and `output` is a truncated human-readable summary. |
-| Worker → Scheduler | `status_update` | `{ type: 'status_update', text }` | Short assistant thread status text. Emitted when a tool starts so scheduler can call Slack assistant thread status APIs, and cleared with empty text at turn completion. |
+| Worker → Scheduler | `status_update` | `{ type: 'status_update', text }` | Short assistant thread status text. Emitted when a tool starts outside the task-card path so scheduler can call Slack assistant thread status APIs, and cleared with empty text at turn completion. |
 | Worker → Scheduler | `intermediate_text` | `{ type: 'intermediate_text', text }` | Phase ③: mid-turn assistant text block, debounced 2s. Scheduler delivers immediately; `turn_complete` deduplicates against `deliveredTexts` to avoid re-sending. |
 
 Adding or changing message types/payload fields requires updating `worker.js` header comment, `scheduler.js` handler, and this section together.
+
+### Task Card Routing
+
+- Task-card path is enabled only when a turn emits whitelisted `tool_use` blocks and the worker sends `tool_call` / `tool_result` IPC messages.
+- `chunk_type` is still decided by the worker on the first task-card tool in a turn (`TodoWrite` uses `'task'`, other tools use `'plan'`), but since v3.3 `display_mode` is always `'timeline'`; `chunk_type` remains semantic only and does not change Slack rendering.
+- `progress_update` remains the non-stream fallback/status surface for TodoWrite outside the task-card path and in failure/fallback scenarios.
+- `status_update` and task-card streaming are mutually exclusive within a turn: once the worker emits any `tool_call`, scheduler ignores later `status_update` events for that turn.
+- Pure text turns or turns without task-card-qualified tools continue through the normal `progress_update` / `intermediate_text` / final reply path.
+
+### Task Card Lifecycle
+
+- Slack task-card streams are per-turn, per-message. Orb must not reuse a prior stream across `inject` follow-up turns.
+- Scheduler opens a stream lazily on the first `tool_call`, using timeline rendering for the turn.
+- Timeline rendering is used for both TodoWrite and non-TodoWrite tool chains; each tool remains a `task_update` item and can carry `details` / `output`.
+- Before `stopStream`, any task card still left `in_progress` is converted to `error` with a timeout fallback output so cards do not remain running forever.
+- `stopStream` carries the final task-update chunks plus optional `markdown_text` and rich `blocks`; extra overflow payloads are sent as normal follow-up replies if needed.
+- If Slack returns ownership/stream-state errors such as `message_not_in_streaming_state` or `message_not_owned_by_app`, Orb degrades to normal message delivery for that turn instead of reusing the broken stream.
 
 ### Immutable Constraints
 

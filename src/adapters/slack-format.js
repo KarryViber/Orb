@@ -551,26 +551,6 @@ export function extractSuggestedPrompts(text) {
   return prompts;
 }
 
-export function buildPlanBlock(taskCardsMap) {
-  const tasks = [...(taskCardsMap?.entries?.() || [])].map(([task_id, card]) => {
-    const task = {
-      type: 'task_card',
-      task_id,
-      title: String(card?.title || 'Task').slice(0, 255),
-      status: normalizeTaskStatus(card?.status, 'in_progress'),
-    };
-    if (card?.details) task.details = richTextFromString(card.details);
-    if (card?.output) task.output = richTextFromString(card.output);
-    return task;
-  });
-
-  return {
-    type: 'plan',
-    title: 'Task progress',
-    ...(tasks.length > 0 ? { tasks } : {}),
-  };
-}
-
 function normalizeTaskStatus(status, fallback = 'in_progress') {
   if (status === 'completed') return 'complete';
   if (status === 'pending' || status === 'in_progress' || status === 'complete' || status === 'error') return status;
@@ -582,13 +562,13 @@ export function buildTaskUpdateChunks(taskCardsMap) {
     const chunk = {
       type: 'task_update',
       id: String(task_id || ''),
-      title: String(card?.title || 'Task').slice(0, 255),
+      title: String(card?.title || 'Task').slice(0, 256),
       status: normalizeTaskStatus(card?.status, 'in_progress'),
     };
     const details = String(card?.details || '').trim();
     const output = String(card?.output || '').trim();
-    if (details) chunk.details = details.slice(0, 255);
-    if (output) chunk.output = output.slice(0, 255);
+    if (details) chunk.details = details.slice(0, 256);
+    if (output) chunk.output = output.slice(0, 256);
     return chunk;
   }).filter((chunk) => chunk.id);
 }

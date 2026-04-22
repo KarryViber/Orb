@@ -26,12 +26,12 @@ import { storeConversation } from './memory.js';
  *   { type: 'progress_update', text }  — Phase ①: fired on each TodoWrite event;
  *     scheduler posts/edits a single progress message in-thread (ts owned by scheduler)
  *     only outside the task-card path / error fallback scenes.
- *   { type: 'tool_call', task_id, tool_name, title, details }  — task-card path:
+ *   { type: 'tool_call', task_id, tool_name, title, details, chunk_type, display_mode? }  — task-card path:
  *     emitted for selected tool_use blocks so scheduler can update Slack task cards.
  *   { type: 'tool_result', task_id, status, output }  — task-card path:
  *     emitted from tool_result blocks; status is 'complete' | 'error'.
  *   { type: 'status_update', text }  — short assistant thread status text;
- *     emitted when a tool starts, and cleared with empty text on turn_complete.
+ *     emitted when a tool starts outside the task-card path, and cleared with empty text on turn_complete.
  *   { type: 'turn_start' }  — explicit turn ownership start on task/inject receipt
  *   { type: 'turn_end' }  — explicit turn ownership end when Claude emits result
  *   { type: 'intermediate_text', text }  — Phase ③: mid-turn text block, debounced 2s
@@ -296,6 +296,12 @@ function truncateText(text, maxChars) {
   return `${normalized.slice(0, maxChars - 3)}...`;
 }
 
+function truncate256(text) {
+  const normalized = String(text || '').replace(/\s+\n/g, '\n').trim();
+  if (normalized.length <= 256) return normalized;
+  return `${normalized.slice(0, 255)}…`;
+}
+
 function tokenizeShellCommand(command) {
   return String(command || '')
     .match(/'[^']*'|"[^"]*"|\S+/g)
@@ -411,6 +417,10 @@ function buildToolTitle(toolName, input) {
 
   if (toolName === 'TodoWrite') return 'Plan update';
   if (toolName === 'Bash') {
+    const description = parsedInput?.description;
+    if (description && typeof description === 'string' && description.trim()) {
+      return `Bash: ${description.trim()}`;
+    }
     const command = parsedInput?.command ?? parsedInput?.cmd ?? input;
     return `Bash: ${firstNonFlagToken(command)}`;
   }
@@ -422,6 +432,10 @@ function buildToolTitle(toolName, input) {
   if (toolName === 'Skill') {
     const skillName = parsedInput?.skill_name || parsedInput?.name || parsedInput?.skill || 'unknown';
     return `Skill: ${skillName}`;
+  }
+  if (toolName === 'Task') {
+    const desc = parsedInput?.description || parsedInput?.subagent_type || 'sub-agent';
+    return `Agent: ${desc}`;
   }
   if (toolName === 'WebFetch') {
     const url = parsedInput?.url || '';
@@ -501,7 +515,16 @@ function runClaudeInteractive(args, initialContent, workspace) {
   let pendingTimer = null;
   let closed = false;
   let turnOpen = true;
+  let taskCardEmittedInTurn = false;
+  let taskCardChunkType = 'plan';
+  let taskCardDisplayMode = 'timeline';
   const pendingTaskCards = new Map();
+
+  const resetTurnStreamingState = () => {
+    taskCardEmittedInTurn = false;
+    taskCardChunkType = 'plan';
+    taskCardDisplayMode = 'timeline';
+  };
 
   const queueIntermediate = (text) => {
     if (!text?.trim() || !onIntermediateText) return;
@@ -545,19 +568,32 @@ function runClaudeInteractive(args, initialContent, workspace) {
         if (block.type === 'tool_use') {
           totalToolCount++;
           lastTool = block.name || null;
-          ipcSend({
-            type: 'status_update',
-            text: buildStatusText(block.name, block.input),
-          }).catch(() => {});
-          if (TASK_CARD_TOOLS.has(block.name) && block.id) {
-            pendingTaskCards.set(block.id, { toolName: block.name });
+          const emitsTaskCard = TASK_CARD_TOOLS.has(block.name) && block.id;
+          if (emitsTaskCard && !taskCardEmittedInTurn) {
+            taskCardChunkType = block.name === 'TodoWrite' ? 'task' : 'plan';
+            taskCardDisplayMode = 'timeline';
+          }
+          if (!taskCardEmittedInTurn && !emitsTaskCard) {
             ipcSend({
+              type: 'status_update',
+              text: buildStatusText(block.name, block.input),
+            }).catch(() => {});
+          }
+          if (emitsTaskCard) {
+            pendingTaskCards.set(block.id, { toolName: block.name });
+            const taskCardPayload = {
               type: 'tool_call',
               task_id: block.id,
               tool_name: block.name,
-              title: buildToolTitle(block.name, block.input),
-              details: summarizeToolDetails(block.name, block.input),
-            }).catch(() => {});
+              title: truncate256(buildToolTitle(block.name, block.input)),
+              details: truncate256(summarizeToolDetails(block.name, block.input)),
+              chunk_type: taskCardChunkType,
+            };
+            if (!taskCardEmittedInTurn) {
+              taskCardPayload.display_mode = taskCardDisplayMode;
+            }
+            ipcSend(taskCardPayload).catch(() => {});
+            taskCardEmittedInTurn = true;
           }
           if (block.name === 'TodoWrite' && Array.isArray(block.input?.todos)) {
             ipcSend({ type: 'progress_update', text: renderTodos(block.input.todos) }).catch(() => {});
@@ -572,7 +608,7 @@ function runClaudeInteractive(args, initialContent, workspace) {
           type: 'tool_result',
           task_id: block.tool_use_id,
           status: block.is_error ? 'error' : 'complete',
-          output: truncateText(extractToolResultText(block.content), 500),
+          output: truncate256(extractToolResultText(block.content)),
         }).catch(() => {});
         pendingTaskCards.delete(block.tool_use_id);
       }
@@ -606,6 +642,7 @@ function runClaudeInteractive(args, initialContent, workspace) {
         lastTurnText = turnText;
       }
       ipcSend({ type: 'status_update', text: '' }).catch(() => {});
+      resetTurnStreamingState();
       deliveredTexts = [];
       accumulatedDelivered = '';
       turnBuffer = [];
@@ -623,6 +660,7 @@ function runClaudeInteractive(args, initialContent, workspace) {
 
   function inject(userText, fileContent, imagePaths) {
     if (closed) return false;
+    resetTurnStreamingState();
     const content = buildUserContent({ userText, fileContent, imagePaths, workspace });
     const msg = JSON.stringify({ type: 'user', message: { role: 'user', content } });
     child.stdin.write(msg + '\n');
@@ -659,6 +697,7 @@ function runClaudeInteractive(args, initialContent, workspace) {
   });
 
   // Send initial message (do NOT close stdin)
+  resetTurnStreamingState();
   const initMsg = JSON.stringify({ type: 'user', message: { role: 'user', content: initialContent } });
   child.stdin.write(initMsg + '\n');
   resetIdleTimer();
