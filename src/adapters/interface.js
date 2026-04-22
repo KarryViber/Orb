@@ -5,8 +5,6 @@ export class PlatformAdapter {
   async editMessage(channel, ts, text, extra) { throw new Error('not implemented'); }
   async uploadFile(channel, threadTs, filePath, filename) { throw new Error('not implemented'); }
   async setTyping(channel, threadTs, status) { throw new Error('not implemented'); }
-  async startTypingIndicator(channel, threadTs) { return this.setTyping(channel, threadTs, 'thinking…'); }
-  async stopTypingIndicator(channel, threadTs) { return this.setTyping(channel, threadTs, ''); }
   async sendApproval(channel, threadTs, prompt) { throw new Error('not implemented'); }
   buildPayloads(text) { throw new Error('not implemented'); }
   async cleanupIndicator(channel, threadTs, typingSet, errorMsg) { throw new Error('not implemented'); }

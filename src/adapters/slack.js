@@ -1383,14 +1383,18 @@ export class SlackAdapter extends PlatformAdapter {
     }
   }
 
-  async setThreadStatus(channel, threadTs, status) {
+  async setThreadStatus(channel, threadTs, status, loadingMessages) {
     if (!channel || !threadTs) return;
     try {
-      await this._slack.apiCall('assistant.threads.setStatus', {
+      const payload = {
         channel_id: channel,
         thread_ts: threadTs,
         status: String(status || ''),
-      });
+      };
+      if (Array.isArray(loadingMessages) && loadingMessages.length > 0) {
+        payload.loading_messages = loadingMessages.slice(0, 10).map(String);
+      }
+      await this._slack.apiCall('assistant.threads.setStatus', payload);
     } catch (_) {}
   }
 
@@ -1425,21 +1429,7 @@ export class SlackAdapter extends PlatformAdapter {
   }
 
   async setTyping(channel, threadTs, status) {
-    if (status) {
-      await this.startTypingIndicator(channel, threadTs).catch(() => {});
-      return;
-    }
-    await this.stopTypingIndicator(channel, threadTs).catch(() => {});
-  }
-
-  async startTypingIndicator(channel, threadTs) {
-    // Typing bubble disabled: redundant with task card and message stream.
-    return;
-  }
-
-  async stopTypingIndicator(channel, threadTs) {
-    if (!channel || !threadTs) return;
-    await this.setThreadStatus(channel, threadTs, '');
+    await this.setThreadStatus(channel, threadTs, status);
   }
 
   buildPayloads(text) {
@@ -1447,7 +1437,7 @@ export class SlackAdapter extends PlatformAdapter {
   }
 
   async cleanupIndicator(channel, threadTs, typingSet, errorMsg) {
-    if (typingSet) await this.stopTypingIndicator(channel, threadTs).catch(() => {});
+    if (typingSet) await this.setThreadStatus(channel, threadTs, '').catch(() => {});
     try {
       await this._postReply(channel, threadTs, `:warning: ${errorMsg}`);
     } catch (err) {
