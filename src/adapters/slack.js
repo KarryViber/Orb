@@ -1326,8 +1326,6 @@ export class SlackAdapter extends PlatformAdapter {
       }
       throw buildStreamAPIError('appendStream', result?.error || 'unknown_error');
     }
-    info(TAG, `[stream-debug] append result: ${JSON.stringify(result)}`);
-    info(TAG, `[stream-debug] sent chunks: ${JSON.stringify(normalizedChunks)}`);
   }
 
   async stopStream(streamId, { markdown_text, blocks, chunks, final_blocks } = {}) {
