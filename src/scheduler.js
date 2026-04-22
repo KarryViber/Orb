@@ -1136,6 +1136,12 @@ export class Scheduler {
                 await stopTaskCardStream(text);
                 turnDelivered = true;
               }
+              // 正常流程：turn_complete 已交付内容后，CLI exit 的空 result 是预期的收尾信号
+              // 不是真·失败，不应该触发 auto-continue
+              if (!text && turnDelivered) {
+                this._autoContinueCount.delete(threadTs);
+                return;
+              }
               if (!text) {
                 const retries = this._autoContinueCount.get(threadTs) || 0;
                 if (retries < MAX_AUTO_CONTINUE) {
