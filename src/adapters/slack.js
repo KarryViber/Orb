@@ -1425,8 +1425,8 @@ export class SlackAdapter extends PlatformAdapter {
   }
 
   async startTypingIndicator(channel, threadTs) {
-    // Typing bubble disabled: redundant with task card and message stream.
-    return;
+    if (!channel || !threadTs) return;
+    await this.setThreadStatus(channel, threadTs, 'Cooking…');
   }
 
   async stopTypingIndicator(channel, threadTs) {
