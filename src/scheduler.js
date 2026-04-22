@@ -1132,8 +1132,13 @@ export class Scheduler {
                 if (retries < MAX_AUTO_CONTINUE) {
                   this._autoContinueCount.set(threadTs, retries + 1);
                   warn(TAG, `empty result, auto-continue ${retries + 1}/${MAX_AUTO_CONTINUE} for thread=${threadTs}`);
-                  if (!deferDeliveryUntilResult) {
+                  const suppressAutoContinueNotice = platform === 'slack'
+                    && typeof channel === 'string'
+                    && channel.startsWith('D');
+                  if (!deferDeliveryUntilResult && !suppressAutoContinueNotice) {
                     await adapter.sendReply(channel, effectiveThreadTs, `⏳ 回合上限已达${msg.stopReason === 'tool_use' ? '（任务执行中）' : msg.lastTool ? '（正在: ' + msg.lastTool + '）' : ''}，自动续接中 (${retries + 1}/${MAX_AUTO_CONTINUE})…`).catch(() => {});
+                  } else if (suppressAutoContinueNotice) {
+                    info(TAG, `empty result auto-continue notice suppressed in Slack DM: thread=${threadTs}`);
                   }
                   // Defer submit to onExit — avoid race with worker's process.exit(0)
                   pendingAutoContinue = {
