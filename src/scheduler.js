@@ -913,6 +913,7 @@ export class Scheduler {
 
           if (msg.type === 'turn_start') {
             metadataUpdatedForTurn = false;
+            progressTs = null;
             await startTyping();
             return;
           }
