@@ -720,10 +720,11 @@ export class Scheduler {
       const finalText = String(text || '').trim();
       const finalPayloads = buildFinalTextPayloads(finalText);
       const primaryPayload = finalPayloads.shift() || null;
+      const hasBlocks = !!primaryPayload?.blocks?.length;
       const stopPayload = {
         chunks: buildTaskCardChunks(),
-        ...(finalText ? { markdown_text: finalText } : {}),
-        ...(primaryPayload?.blocks?.length ? { blocks: primaryPayload.blocks } : {}),
+        ...(finalText && !hasBlocks ? { markdown_text: finalText } : {}),
+        ...(hasBlocks ? { blocks: primaryPayload.blocks } : {}),
       };
       await adapter.stopStream(taskCardState.streamId, stopPayload);
       resetTaskCardState();
@@ -858,7 +859,6 @@ export class Scheduler {
 
           if (msg.type === 'status_update') {
             if (deferDeliveryUntilResult) return;
-            if (taskCardState.enabled) return;
             await applyThreadStatus(msg.text || '');
             return;
           }
