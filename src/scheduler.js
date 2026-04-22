@@ -730,7 +730,21 @@ export class Scheduler {
         ...(finalText && !hasBlocks ? { markdown_text: finalText } : {}),
         ...(hasBlocks ? { blocks: primaryPayload.blocks } : {}),
       };
-      await adapter.stopStream(taskCardState.streamId, stopPayload);
+      try {
+        await adapter.stopStream(taskCardState.streamId, stopPayload);
+      } catch (err) {
+        const failure = classifyTaskCardStreamError(err);
+        if (failure.code === 'message_not_in_streaming_state' || failure.code === 'message_not_owned_by_app') {
+          warn(TAG, `stopStream degraded to plain message: ${err.message}`);
+          taskCardState.failed = true;
+          if (finalText && primaryPayload) await emitPayload(primaryPayload);
+          else if (finalText) await adapter.sendReply(channel, effectiveThreadTs, finalText);
+          resetTaskCardState();
+          for (const payload of finalPayloads) await emitPayload(payload);
+          return true;
+        }
+        throw err;
+      }
       resetTaskCardState();
       for (const payload of finalPayloads) {
         await emitPayload(payload);
