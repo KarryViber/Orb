@@ -69,18 +69,23 @@ export function markdownToMrkdwn(text) {
     return `\x00BD${boldMarks.length - 1}\x00`;
   });
 
-  // Italic: single *text* → _text_ (only matches genuine italic, not converted bold)
-  // Also fix CJK boundary (same reason as bold above)
+  // Italic: single *text* → _text_ (only matches genuine italic, not converted bold).
+  // If inner contains CJK, preserve *text* — Slack mrkdwn uses * for bold, so
+  // agents that already write Slack-style bold stay idempotent instead of
+  // silently flipping to italic. ZWSP is inserted OUTSIDE the stars only.
   result = result.replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g, (match, inner, offset, str) => {
     const before = str[offset - 1] || '';
     const after = str[offset + match.length] || '';
-    let out = `_${inner}_`;
+    const innerHasCjk = CJK_BOUNDARY.test(inner);
+    let out = innerHasCjk ? `*${inner}*` : `_${inner}_`;
     if (CJK_BOUNDARY.test(before)) out = '\u200b' + out;
     if (CJK_BOUNDARY.test(after)) out = out + '\u200b';
     return out;
   });
 
-  // Restore bold with CJK boundary awareness
+  // Restore bold with CJK boundary awareness.
+  // Invariant: ZWSP is only inserted OUTSIDE the stars (`\u200b*X*\u200b`),
+  // never between them, so adjacent output never produces `**X*\u200b*`.
   result = result.replace(/\x00BD(\d+)\x00/g, (match, i, offset, str) => {
     const before = str[offset - 1] || '';
     const after = str[offset + match.length] || '';
