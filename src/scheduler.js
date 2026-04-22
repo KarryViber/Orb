@@ -724,6 +724,9 @@ export class Scheduler {
       if (failure.level === 'warn') warn(TAG, `[task_card] stream degraded: ${detail}`);
       else logError(TAG, `[task_card] stream failed: ${detail}`);
       taskCardState.failureNotified = true;
+      if (typingActive) {
+        await startThreadStatusRefresh().catch(() => {});
+      }
     };
 
     const disableTaskCardStreaming = (mode) => {
