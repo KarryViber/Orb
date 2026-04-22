@@ -771,10 +771,13 @@ export class Scheduler {
       }
     };
 
-    const appendTaskCardPlan = async () => {
+    const appendTaskCardPlan = async (task_id) => {
       if (!taskCardState.streamId || taskCardState.failed) return false;
+      const card = taskCardState.taskCards.get(task_id);
+      if (!card) return false;
       try {
-        await adapter.appendStream(taskCardState.streamId, buildTaskCardChunks());
+        const single = new Map([[task_id, card]]);
+        await adapter.appendStream(taskCardState.streamId, buildTaskUpdateChunks(single));
         armKeepalive();
         return true;
       } catch (err) {
@@ -1015,7 +1018,7 @@ export class Scheduler {
               taskCardState.bubbleCleared = true;
             }
             if (streamReady && hadStream) {
-              await appendTaskCardPlan();
+              await appendTaskCardPlan(msg.task_id);
             }
             return;
           }
@@ -1028,7 +1031,7 @@ export class Scheduler {
             taskCard.output = msg.output || '';
             if (!taskCardState.enabled) return;
             if (taskCardState.streamId) {
-              await appendTaskCardPlan();
+              await appendTaskCardPlan(msg.task_id);
             }
             return;
           }
