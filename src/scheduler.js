@@ -583,6 +583,7 @@ export class Scheduler {
     const applyThreadStatus = async (status) => {
       pendingThreadStatus = String(status || '');
       if (!canManageThreadStatus || !effectiveThreadTs) return;
+      info(TAG, `[typing-trace] applyThreadStatus(${JSON.stringify(pendingThreadStatus)}) thread=${effectiveThreadTs}`);
       try {
         await adapter.setThreadStatus(channel, effectiveThreadTs, pendingThreadStatus);
       } catch (err) {
@@ -629,23 +630,32 @@ export class Scheduler {
     };
 
     const stopTyping = async () => {
+      info(TAG, `[typing-trace] stopTyping() entered typingActive=${typingActive} hasInterval=${!!typingInterval} deferDeliveryUntilResult=${deferDeliveryUntilResult}`);
       if (deferDeliveryUntilResult) return;
-      if (!typingActive && !typingInterval) return;
+      if (!typingActive && !typingInterval) {
+        info(TAG, '[typing-trace] stopTyping() early-return: not active, no interval');
+        return;
+      }
       if (canUseTypingIndicator) {
         try {
           await adapter.stopTypingIndicator(channel, effectiveThreadTs);
         } catch (err) {
           warn(TAG, `failed to stop typing indicator: ${err.message}`);
         }
+        info(TAG, `[typing-trace] stopTyping() stopTypingIndicator completed thread=${effectiveThreadTs}`);
         typingActive = false;
       }
       if (typingInterval) {
+        info(TAG, `[typing-trace] stopTyping() clearing typingInterval thread=${effectiveThreadTs}`);
         clearInterval(typingInterval);
         typingInterval = null;
+        info(TAG, `[typing-trace] stopTyping() cleared typingInterval thread=${effectiveThreadTs}`);
       }
       if (canManageThreadStatus) {
         typingActive = false;
+        info(TAG, `[typing-trace] stopTyping() before applyThreadStatus(\"\") thread=${effectiveThreadTs}`);
         await applyThreadStatus('');
+        info(TAG, `[typing-trace] stopTyping() after applyThreadStatus(\"\") thread=${effectiveThreadTs}`);
         return;
       }
       typingActive = false;
@@ -775,7 +785,9 @@ export class Scheduler {
         ...(finalText ? { markdown_text: finalText } : {}),
         ...(primaryPayload?.blocks?.length ? { blocks: primaryPayload.blocks } : {}),
       };
+      info(TAG, `[typing-trace] before stopStream stream=${taskCardState.streamId} thread=${effectiveThreadTs}`);
       await adapter.stopStream(taskCardState.streamId, stopPayload);
+      info(TAG, `[typing-trace] after stopStream stream=${taskCardState.streamId} thread=${effectiveThreadTs}`);
       resetTaskCardState();
       for (const payload of finalPayloads) {
         await emitPayload(payload);
@@ -838,7 +850,9 @@ export class Scheduler {
               markdown_text: text,
               ...(primaryPayload?.blocks?.length ? { blocks: primaryPayload.blocks } : {}),
             };
+            info(TAG, `[typing-trace] before stopStream stream=${stream?.stream_id || 'unknown'} thread=${effectiveThreadTs}`);
             await adapter.stopStream(stream?.stream_id, stopPayload);
+            info(TAG, `[typing-trace] after stopStream stream=${stream?.stream_id || 'unknown'} thread=${effectiveThreadTs}`);
             for (const payload of finalPayloads) {
               await emitPayload(payload);
             }
@@ -963,6 +977,7 @@ export class Scheduler {
           }
 
           if (msg.type === 'turn_end') {
+            info(TAG, `[typing-trace] received turn_end from worker thread=${threadTs}`);
             await stopTyping();
             return;
           }
