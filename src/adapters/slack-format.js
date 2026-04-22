@@ -195,13 +195,21 @@ function shouldUseBlocks(text) {
 
 /**
  * Generate compact fallback text for push notifications (max 180 chars).
- * Strips code fences and header markers.
+ * Strips code fences, inline code, header markers, and markdown emphasis so
+ * notifications don't display literal `**X**` / `~~Y~~` noise.
  */
 function buildFallbackText(text) {
   const stripped = text
     .replace(/```[\s\S]*?```/g, '[代码]')
-    .replace(/`[^`]+`/g, '[代码]')
-    .replace(/【([^\]]+)】/g, '$1');
+    .replace(/【([^\]]+)】/g, '$1')
+    .replace(/\*\*(.+?)\*\*/g, '$1')
+    .replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g, '$1')
+    .replace(/__(.+?)__/g, '$1')
+    .replace(/(?<!_)_(?!_)(.+?)(?<!_)_(?!_)/g, '$1')
+    .replace(/~~(.+?)~~/g, '$1')
+    .replace(/(?<!~)~(?!~)(.+?)(?<!~)~(?!~)/g, '$1')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/​/g, '');
   const firstLine = stripped.split('\n').find((l) => l.trim()) || '';
   const clean = firstLine.trim();
   return clean.length <= FALLBACK_MAX ? clean : clean.slice(0, FALLBACK_MAX - 1) + '…';
