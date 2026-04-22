@@ -19,6 +19,13 @@ const SHUTDOWN_QUEUE_FILE = 'shutdown-queue.json';
 const SHUTDOWN_QUEUE_VERSION = 2;
 const SILENT_PREFIX = '[SILENT]';
 const THINKING_STATUS = 'Cooking…';
+const LOADING_MESSAGES = [
+  'Cooking…',
+  'Reading files…',
+  'Thinking…',
+  'Working on it…',
+  'Analyzing…',
+];
 
 // --- Effort escalation keywords ---
 // 命中任一关键词且消息长度 > 20 字 → 升到 xhigh
@@ -531,7 +538,6 @@ export class Scheduler {
     // 默认 low（若前面都没设）
     if (!effectiveEffort) effectiveEffort = 'low';
 
-    let typingInterval = null;
     let typingActive = false;
     let responded = false;
     let turnDelivered = false;
@@ -549,10 +555,6 @@ export class Scheduler {
       && platform === 'slack'
       && channel != null
       && typeof adapter?.setThreadStatus === 'function';
-    const canUseTypingIndicator = platform === 'slack'
-      && !deferDeliveryUntilResult
-      && typeof adapter?.startTypingIndicator === 'function'
-      && typeof adapter?.stopTypingIndicator === 'function';
     const taskCardState = {
       enabled: !deferDeliveryUntilResult
         && platform === 'slack' && channel != null && hasTaskCardThread()
@@ -572,6 +574,7 @@ export class Scheduler {
       failed: false,
       failureNotified: false,
       missingThreadWarned: false,
+      bubbleCleared: false,
     };
 
     const settleCompletion = (method, payload) => {
@@ -580,11 +583,11 @@ export class Scheduler {
       task._completion?.[method]?.(payload);
     };
 
-    const applyThreadStatus = async (status) => {
+    const applyThreadStatus = async (status, loadingMessages) => {
       pendingThreadStatus = String(status || '');
       if (!canManageThreadStatus || !effectiveThreadTs) return;
       try {
-        await adapter.setThreadStatus(channel, effectiveThreadTs, pendingThreadStatus);
+        await adapter.setThreadStatus(channel, effectiveThreadTs, pendingThreadStatus, loadingMessages);
       } catch (err) {
         warn(TAG, `failed to set thread status: ${err.message}`);
       }
@@ -592,64 +595,20 @@ export class Scheduler {
 
     const startThreadStatusRefresh = async (status = THINKING_STATUS) => {
       if (!canManageThreadStatus) return;
-      await applyThreadStatus(status);
-      if (typingInterval) return;
-      typingInterval = setInterval(async () => {
-        await applyThreadStatus(pendingThreadStatus || status);
-      }, 5_000);
+      await applyThreadStatus(status, LOADING_MESSAGES);
     };
 
     const startTyping = async () => {
       if (deferDeliveryUntilResult) return;
       await startThreadStatusRefresh();
-      if (typingActive) return;
-      if (canUseTypingIndicator) {
-        if (platform === 'slack' && String(channel || '').startsWith('D')) {
-          if (!pendingThreadStatus) pendingThreadStatus = THINKING_STATUS;
-          if (pendingThreadStatus !== THINKING_STATUS) return;
-        }
-        try {
-          await adapter.startTypingIndicator(channel, effectiveThreadTs);
-          typingActive = true;
-        } catch (err) {
-          warn(TAG, `failed to start typing indicator: ${err.message}`);
-        }
-        return;
-      }
-      if (canManageThreadStatus) {
-        typingActive = true;
-        return;
-      }
-      if (typingInterval) return;
-      try { await adapter.setTyping(channel, effectiveThreadTs, THINKING_STATUS); } catch (_) {}
       typingActive = true;
-      typingInterval = setInterval(async () => {
-        try { await adapter.setTyping(channel, effectiveThreadTs, THINKING_STATUS); } catch (_) {}
-      }, 5_000);
     };
 
     const stopTyping = async () => {
       if (deferDeliveryUntilResult) return;
-      if (!typingActive && !typingInterval) return;
-      if (canUseTypingIndicator) {
-        try {
-          await adapter.stopTypingIndicator(channel, effectiveThreadTs);
-        } catch (err) {
-          warn(TAG, `failed to stop typing indicator: ${err.message}`);
-        }
-        typingActive = false;
-      }
-      if (typingInterval) {
-        clearInterval(typingInterval);
-        typingInterval = null;
-      }
-      if (canManageThreadStatus) {
-        typingActive = false;
-        await applyThreadStatus('');
-        return;
-      }
+      if (!typingActive) return;
       typingActive = false;
-      try { await adapter.setTyping(channel, effectiveThreadTs, ''); } catch (_) {}
+      await applyThreadStatus('');
     };
 
     const resetTaskCardState = () => {
@@ -660,6 +619,7 @@ export class Scheduler {
       taskCardState.taskCards.clear();
       taskCardState.failed = false;
       taskCardState.failureNotified = false;
+      taskCardState.bubbleCleared = false;
     };
 
     const failTaskCardStream = async (err) => {
@@ -718,7 +678,6 @@ export class Scheduler {
         });
         taskCardState.streamId = stream?.stream_id || null;
         if (!effectiveThreadTs && stream?.ts) effectiveThreadTs = stream.ts;
-        if (pendingThreadStatus) await applyThreadStatus(pendingThreadStatus);
         return Boolean(taskCardState.streamId);
       } catch (err) {
         await failTaskCardStream(err);
@@ -932,7 +891,12 @@ export class Scheduler {
             });
             if (!taskCardState.enabled) return;
             const hadStream = Boolean(taskCardState.streamId);
-            if (await ensureTaskCardStream() && hadStream) {
+            const streamReady = await ensureTaskCardStream();
+            if (streamReady && !taskCardState.bubbleCleared) {
+              await applyThreadStatus('');
+              taskCardState.bubbleCleared = true;
+            }
+            if (streamReady && hadStream) {
               await appendTaskCardPlan();
             }
             return;
@@ -953,11 +917,6 @@ export class Scheduler {
 
           if (msg.type === 'turn_start') {
             metadataUpdatedForTurn = false;
-            if (taskCardState.enabled) {
-              await startThreadStatusRefresh();
-              await startTyping();
-              return;
-            }
             await startTyping();
             return;
           }
