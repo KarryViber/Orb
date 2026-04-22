@@ -1107,7 +1107,8 @@ export class Scheduler {
               }
             } catch (err) {
               await stopTyping();
-              logError(TAG, `failed to send result: ${err.message}`);
+              const errCode = typeof getTaskCardStreamErrorCode === 'function' ? getTaskCardStreamErrorCode(err) : null;
+              logError(TAG, `failed to send result: ${err.message}${errCode ? ` (code=${errCode})` : ''}`);
               await adapter.sendReply(channel, effectiveThreadTs, ':warning: 回复发送失败。').catch(() => {});
             }
             if (msg.toolCount > 0) {
