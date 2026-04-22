@@ -859,6 +859,7 @@ export class Scheduler {
 
           if (msg.type === 'status_update') {
             if (deferDeliveryUntilResult) return;
+            if (taskCardState.streamId && !taskCardState.failed) return;
             await applyThreadStatus(msg.text || '');
             return;
           }
