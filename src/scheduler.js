@@ -18,7 +18,7 @@ const PERMISSION_APPROVAL_TIMEOUT_MS = parseInt(process.env.ORB_PERMISSION_TIMEO
 const SHUTDOWN_QUEUE_FILE = 'shutdown-queue.json';
 const SHUTDOWN_QUEUE_VERSION = 2;
 const SILENT_PREFIX = '[SILENT]';
-const THINKING_STATUS = 'Orb is thinking…';
+const THINKING_STATUS = 'Cooking…';
 
 // --- Effort escalation keywords ---
 // 命中任一关键词且消息长度 > 20 字 → 升到 xhigh
