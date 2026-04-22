@@ -815,8 +815,20 @@ export class Scheduler {
             return true;
           } catch (err) {
             const failure = classifyTaskCardStreamError(err);
-            if (failure.level === 'warn') warn(TAG, `deferred task_card delivery degraded: ${err.message}`);
-            else logError(TAG, `deferred task_card delivery failed: ${err.message}`);
+            if (failure.level === 'warn') {
+              warn(TAG, `deferred task_card delivery degraded to plain message: ${err.message}`);
+              taskCardState.failed = true;
+              try {
+                const fallbackPayloads = buildFinalTextPayloads(text);
+                for (const payload of fallbackPayloads) await emitPayload(payload);
+                resetTaskCardState();
+                return true;
+              } catch (fallbackErr) {
+                logError(TAG, `deferred fallback delivery failed: ${fallbackErr.message}`);
+              }
+            } else {
+              logError(TAG, `deferred task_card delivery failed: ${err.message}`);
+            }
           }
         }
       }
