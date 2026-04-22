@@ -573,12 +573,10 @@ function runClaudeInteractive(args, initialContent, workspace) {
             taskCardChunkType = block.name === 'TodoWrite' ? 'task' : 'plan';
             taskCardDisplayMode = 'timeline';
           }
-          if (!taskCardEmittedInTurn && !emitsTaskCard) {
-            ipcSend({
-              type: 'status_update',
-              text: buildStatusText(block.name, block.input),
-            }).catch(() => {});
-          }
+          ipcSend({
+            type: 'status_update',
+            text: buildStatusText(block.name, block.input),
+          }).catch(() => {});
           if (emitsTaskCard) {
             pendingTaskCards.set(block.id, { toolName: block.name });
             const taskCardPayload = {
