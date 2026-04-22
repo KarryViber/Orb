@@ -16,6 +16,7 @@ const MEMORY_SYNC_INTERVAL = 6 * 60 * 60 * 1000;  // min 6h between syncs per pr
 const MAX_AUTO_CONTINUE = 2;  // max auto-retries on empty result (context overflow)
 const PERMISSION_APPROVAL_TIMEOUT_MS = parseInt(process.env.ORB_PERMISSION_TIMEOUT_MS, 10) || 300_000;
 const STREAM_KEEPALIVE_MS = 20_000;
+const STATUS_REFRESH_MS = 20_000;
 const SHUTDOWN_QUEUE_FILE = 'shutdown-queue.json';
 const SHUTDOWN_QUEUE_VERSION = 2;
 const SILENT_PREFIX = '[SILENT]';
@@ -549,6 +550,8 @@ export class Scheduler {
     let pendingAutoContinue = null;
     let effectiveThreadTs = task.deliveryThreadTs === undefined ? (threadTs || null) : task.deliveryThreadTs;
     let pendingThreadStatus = '';
+    let pendingStatusLoadingMessages = null;
+    let statusRefreshTimer = null;
     let turnCount = 0;
     let metadataUpdatedForTurn = false;
     let finalResultText = '';
@@ -588,13 +591,39 @@ export class Scheduler {
       task._completion?.[method]?.(payload);
     };
 
+    const clearStatusRefresh = () => {
+      if (statusRefreshTimer) {
+        clearTimeout(statusRefreshTimer);
+        statusRefreshTimer = null;
+      }
+    };
+    const armStatusRefresh = () => {
+      clearStatusRefresh();
+      if (!canManageThreadStatus || !effectiveThreadTs) return;
+      if (!pendingThreadStatus) return;
+      statusRefreshTimer = setTimeout(async () => {
+        statusRefreshTimer = null;
+        if (!pendingThreadStatus || !canManageThreadStatus || !effectiveThreadTs) return;
+        try {
+          await adapter.setThreadStatus(channel, effectiveThreadTs, pendingThreadStatus, pendingStatusLoadingMessages || undefined);
+          armStatusRefresh();
+        } catch (err) {
+          warn(TAG, `status refresh failed: ${err.message}`);
+        }
+      }, STATUS_REFRESH_MS);
+    };
+
     const applyThreadStatus = async (status, loadingMessages) => {
       pendingThreadStatus = String(status || '');
+      pendingStatusLoadingMessages = Array.isArray(loadingMessages) ? loadingMessages : null;
       if (!canManageThreadStatus || !effectiveThreadTs) return;
       try {
         await adapter.setThreadStatus(channel, effectiveThreadTs, pendingThreadStatus, loadingMessages);
+        if (pendingThreadStatus) armStatusRefresh();
+        else clearStatusRefresh();
       } catch (err) {
         warn(TAG, `failed to set thread status: ${err.message}`);
+        clearStatusRefresh();
       }
     };
 
