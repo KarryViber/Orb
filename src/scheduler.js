@@ -89,18 +89,26 @@ function classifyTaskCardStreamError(err) {
 }
 
 function resolveTaskCardDisplayMode(chunkType, fallback = 'timeline') {
-  if (chunkType === 'task') return 'timeline';
+  if (chunkType === 'task') return 'plan';
   return fallback;
 }
 
-function makeTaskCardState({ enabled = false, deferred = false } = {}) {
+function normalizeTaskCardStatus(status, fallback = 'pending') {
+  if (status === 'completed') return 'complete';
+  if (status === 'pending' || status === 'in_progress' || status === 'complete' || status === 'error') return status;
+  return fallback;
+}
+
+export function makeTaskCardState({ enabled = false, deferred = false } = {}) {
   return {
     enabled: Boolean(enabled),
     deferred: Boolean(deferred),
     streamId: null,
     streamTs: null,
+    startStreamPromise: null,
     chunkType: null,
     displayMode: null,
+    planTitle: '',
     taskCards: new Map(),
     failed: false,
     failureNotified: false,
@@ -108,6 +116,72 @@ function makeTaskCardState({ enabled = false, deferred = false } = {}) {
     bubbleCleared: false,
     keepaliveTimer: null,
   };
+}
+
+export function buildTaskCardChunksFromState(taskCardState, { updateOnly = false, includePlanUpdate = true } = {}) {
+  const chunks = [];
+  if (includePlanUpdate && taskCardState?.displayMode === 'plan') {
+    const planTitle = String(taskCardState?.planTitle || '').trim();
+    if (planTitle) chunks.push({ type: 'plan_update', title: planTitle });
+  }
+  return chunks.concat(buildTaskUpdateChunks(taskCardState?.taskCards, { updateOnly }));
+}
+
+export function replaceTaskCardSnapshotRows(rows) {
+  const next = new Map();
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const taskId = String(row?.task_id || row?.id || '').trim();
+    if (!taskId) continue;
+    next.set(taskId, {
+      title: String(row?.title || row?.text || 'Task').slice(0, 256),
+      details: '',
+      status: normalizeTaskCardStatus(row?.status),
+      output: String(row?.output || '').trim().slice(0, 256),
+    });
+  }
+  return next;
+}
+
+export async function ensureTaskCardStreamStarted({
+  taskCardState,
+  hasTaskCardThread,
+  disableTaskCardStreaming,
+  adapter,
+  channel,
+  effectiveThreadTs,
+  teamId = null,
+  buildTaskCardChunks,
+  armKeepalive,
+  failTaskCardStream,
+  onStreamStarted,
+}) {
+  if (!taskCardState.enabled || taskCardState.failed) return false;
+  if (!hasTaskCardThread()) {
+    disableTaskCardStreaming('live');
+    return false;
+  }
+  if (taskCardState.streamId) return true;
+  if (taskCardState.startStreamPromise) return taskCardState.startStreamPromise;
+  taskCardState.startStreamPromise = (async () => {
+    try {
+      const stream = await adapter.startStream(channel, effectiveThreadTs, {
+        task_display_mode: taskCardState.displayMode || resolveTaskCardDisplayMode(taskCardState.chunkType, 'timeline'),
+        initial_chunks: buildTaskCardChunks(),
+        team_id: teamId,
+      });
+      taskCardState.streamId = stream?.stream_id || null;
+      taskCardState.streamTs = stream?.ts || null;
+      if (typeof onStreamStarted === 'function') onStreamStarted(stream);
+      if (taskCardState.streamId) armKeepalive();
+      return Boolean(taskCardState.streamId);
+    } catch (err) {
+      await failTaskCardStream(err);
+      return false;
+    } finally {
+      taskCardState.startStreamPromise = null;
+    }
+  })();
+  return taskCardState.startStreamPromise;
 }
 
 function makeTurnState(log, taskCardConfig) {
@@ -709,8 +783,10 @@ export class Scheduler {
       // Slack streaming is per-message; every turn starts a fresh stream.
       turn.taskCardState.streamId = null;
       turn.taskCardState.streamTs = null;
+      turn.taskCardState.startStreamPromise = null;
       turn.taskCardState.chunkType = null;
       turn.taskCardState.displayMode = null;
+      turn.taskCardState.planTitle = '';
       turn.taskCardState.taskCards.clear();
       turn.taskCardState.failed = false;
       turn.taskCardState.failureNotified = false;
@@ -734,9 +810,11 @@ export class Scheduler {
       turn.egress.reset(); // [EGF-2] stream 失败后清空 fingerprints，避免污染 fallback 路径的 final/后续 intermediate
       turn.taskCardState.streamId = null;
       turn.taskCardState.streamTs = null;
+      turn.taskCardState.startStreamPromise = null;
       clearKeepalive();
       turn.taskCardState.chunkType = null;
       turn.taskCardState.displayMode = null;
+      turn.taskCardState.planTitle = '';
       if (fallbackMarkdown) {
         let edited = false;
         if (editableTs && typeof adapter?.editMessage === 'function') {
@@ -773,39 +851,37 @@ export class Scheduler {
       turn.taskCardState.enabled = false;
       turn.taskCardState.deferred = false;
       turn.taskCardState.streamId = null;
+      turn.taskCardState.startStreamPromise = null;
       turn.taskCardState.chunkType = null;
       turn.taskCardState.displayMode = null;
+      turn.taskCardState.planTitle = '';
       turn.taskCardState.taskCards.clear();
       clearKeepalive();
     };
 
-    const buildTaskCardChunks = () => {
-      return buildTaskUpdateChunks(turn.taskCardState.taskCards);
+    const buildTaskCardChunks = ({ updateOnly = false, includePlanUpdate = true } = {}) => (
+      buildTaskCardChunksFromState(turn.taskCardState, { updateOnly, includePlanUpdate })
+    );
+
+    const replaceTaskCardSnapshot = (rows) => {
+      turn.taskCardState.taskCards = replaceTaskCardSnapshotRows(rows);
     };
 
-    const ensureTaskCardStream = async () => {
-      if (!turn.taskCardState.enabled || turn.taskCardState.failed) return false;
-      if (!hasTaskCardThread()) {
-        disableTaskCardStreaming('live');
-        return false;
-      }
-      if (turn.taskCardState.streamId) return true;
-      try {
-        const stream = await adapter.startStream(channel, effectiveThreadTs, {
-          task_display_mode: turn.taskCardState.displayMode || resolveTaskCardDisplayMode(turn.taskCardState.chunkType, 'timeline'),
-          initial_chunks: buildTaskCardChunks(),
-          team_id: task.teamId || null,
-        });
-        turn.taskCardState.streamId = stream?.stream_id || null;
-        turn.taskCardState.streamTs = stream?.ts || null;
+    const ensureTaskCardStream = async () => ensureTaskCardStreamStarted({
+      taskCardState: turn.taskCardState,
+      hasTaskCardThread,
+      disableTaskCardStreaming,
+      adapter,
+      channel,
+      effectiveThreadTs,
+      teamId: task.teamId || null,
+      buildTaskCardChunks: () => buildTaskCardChunks(),
+      armKeepalive,
+      failTaskCardStream,
+      onStreamStarted: (stream) => {
         if (!effectiveThreadTs && stream?.ts) effectiveThreadTs = stream.ts;
-        if (turn.taskCardState.streamId) armKeepalive();
-        return Boolean(turn.taskCardState.streamId);
-      } catch (err) {
-        await failTaskCardStream(err);
-        return false;
-      }
-    };
+      },
+    });
 
     const appendTaskCardPlan = async (task_id, updateOnly = false) => {
       if (!turn.taskCardState.streamId || turn.taskCardState.failed) return false;
@@ -814,6 +890,21 @@ export class Scheduler {
       try {
         const single = new Map([[task_id, card]]);
         await adapter.appendStream(turn.taskCardState.streamId, buildTaskUpdateChunks(single, { updateOnly }));
+        armKeepalive();
+        return true;
+      } catch (err) {
+        await failTaskCardStream(err);
+        return false;
+      }
+    };
+
+    const appendTaskCardSnapshot = async () => {
+      if (!turn.taskCardState.streamId || turn.taskCardState.failed) return false;
+      try {
+        await adapter.appendStream(
+          turn.taskCardState.streamId,
+          buildTaskCardChunks({ includePlanUpdate: false }),
+        );
         armKeepalive();
         return true;
       } catch (err) {
@@ -1065,6 +1156,52 @@ export class Scheduler {
             }
             if (streamReady && hadStream) {
               await appendTaskCardPlan(msg.task_id);
+            }
+            return;
+          }
+
+          if (msg.type === 'plan_title_update') {
+            if ((!turn.taskCardState.enabled && !turn.taskCardState.deferred) || turn.taskCardState.failed) return;
+            const title = String(msg.title || '').trim();
+            if (!title) return;
+            turn.taskCardState.planTitle = title;
+            if (!turn.taskCardState.displayMode) {
+              turn.taskCardState.displayMode = 'plan';
+            }
+            if (!turn.taskCardState.enabled || !turn.taskCardState.streamId) return;
+            try {
+              await adapter.appendStream(turn.taskCardState.streamId, [{ type: 'plan_update', title }]);
+              armKeepalive();
+            } catch (err) {
+              await failTaskCardStream(err);
+            }
+            return;
+          }
+
+          if (msg.type === 'plan_snapshot') {
+            if ((!turn.taskCardState.enabled && !turn.taskCardState.deferred) || turn.taskCardState.failed) return;
+            if (!turn.taskCardState.chunkType && typeof msg.chunk_type === 'string') {
+              turn.taskCardState.chunkType = msg.chunk_type;
+            }
+            if (!turn.taskCardState.displayMode && typeof msg.display_mode === 'string') {
+              turn.taskCardState.displayMode = msg.display_mode;
+            }
+            if (!turn.taskCardState.displayMode && turn.taskCardState.chunkType) {
+              turn.taskCardState.displayMode = resolveTaskCardDisplayMode(turn.taskCardState.chunkType);
+            }
+            if (typeof msg.title === 'string' && msg.title.trim()) {
+              turn.taskCardState.planTitle = msg.title.trim();
+            }
+            replaceTaskCardSnapshot(msg.rows);
+            if (!turn.taskCardState.enabled) return;
+            const hadStream = Boolean(turn.taskCardState.streamId);
+            const streamReady = await ensureTaskCardStream();
+            if (streamReady && !turn.taskCardState.bubbleCleared) {
+              await applyThreadStatus('');
+              turn.taskCardState.bubbleCleared = true;
+            }
+            if (streamReady && hadStream) {
+              await appendTaskCardSnapshot();
             }
             return;
           }
