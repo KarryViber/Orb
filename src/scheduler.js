@@ -1174,7 +1174,7 @@ export class Scheduler {
               turn.taskCardState.bubbleCleared = true;
             }
             if (streamReady && hadStream) {
-              await appendTaskCardPlan(msg.task_id);
+              await appendTaskCardPlan(msg.task_id, true);
             }
             return;
           }
