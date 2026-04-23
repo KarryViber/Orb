@@ -99,6 +99,42 @@ function normalizeTaskCardStatus(status, fallback = 'pending') {
   return fallback;
 }
 
+export function subtractDeliveredText(finalText, deliveredTexts = []) {
+  const text = typeof finalText === 'string' ? finalText : '';
+  if (!text.trim()) return '';
+
+  const delivered = Array.isArray(deliveredTexts)
+    ? deliveredTexts.map((entry) => typeof entry === 'string' ? entry : '').join('')
+    : '';
+  if (!delivered.trim()) return text;
+
+  if (text === delivered || delivered.includes(text)) return '';
+  if (text.startsWith(delivered)) return text.slice(delivered.length);
+  if (text.endsWith(delivered)) return text.slice(0, text.length - delivered.length);
+
+  const trimmedText = text.trim();
+  const trimmedDelivered = delivered.trim();
+  if (trimmedDelivered) {
+    if (trimmedText === trimmedDelivered || trimmedDelivered.includes(trimmedText)) return '';
+    if (trimmedText.startsWith(trimmedDelivered)) return trimmedText.slice(trimmedDelivered.length);
+    if (trimmedText.endsWith(trimmedDelivered)) {
+      return trimmedText.slice(0, trimmedText.length - trimmedDelivered.length);
+    }
+  }
+
+  const deliveredSet = new Set(
+    (deliveredTexts || []).map((entry) => String(entry || '').trim()).filter(Boolean),
+  );
+  return deliveredSet.has(trimmedText) ? '' : text;
+}
+
+export function resolveTurnCompleteDeliveryText(msg) {
+  if (typeof msg?.undeliveredText === 'string') {
+    return msg.undeliveredText.trim() ? msg.undeliveredText : '';
+  }
+  return subtractDeliveredText(msg?.text, msg?.deliveredTexts);
+}
+
 export function makeTaskCardState({ enabled = false, deferred = false } = {}) {
   return {
     enabled: Boolean(enabled),
@@ -1370,45 +1406,47 @@ export class Scheduler {
           if (msg.type === 'turn_complete') {
             finalStopReason = msg.stopReason || finalStopReason;
             await stopTyping();
-            // 中间轮次完成 — worker 已裁剪掉经 intermediate_text 投递过的部分
+            const deliveryText = resolveTurnCompleteDeliveryText(msg);
+            const metadataText = typeof msg.text === 'string' ? msg.text : deliveryText;
+            // 中间轮次完成 — 优先使用 worker 提供的 undeliveredText，
+            // 否则按 deliveredTexts 从完整文本中扣掉已发部分。
             try {
-              const text = (typeof msg.undeliveredText === 'string' ? msg.undeliveredText : msg.text)?.trim();
-              if (deferDeliveryUntilResult && isSilentResultText(text)) {
+              if (deferDeliveryUntilResult && isSilentResultText(deliveryText)) {
                 info(TAG, `silent deferred turn suppressed: thread=${threadTs}`);
                 turnDelivered = true;
                 resetTaskCardState();
                 return;
               }
               if (turn.taskCardState.streamId && !turn.taskCardState.failed) {
-                await stopTaskCardStream(text);
+                await stopTaskCardStream(deliveryText);
                 turnDelivered = true;
-                await updateThreadMetadata(text);
+                await updateThreadMetadata(metadataText);
                 return;
               }
-              if (text) {
+              if (deliveryText.trim()) {
                 turnDelivered = true;
-                if (deferDeliveryUntilResult) await deliverDeferredFinalResult(text);
-                else if (turn.intermediateDeliveredThisTurn) {
-                  info(TAG, `turn_complete text already delivered via intermediate stream, skip sendReply`);
-                }
-                else if (turn.egress.admit(text, 'final')) {
-                  const payloads = adapter.buildPayloads(text);
+                if (deferDeliveryUntilResult) await deliverDeferredFinalResult(deliveryText);
+                else if (turn.egress.admit(deliveryText, 'final')) {
+                  const payloads = adapter.buildPayloads(deliveryText);
                   for (const payload of payloads) {
                     await emitPayload(payload);
                   }
                 }
+              } else if (metadataText?.trim()) {
+                turnDelivered = true;
+                info(TAG, `turn_complete diff empty after dedupe, skip sendReply`);
               }
-              await updateThreadMetadata(text);
+              await updateThreadMetadata(metadataText);
               resetTaskCardState();
             } catch (err) {
               if (turn.taskCardState.streamId) await failTaskCardStream(err);
               logError(TAG, `failed to send turn_complete: ${err.message}`);
-              const fallbackText = (typeof msg.undeliveredText === 'string' ? msg.undeliveredText : msg.text)?.trim();
+              const fallbackText = deliveryText;
               const silentDeferredFallback = deferDeliveryUntilResult && isSilentResultText(fallbackText);
               if (silentDeferredFallback) {
                 info(TAG, `silent deferred turn suppressed after delivery failure: thread=${threadTs}`);
                 turnDelivered = true;
-              } else if (fallbackText) {
+              } else if (fallbackText.trim()) {
                 turnDelivered = true;
                 if (deferDeliveryUntilResult) await deliverDeferredFinalResult(fallbackText);
                 else if (turn.egress.admit(fallbackText, 'fallback')) {
@@ -1417,8 +1455,11 @@ export class Scheduler {
                     await emitPayload(payload);
                   }
                 }
+              } else if (metadataText?.trim()) {
+                turnDelivered = true;
+                info(TAG, `turn_complete fallback diff empty after dedupe, skip sendReply`);
               }
-              if (!silentDeferredFallback) await updateThreadMetadata(fallbackText);
+              if (!silentDeferredFallback) await updateThreadMetadata(metadataText);
               resetTaskCardState();
             }
             return;

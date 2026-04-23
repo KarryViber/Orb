@@ -145,7 +145,7 @@ async function start() {
             label: `cron:${job.id}`,
             onMessage: (msg) => {
               if (msg?.type === 'turn_complete') {
-                responseText = typeof msg.undeliveredText === 'string' ? msg.undeliveredText : (msg.text || responseText);
+                responseText = typeof msg.text === 'string' ? msg.text : responseText;
                 stopReason = msg.stopReason || stopReason;
               }
               else if (msg?.type === 'result') {

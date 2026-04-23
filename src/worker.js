@@ -71,8 +71,9 @@ const TASK_CARD_TOOLS = new Set([
 ]);
 
 let _activeCli = null;   // reference to active interactive CLI session
-// Last text emitted via turn_complete IPC. Exit path compares against exitResult.lastTurnText
-// and suppresses duplicate result text that the scheduler already tendered through stopStream.
+// Last full turn text emitted via turn_complete IPC. Exit path compares against
+// exitResult.lastTurnText and suppresses duplicate result text when the
+// scheduler has already handled that turn through turn_complete delivery.
 let _lastEmittedTurnText = null;
 
 process.on('message', async (msg) => {
@@ -220,8 +221,16 @@ process.on('message', async (msg) => {
       // Each turn completed → send to scheduler for delivery
       cli.setOnTurnComplete(async (turn) => {
         if (turn.text?.trim()) {
-          _lastEmittedTurnText = turn.undeliveredText || turn.text || '';
-          await ipcSend({ type: 'turn_complete', text: turn.text, toolCount: turn.toolCount, lastTool: turn.lastTool, stopReason: turn.stopReason, deliveredTexts: turn.deliveredTexts || [] });
+          _lastEmittedTurnText = turn.text || turn.undeliveredText || '';
+          await ipcSend({
+            type: 'turn_complete',
+            text: turn.text,
+            toolCount: turn.toolCount,
+            lastTool: turn.lastTool,
+            stopReason: turn.stopReason,
+            deliveredTexts: turn.deliveredTexts || [],
+            undeliveredText: turn.undeliveredText,
+          });
         }
       });
       cli.setOnTurnEnd(async () => {
@@ -823,18 +832,28 @@ function sanitizeFileToken(value) {
 }
 
 export function computeUndeliveredTurnText(finalText, accumulatedDelivered = '', deliveredTexts = []) {
-  const text = String(finalText || '').trim();
-  if (!text) return '';
+  const text = typeof finalText === 'string' ? finalText : '';
+  if (!text.trim()) return '';
 
-  const accumulated = String(accumulatedDelivered || '').trim();
-  if (accumulated) {
+  const accumulated = typeof accumulatedDelivered === 'string' ? accumulatedDelivered : '';
+  if (accumulated.trim()) {
     if (text === accumulated || accumulated.includes(text)) return '';
-    if (text.startsWith(accumulated)) return text.slice(accumulated.length).trimStart();
-    if (text.endsWith(accumulated)) return text.slice(0, text.length - accumulated.length).trimEnd();
+    if (text.startsWith(accumulated)) return text.slice(accumulated.length);
+    if (text.endsWith(accumulated)) return text.slice(0, text.length - accumulated.length);
   }
 
+  const deliveredJoined = Array.isArray(deliveredTexts)
+    ? deliveredTexts.map((entry) => typeof entry === 'string' ? entry : '').join('')
+    : '';
+  if (deliveredJoined.trim()) {
+    if (text === deliveredJoined || deliveredJoined.includes(text)) return '';
+    if (text.startsWith(deliveredJoined)) return text.slice(deliveredJoined.length);
+    if (text.endsWith(deliveredJoined)) return text.slice(0, text.length - deliveredJoined.length);
+  }
+
+  const trimmedText = text.trim();
   const deliveredSet = new Set((deliveredTexts || []).map((entry) => String(entry || '').trim()).filter(Boolean));
-  return deliveredSet.has(text) ? '' : text;
+  return deliveredSet.has(trimmedText) ? '' : text;
 }
 
 function buildUserContent({ userText, fileContent, imagePaths, workspace }) {
