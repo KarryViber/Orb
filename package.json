@@ -1,6 +1,6 @@
 {
   "name": "orb",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Multi-profile AI agent framework — receive messages via Slack, fork Claude Code CLI to execute tasks",
   "type": "module",
   "main": "src/main.js",
