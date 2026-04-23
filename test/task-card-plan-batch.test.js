@@ -6,7 +6,7 @@ import {
   makeTaskCardState,
   replaceTaskCardSnapshotRows,
 } from '../src/scheduler.js';
-import { buildPlanSnapshotRows } from '../src/worker.js';
+import { buildPlanSnapshotRows, buildPlanSnapshotTitle } from '../src/worker.js';
 
 test('buildPlanSnapshotRows batches TodoWrite todos into ordered plan rows', () => {
   const rows = buildPlanSnapshotRows([
@@ -20,6 +20,29 @@ test('buildPlanSnapshotRows batches TodoWrite todos into ordered plan rows', () 
     { task_id: 'todowrite-todo-1', title: '第二步', status: 'complete' },
     { task_id: 'todowrite-todo-2', title: '第三步', status: 'pending' },
   ]);
+});
+
+test('buildPlanSnapshotTitle omits active suffix when all todos are pending', () => {
+  assert.equal(buildPlanSnapshotTitle([
+    { content: '第一步', status: 'pending' },
+    { content: '第二步', status: 'pending' },
+    { content: '第三步', status: 'pending' },
+  ]), '进度 0/3');
+});
+
+test('buildPlanSnapshotTitle includes active step and truncates it to 40 chars', () => {
+  assert.equal(buildPlanSnapshotTitle([
+    { content: '第一步', status: 'completed' },
+    { content: 'abcdefghijklmnopqrstuvwxyz1234567890ABCDEFGHIJKLMN', status: 'in_progress' },
+    { content: '第三步', status: 'pending' },
+  ]), '进度 1/3｜abcdefghijklmnopqrstuvwxyz1234567890A...');
+});
+
+test('buildPlanSnapshotTitle marks all-complete plans as finished', () => {
+  assert.equal(buildPlanSnapshotTitle([
+    { content: '第一步', status: 'completed' },
+    { content: '第二步', status: 'completed' },
+  ]), '进度 2/2｜完成');
 });
 
 test('buildTaskCardChunksFromState prepends plan_update for plan snapshots', () => {
