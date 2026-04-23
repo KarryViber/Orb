@@ -68,6 +68,20 @@ test('buildTaskCardChunksFromState prepends plan_update for plan snapshots', () 
   ]);
 });
 
+test('buildTaskCardChunksFromState omits title/details for update-only task deltas', () => {
+  const state = makeTaskCardState({ enabled: true });
+  state.taskCards = replaceTaskCardSnapshotRows([
+    { task_id: 'bash-1', title: 'Run Bash', status: 'in_progress' },
+  ]);
+  state.taskCards.get('bash-1').details = 'echo hello';
+
+  const chunks = buildTaskCardChunksFromState(state, { updateOnly: true, includePlanUpdate: false });
+
+  assert.deepEqual(chunks, [
+    { type: 'task_update', id: 'bash-1', status: 'in_progress' },
+  ]);
+});
+
 test('shouldIncludeTaskCardPlanUpdate only flips true when the plan title changes', () => {
   const state = makeTaskCardState({ enabled: true });
   state.displayMode = 'plan';
