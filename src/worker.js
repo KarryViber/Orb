@@ -17,7 +17,7 @@ import { storeConversation } from './memory.js';
  *     - mode: 'skill-review' enters a dedicated branch that requires
  *       priorConversation; context.js injects it as "## 待审查会话".
  *     - priorConversation: [{role: 'user'|'assistant', content: string}, ...]
- *   { type: 'inject', userText, fileContent?, imagePaths? }
+ *   { type: 'inject', injectId?, userText, fileContent?, imagePaths? }
  *
  * Worker -> Scheduler:
  *   { type: 'result', text, toolCount, lastTool?, stopReason? }
@@ -38,9 +38,11 @@ import { storeConversation } from './memory.js';
  *     emitted from tool_result blocks for tools that wait on a result; status is 'complete' | 'error'.
  *   { type: 'status_update', text }  — short assistant thread status text;
  *     emitted when a tool starts outside the task-card path, and cleared with empty text on turn_complete.
- *   { type: 'turn_start' }  — explicit turn ownership start on task/inject receipt
+ *   { type: 'turn_start', injectId? }  — explicit turn ownership start on task/inject receipt
  *   { type: 'turn_end' }  — explicit turn ownership end when Claude emits result
  *   { type: 'intermediate_text', text }  — Phase ③: mid-turn text block, debounced 2s
+ *   { type: 'inject_failed', injectId?, userText, fileContent?, imagePaths? }  — follow-up inject could not reach CLI;
+ *     scheduler should respawn a fresh worker and replay the user payload.
  */
 
 const CLAUDE_PATH = process.env.CLAUDE_PATH || 'claude';
@@ -79,13 +81,29 @@ process.on('message', async (msg) => {
       const injected = _activeCli.inject(msg.userText, msg.fileContent, msg.imagePaths);
       if (injected) {
         _lastEmittedTurnText = null;
-        await ipcSend({ type: 'turn_start' }).catch(() => {});
+        await ipcSend({ type: 'turn_start', injectId: msg.injectId || null }).catch(() => {});
         console.log(`[worker] injected: "${(msg.userText || '').slice(0, 60)}"`);
       } else {
-        console.warn('[worker] inject rejected by CLI');
+        console.warn('[worker] inject rejected by CLI — signaling fail-forward');
+        await ipcSend({
+          type: 'inject_failed',
+          injectId: msg.injectId || null,
+          userText: msg.userText,
+          fileContent: msg.fileContent,
+          imagePaths: msg.imagePaths,
+        }).catch(() => {});
+        _activeCli.close();
       }
     } else {
-      console.warn('[worker] inject received but no active CLI');
+      console.warn('[worker] inject received but no active CLI — signaling fail-forward');
+      await ipcSend({
+        type: 'inject_failed',
+        injectId: msg.injectId || null,
+        userText: msg.userText,
+        fileContent: msg.fileContent,
+        imagePaths: msg.imagePaths,
+      }).catch(() => {});
+      setImmediate(() => process.exit(0));
     }
     return;
   }

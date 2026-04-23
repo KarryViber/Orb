@@ -239,6 +239,7 @@ export class Scheduler {
     this._autoContinueCount = new Map(); // threadTs → retry count for empty results
     this._backgroundWorkers = new Set(); // skill-review + memory-sync workers
     this._maxBackgroundWorkers = 2;
+    this._nextInjectId = 1;
     this._pendingPermissionRequests = new Map();
     this._permissionApprovalMode = process.env.ORB_PERMISSION_APPROVAL_MODE || 'auto-allow';
     this._permissionSocketPath = join(tmpdir(), `orb-permission-scheduler-${process.pid}.sock`);
@@ -519,11 +520,27 @@ export class Scheduler {
 
     if (!task.forceNewWorker && this.activeWorkers.has(threadTs)) {
       const entry = this.activeWorkers.get(threadTs);
+      const injectId = `inject-${this._nextInjectId++}`;
+      const injectTask = {
+        ...task,
+        deliveryThreadTs: task.deliveryThreadTs === undefined
+          ? (entry?.deliveryThreadTs ?? threadTs ?? null)
+          : task.deliveryThreadTs,
+      };
+      if (!entry.pendingInjects) entry.pendingInjects = new Map();
+      entry.pendingInjects.set(injectId, injectTask);
       try {
-        entry.worker.send({ type: 'inject', userText: task.userText, fileContent: task.fileContent, imagePaths: task.imagePaths });
+        entry.worker.send({
+          type: 'inject',
+          injectId,
+          userText: task.userText,
+          fileContent: task.fileContent,
+          imagePaths: task.imagePaths,
+        });
         info(TAG, `injected into active worker: thread=${threadTs}`);
         return;
       } catch (e) {
+        entry.pendingInjects.delete(injectId);
         info(TAG, `inject failed, queuing: ${e.message}`);
         if (!this.threadQueues.has(threadTs)) this.threadQueues.set(threadTs, []);
         this.threadQueues.get(threadTs).push(task);
@@ -675,6 +692,12 @@ export class Scheduler {
     let workerFailure = null;
     let completionSettled = false;
     let worker;
+    const syncActiveWorkerDeliveryThread = () => {
+      const activeEntry = this.activeWorkers.get(threadTs);
+      if (activeEntry?.worker === worker) {
+        activeEntry.deliveryThreadTs = effectiveThreadTs;
+      }
+    };
     const hasTaskCardThread = () => effectiveThreadTs != null;
     const canManageThreadStatus = !deferDeliveryUntilResult
       && platform === 'slack'
@@ -893,7 +916,10 @@ export class Scheduler {
       armKeepalive,
       failTaskCardStream,
       onStreamStarted: (stream) => {
-        if (!effectiveThreadTs && stream?.ts) effectiveThreadTs = stream.ts;
+        if (!effectiveThreadTs && stream?.ts) {
+          effectiveThreadTs = stream.ts;
+          syncActiveWorkerDeliveryThread();
+        }
       },
     });
 
@@ -1053,7 +1079,10 @@ export class Scheduler {
               initial_chunks: buildTaskCardChunks(),
               team_id: task.teamId || null,
             });
-            if (!effectiveThreadTs && stream?.ts) effectiveThreadTs = stream.ts;
+            if (!effectiveThreadTs && stream?.ts) {
+              effectiveThreadTs = stream.ts;
+              syncActiveWorkerDeliveryThread();
+            }
             const stopPayload = {
               chunks: buildTaskCardChunks(),
               markdown_text: text,
@@ -1238,7 +1267,45 @@ export class Scheduler {
             return;
           }
 
+          if (msg.type === 'inject_failed') {
+            responded = true;
+            const activeEntry = this.activeWorkers.get(threadTs);
+            const failedTask = activeEntry?.pendingInjects?.get(msg.injectId) || null;
+            if (activeEntry?.pendingInjects && msg.injectId) {
+              activeEntry.pendingInjects.delete(msg.injectId);
+            }
+            const respawnTask = {
+              ...(failedTask || {}),
+              userText: msg.userText ?? failedTask?.userText ?? '',
+              fileContent: msg.fileContent ?? failedTask?.fileContent ?? '',
+              imagePaths: Array.isArray(msg.imagePaths)
+                ? msg.imagePaths
+                : (failedTask?.imagePaths || []),
+              threadTs,
+              deliveryThreadTs: failedTask?.deliveryThreadTs === undefined
+                ? effectiveThreadTs
+                : failedTask.deliveryThreadTs,
+              channel,
+              userId,
+              platform,
+              teamId: failedTask?.teamId ?? task.teamId ?? null,
+              threadHistory: failedTask?.threadHistory ?? task.threadHistory,
+              profile: failedTask?.profile ?? profile,
+              maxTurns: failedTask?.maxTurns ?? task.maxTurns ?? null,
+              enableTaskCard: failedTask?.enableTaskCard ?? task.enableTaskCard,
+              deferDeliveryUntilResult: failedTask?.deferDeliveryUntilResult ?? deferDeliveryUntilResult,
+            };
+            if (!this.threadQueues.has(threadTs)) this.threadQueues.set(threadTs, []);
+            this.threadQueues.get(threadTs).unshift(respawnTask);
+            warn(TAG, `inject failed, respawning worker for thread=${threadTs}`);
+            return;
+          }
+
           if (msg.type === 'turn_start') {
+            if (msg.injectId) {
+              const activeEntry = this.activeWorkers.get(threadTs);
+              activeEntry?.pendingInjects?.delete(msg.injectId);
+            }
             // Clear lingering per-turn timers from the previous turn
             // (these close over `turn`, so run them before rebuilding state).
             clearStatusRefresh();
@@ -1535,7 +1602,14 @@ export class Scheduler {
       return;
     }
 
-    this.activeWorkers.set(threadTs, { worker, platform, channel, userId });
+    this.activeWorkers.set(threadTs, {
+      worker,
+      platform,
+      channel,
+      userId,
+      deliveryThreadTs: effectiveThreadTs,
+      pendingInjects: new Map(),
+    });
     worker.on('error', (err) => {
       logError(TAG, `worker error event: pid=${worker.pid} err=${err.message}`);
     });
