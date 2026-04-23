@@ -768,7 +768,6 @@ export class Scheduler {
     };
     const armKeepalive = () => {
       if (turn.statusRefreshTimer) {
-        warn(TAG, '[invariant] armKeepalive called while statusRefreshTimer active — clearing peer');
         clearStatusRefresh();
       }
       clearKeepalive();
