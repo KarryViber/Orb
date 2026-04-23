@@ -33,6 +33,7 @@ src/
 - `lib/holographic/`                      — Holographic memory engine (Python)
 - `lib/docstore/`                         — DocStore file index (FTS5, Python)
 - `config.json`                           — Profile routing + adapter configuration
+- Memory layers policy: `docs/memory-policy.md`
 
 ## Prompt Architecture
 
