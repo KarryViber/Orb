@@ -7,6 +7,13 @@ import { warn } from './log.js';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const TAG = 'context';
 
+export function encodeCwd(cwd) {
+  if (typeof cwd !== 'string' || cwd.length === 0) {
+    throw new TypeError('encodeCwd(cwd) requires a non-empty string');
+  }
+  return cwd.replaceAll('/', '-');
+}
+
 function serializeError(error) {
   if (!error) return 'Error: unknown';
   const name = error.name || 'Error';
