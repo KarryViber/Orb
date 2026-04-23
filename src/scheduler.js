@@ -718,6 +718,11 @@ export class Scheduler {
       clearKeepalive();
     };
 
+    const markTaskCardFailed = () => {
+      turn.taskCardState.failed = true;
+      turn.egress.reset();
+    };
+
     const failTaskCardStream = async (err) => {
       if (turn.taskCardState.failed && turn.taskCardState.failureNotified) return;
       const failure = classifyTaskCardStreamError(err);
@@ -858,8 +863,7 @@ export class Scheduler {
         const failure = classifyTaskCardStreamError(err);
         if (failure.code === 'message_not_in_streaming_state' || failure.code === 'message_not_owned_by_app') {
           warn(TAG, `stopStream degraded to plain message: ${err.message}`);
-          turn.taskCardState.failed = true;
-          turn.egress.reset(); // [EGF-2] stopStream 降级前 reset，让 finalText 的 ssfe-edit / fallback admit 不被前轮 fingerprint 拦截
+          markTaskCardFailed(); // [EGF-2] reset 确保 ssfe-edit / fallback admit 不被前轮 fingerprint 拦截
           const editableTs = turn.taskCardState.streamTs;
           let edited = false;
           if (finalText && editableTs && typeof adapter?.editMessage === 'function') {
@@ -956,7 +960,7 @@ export class Scheduler {
             const failure = classifyTaskCardStreamError(err);
             if (failure.level === 'warn') {
               warn(TAG, `deferred task_card delivery degraded to plain message: ${err.message}`);
-              turn.taskCardState.failed = true;
+              markTaskCardFailed(); // defensive; deferred path doesn't admit today but keep parity with other degrade sites
               try {
                 const fallbackPayloads = buildFinalTextPayloads(text);
                 for (const payload of fallbackPayloads) await emitPayload(payload);
@@ -1113,8 +1117,7 @@ export class Scheduler {
                 const code = err?.data?.error || err?.code || '';
                 if (code === 'message_not_in_streaming_state' || code === 'message_not_owned_by_app') {
                   warn(TAG, `stream ownership lost, degrading to sendReply: ${code}`);
-                  turn.taskCardState.failed = true;
-                  turn.egress.reset(); // [EGF-2] stream 失败后清空 fingerprints，避免污染 fallback 路径的 final/后续 intermediate
+                  markTaskCardFailed(); // [EGF-2] reset 避免污染 fallback 路径的 final/后续 intermediate
                 } else {
                   warn(TAG, `failed to append intermediate markdown_text to stream: ${err.message}`);
                   return;
