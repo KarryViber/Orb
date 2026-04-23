@@ -726,6 +726,7 @@ export class Scheduler {
         : '';
       const editableTs = turn.taskCardState.streamTs;
       turn.taskCardState.failed = true;
+      turn.egress.reset(); // [EGF-2] stream 失败后清空 fingerprints，避免污染 fallback 路径的 final/后续 intermediate
       turn.taskCardState.streamId = null;
       turn.taskCardState.streamTs = null;
       clearKeepalive();
@@ -858,6 +859,7 @@ export class Scheduler {
         if (failure.code === 'message_not_in_streaming_state' || failure.code === 'message_not_owned_by_app') {
           warn(TAG, `stopStream degraded to plain message: ${err.message}`);
           turn.taskCardState.failed = true;
+          turn.egress.reset(); // [EGF-2] stopStream 降级前 reset，让 finalText 的 ssfe-edit / fallback admit 不被前轮 fingerprint 拦截
           const editableTs = turn.taskCardState.streamTs;
           let edited = false;
           if (finalText && editableTs && typeof adapter?.editMessage === 'function') {
@@ -1112,6 +1114,7 @@ export class Scheduler {
                 if (code === 'message_not_in_streaming_state' || code === 'message_not_owned_by_app') {
                   warn(TAG, `stream ownership lost, degrading to sendReply: ${code}`);
                   turn.taskCardState.failed = true;
+                  turn.egress.reset(); // [EGF-2] stream 失败后清空 fingerprints，避免污染 fallback 路径的 final/后续 intermediate
                 } else {
                   warn(TAG, `failed to append intermediate markdown_text to stream: ${err.message}`);
                   return;
