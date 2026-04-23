@@ -149,6 +149,11 @@ function formatPermissionPreviewMeta(text, maxChars) {
   return `(前 ${previewChars} 字符 / 共 ${totalChars} 字符)`;
 }
 
+function isIgnorableAssistantThreadError(err) {
+  const code = String(err?.data?.error || err?.code || '').trim();
+  return code === 'no_permission' || code === 'channel_not_found';
+}
+
 function tokenizeShellCommand(command) {
   return String(command || '')
     .match(/'[^']*'|"[^"]*"|\S+/g)
@@ -1430,6 +1435,7 @@ export class SlackAdapter extends PlatformAdapter {
       }
       await this._slack.apiCall('assistant.threads.setStatus', payload);
     } catch (err) {
+      if (isIgnorableAssistantThreadError(err)) return;
       warn(TAG, `setThreadStatus failed: ${err.message}`);
     }
   }
@@ -1443,6 +1449,7 @@ export class SlackAdapter extends PlatformAdapter {
         title: String(title).trim().slice(0, 60),
       });
     } catch (err) {
+      if (isIgnorableAssistantThreadError(err)) return;
       warn(TAG, `setThreadTitle failed: ${err.message}`);
     }
   }
@@ -1464,6 +1471,7 @@ export class SlackAdapter extends PlatformAdapter {
         prompts: normalizedPrompts,
       });
     } catch (err) {
+      if (isIgnorableAssistantThreadError(err)) return;
       warn(TAG, `setSuggestedPrompts failed: ${err.message}`);
     }
   }
