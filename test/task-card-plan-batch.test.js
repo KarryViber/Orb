@@ -5,6 +5,7 @@ import {
   ensureTaskCardStreamStarted,
   makeTaskCardState,
   replaceTaskCardSnapshotRows,
+  shouldIncludeTaskCardPlanUpdate,
 } from '../src/scheduler.js';
 import { buildPlanSnapshotRows, buildPlanSnapshotTitle } from '../src/worker.js';
 
@@ -61,6 +62,20 @@ test('buildTaskCardChunksFromState prepends plan_update for plan snapshots', () 
     { type: 'task_update', id: 'todowrite-todo-0', title: '第一步', status: 'in_progress' },
     { type: 'task_update', id: 'todowrite-todo-1', title: '第二步', status: 'pending' },
   ]);
+});
+
+test('shouldIncludeTaskCardPlanUpdate only flips true when the plan title changes', () => {
+  const state = makeTaskCardState({ enabled: true });
+  state.displayMode = 'plan';
+  state.planTitle = '进度 1/3｜执行核心流程';
+
+  assert.equal(shouldIncludeTaskCardPlanUpdate(state), true);
+
+  state.lastSentPlanTitle = '进度 1/3｜执行核心流程';
+  assert.equal(shouldIncludeTaskCardPlanUpdate(state), false);
+
+  state.planTitle = '进度 2/3｜执行核心流程';
+  assert.equal(shouldIncludeTaskCardPlanUpdate(state), true);
 });
 
 test('ensureTaskCardStreamStarted gates concurrent startStream calls', async () => {

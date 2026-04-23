@@ -109,6 +109,7 @@ export function makeTaskCardState({ enabled = false, deferred = false } = {}) {
     chunkType: null,
     displayMode: null,
     planTitle: '',
+    lastSentPlanTitle: null,
     taskCards: new Map(),
     failed: false,
     failureNotified: false,
@@ -125,6 +126,13 @@ export function buildTaskCardChunksFromState(taskCardState, { updateOnly = false
     if (planTitle) chunks.push({ type: 'plan_update', title: planTitle });
   }
   return chunks.concat(buildTaskUpdateChunks(taskCardState?.taskCards, { updateOnly }));
+}
+
+export function shouldIncludeTaskCardPlanUpdate(taskCardState) {
+  if (taskCardState?.displayMode !== 'plan') return false;
+  const planTitle = String(taskCardState?.planTitle || '').trim();
+  if (!planTitle) return false;
+  return planTitle !== String(taskCardState?.lastSentPlanTitle || '').trim();
 }
 
 export function replaceTaskCardSnapshotRows(rows) {
@@ -171,6 +179,10 @@ export async function ensureTaskCardStreamStarted({
       });
       taskCardState.streamId = stream?.stream_id || null;
       taskCardState.streamTs = stream?.ts || null;
+      if (taskCardState.streamId && taskCardState.displayMode === 'plan') {
+        const planTitle = String(taskCardState.planTitle || '').trim();
+        taskCardState.lastSentPlanTitle = planTitle || null;
+      }
       if (typeof onStreamStarted === 'function') onStreamStarted(stream);
       if (taskCardState.streamId) armKeepalive();
       return Boolean(taskCardState.streamId);
@@ -787,6 +799,7 @@ export class Scheduler {
       turn.taskCardState.chunkType = null;
       turn.taskCardState.displayMode = null;
       turn.taskCardState.planTitle = '';
+      turn.taskCardState.lastSentPlanTitle = null;
       turn.taskCardState.taskCards.clear();
       turn.taskCardState.failed = false;
       turn.taskCardState.failureNotified = false;
@@ -815,6 +828,7 @@ export class Scheduler {
       turn.taskCardState.chunkType = null;
       turn.taskCardState.displayMode = null;
       turn.taskCardState.planTitle = '';
+      turn.taskCardState.lastSentPlanTitle = null;
       if (fallbackMarkdown) {
         let edited = false;
         if (editableTs && typeof adapter?.editMessage === 'function') {
@@ -855,6 +869,7 @@ export class Scheduler {
       turn.taskCardState.chunkType = null;
       turn.taskCardState.displayMode = null;
       turn.taskCardState.planTitle = '';
+      turn.taskCardState.lastSentPlanTitle = null;
       turn.taskCardState.taskCards.clear();
       clearKeepalive();
     };
@@ -900,11 +915,15 @@ export class Scheduler {
 
     const appendTaskCardSnapshot = async () => {
       if (!turn.taskCardState.streamId || turn.taskCardState.failed) return false;
+      const includePlanUpdate = shouldIncludeTaskCardPlanUpdate(turn.taskCardState);
       try {
         await adapter.appendStream(
           turn.taskCardState.streamId,
-          buildTaskCardChunks({ includePlanUpdate: false }),
+          buildTaskCardChunks({ includePlanUpdate }),
         );
+        if (includePlanUpdate) {
+          turn.taskCardState.lastSentPlanTitle = String(turn.taskCardState.planTitle || '').trim() || null;
+        }
         armKeepalive();
         return true;
       } catch (err) {
@@ -1171,6 +1190,7 @@ export class Scheduler {
             if (!turn.taskCardState.enabled || !turn.taskCardState.streamId) return;
             try {
               await adapter.appendStream(turn.taskCardState.streamId, [{ type: 'plan_update', title }]);
+              turn.taskCardState.lastSentPlanTitle = title;
               armKeepalive();
             } catch (err) {
               await failTaskCardStream(err);
