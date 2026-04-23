@@ -881,15 +881,15 @@ export class SlackAdapter extends PlatformAdapter {
   }
 
   _buildApprovalStatusBlocks(pending, label, extraText) {
-    const updatedBlocks = (pending.blocks || [])
-      .filter((b) => b.type !== 'actions')
-      .concat([{
-        type: 'context',
-        elements: [
-          { type: 'mrkdwn', text: extraText ? `${label} · ${extraText}` : label },
-        ],
-      }]);
-    return updatedBlocks;
+    const toolName = pending?.prompt?.toolName || '';
+    const semantics = toolName ? ` · \`${toolName}\`` : '';
+    const trailing = extraText ? ` · ${extraText}` : '';
+    return [{
+      type: 'context',
+      elements: [
+        { type: 'mrkdwn', text: `${label}${semantics}${trailing}` },
+      ],
+    }];
   }
 
   async sendApproval(channel, threadTs, prompt) {
