@@ -249,6 +249,15 @@ def apply_fact_write(
     if not content:
         return {"error": "empty content"}
 
+    # Auto-upgrade confidence for high-signal sources when caller didn't specify.
+    # correction_capture = Karry 亲自纠正蒸馏，llm_distill lesson = 已策划复盘，
+    # 都应该是 confirmed (0.9, frozen)，而不是 default (0.5)。
+    if confidence == "default":
+        if source == "correction_capture":
+            confidence = "confirmed"
+        elif source == "llm_distill" and category == "lesson":
+            confidence = "confirmed"
+
     neighbors: list[dict] = []
     if not skip_arbitrate and _ARBITRATE_ENABLED:
         try:
