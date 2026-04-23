@@ -299,7 +299,7 @@ process.on('message', async (msg) => {
 const IDLE_TIMEOUT = parseInt(process.env.WORKER_IDLE_TIMEOUT_MS, 10) || 60_000; // idle → close stdin → CLI exits
 
 function renderTodos(todos) {
-  const lines = ['📋 进度'];
+  const lines = [`📋 ${buildPlanSnapshotTitle(todos)}`];
   for (const t of todos) {
     const icon = t.status === 'completed' ? '✅' : t.status === 'in_progress' ? '🔄' : '⬜';
     lines.push(`${icon} ${t.content}`);
@@ -332,6 +332,21 @@ export function buildPlanSnapshotRows(todos) {
     title: truncate256(todo?.content || `Todo ${index + 1}`),
     status: mapTodoStatus(todo?.status),
   }));
+}
+
+export function buildPlanSnapshotTitle(todos) {
+  const list = Array.isArray(todos) ? todos : [];
+  const total = list.length;
+  const completed = list.filter((todo) => todo?.status === 'completed').length;
+  const activeTodo = list.find((todo) => todo?.status === 'in_progress');
+
+  if (activeTodo) {
+    return `进度 ${completed}/${total}｜${truncateText(activeTodo.content || '进行中', 40)}`;
+  }
+  if (total > 0 && completed === total) {
+    return `进度 ${total}/${total}｜完成`;
+  }
+  return `进度 ${completed}/${total}`;
 }
 
 function tokenizeShellCommand(command) {
@@ -633,13 +648,14 @@ function runClaudeInteractive(args, initialContent, workspace) {
             if (rows.length > 0) {
               ipcSend({
                 type: 'plan_snapshot',
-                title: '进度',
+                title: buildPlanSnapshotTitle(block.input.todos),
                 chunk_type: taskCardChunkType,
                 display_mode: taskCardDisplayMode,
                 rows,
               }).catch(() => {});
               taskCardEmittedInTurn = true;
             }
+            ipcSend({ type: 'progress_update', text: renderTodos(block.input.todos) }).catch(() => {});
             continue;
           }
           if (emitsTaskCard) {
