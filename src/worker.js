@@ -26,10 +26,16 @@ import { storeConversation } from './memory.js';
  *   { type: 'progress_update', text }  — Phase ①: fired on each TodoWrite event;
  *     scheduler posts/edits a single progress message in-thread (ts owned by scheduler)
  *     only outside the task-card path / error fallback scenes.
- *   { type: 'tool_call', task_id, tool_name, title, details, chunk_type, display_mode? }  — task-card path:
+ *   { type: 'plan_title_update', title }  — task-card path:
+ *     compatibility path for callers that want to label plan-mode cards.
+ *   { type: 'plan_snapshot', title, chunk_type, display_mode, rows }  — task-card path:
+ *     TodoWrite-only full snapshot for plan rendering; rows replace the current
+ *     plan-card contents in one scheduler update.
+ *   { type: 'tool_call', task_id, tool_name, title, details, status?, chunk_type, display_mode? }  — task-card path:
  *     emitted for selected tool_use blocks so scheduler can update Slack task cards.
+ *     TodoWrite synthetic per-todo ids now live inside plan_snapshot.rows[].task_id.
  *   { type: 'tool_result', task_id, status, output }  — task-card path:
- *     emitted from tool_result blocks; status is 'complete' | 'error'.
+ *     emitted from tool_result blocks for tools that wait on a result; status is 'complete' | 'error'.
  *   { type: 'status_update', text }  — short assistant thread status text;
  *     emitted when a tool starts outside the task-card path, and cleared with empty text on turn_complete.
  *   { type: 'turn_start' }  — explicit turn ownership start on task/inject receipt
@@ -311,6 +317,21 @@ function truncate256(text) {
   const normalized = String(text || '').replace(/\s+\n/g, '\n').trim();
   if (normalized.length <= 256) return normalized;
   return `${normalized.slice(0, 255)}…`;
+}
+
+function mapTodoStatus(status) {
+  if (status === 'completed') return 'complete';
+  if (status === 'in_progress') return 'in_progress';
+  return 'pending';
+}
+
+export function buildPlanSnapshotRows(todos) {
+  if (!Array.isArray(todos)) return [];
+  return todos.map((todo, index) => ({
+    task_id: `todowrite-todo-${index}`,
+    title: truncate256(todo?.content || `Todo ${index + 1}`),
+    status: mapTodoStatus(todo?.status),
+  }));
 }
 
 function tokenizeShellCommand(command) {
@@ -595,15 +616,32 @@ function runClaudeInteractive(args, initialContent, workspace) {
         if (block.type === 'tool_use') {
           totalToolCount++;
           lastTool = block.name || null;
-          const emitsTaskCard = TASK_CARD_TOOLS.has(block.name) && block.id;
+          const isTodoWriteSnapshot = block.name === 'TodoWrite' && Array.isArray(block.input?.todos);
+          const emitsTaskCard = isTodoWriteSnapshot
+            ? TASK_CARD_TOOLS.has(block.name)
+            : TASK_CARD_TOOLS.has(block.name) && block.id;
           if (emitsTaskCard && !taskCardEmittedInTurn) {
-            taskCardChunkType = block.name === 'TodoWrite' ? 'task' : 'plan';
-            taskCardDisplayMode = 'timeline';
+            taskCardChunkType = isTodoWriteSnapshot ? 'task' : 'plan';
+            taskCardDisplayMode = isTodoWriteSnapshot ? 'plan' : 'timeline';
           }
           ipcSend({
             type: 'status_update',
             text: buildStatusText(block.name, block.input),
           }).catch(() => {});
+          if (isTodoWriteSnapshot) {
+            const rows = buildPlanSnapshotRows(block.input.todos);
+            if (rows.length > 0) {
+              ipcSend({
+                type: 'plan_snapshot',
+                title: '进度',
+                chunk_type: taskCardChunkType,
+                display_mode: taskCardDisplayMode,
+                rows,
+              }).catch(() => {});
+              taskCardEmittedInTurn = true;
+            }
+            continue;
+          }
           if (emitsTaskCard) {
             pendingTaskCards.set(block.id, { toolName: block.name });
             const taskCardPayload = {
@@ -619,9 +657,6 @@ function runClaudeInteractive(args, initialContent, workspace) {
             }
             ipcSend(taskCardPayload).catch(() => {});
             taskCardEmittedInTurn = true;
-          }
-          if (block.name === 'TodoWrite' && Array.isArray(block.input?.todos)) {
-            ipcSend({ type: 'progress_update', text: renderTodos(block.input.todos) }).catch(() => {});
           }
         }
       }
