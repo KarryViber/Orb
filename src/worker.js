@@ -65,10 +65,7 @@ const DEFAULT_WORKSPACE_ALLOW_RULES = [
   'Bash(date)',
 ];
 const TASK_CARD_TOOLS = new Set([
-  'TodoWrite', 'Task', 'Agent',
-  'Bash', 'Write', 'Edit', 'NotebookEdit',
-  'WebFetch', 'WebSearch',
-  'Skill',
+  'TodoWrite', 'Task', 'Agent', 'Skill',
 ]);
 
 let _activeCli = null;   // reference to active interactive CLI session
@@ -347,6 +344,13 @@ export function buildPlanSnapshotTitle(todos) {
     return `进度 ${total}/${total}｜完成`;
   }
   return `进度 ${completed}/${total}`;
+}
+
+export function shouldEmitTaskCardForTool(toolName, input, toolUseId = null) {
+  const isTodoWriteSnapshot = toolName === 'TodoWrite' && Array.isArray(input?.todos);
+  return isTodoWriteSnapshot
+    ? TASK_CARD_TOOLS.has(toolName)
+    : TASK_CARD_TOOLS.has(toolName) && Boolean(toolUseId);
 }
 
 function tokenizeShellCommand(command) {
@@ -632,9 +636,7 @@ function runClaudeInteractive(args, initialContent, workspace) {
           totalToolCount++;
           lastTool = block.name || null;
           const isTodoWriteSnapshot = block.name === 'TodoWrite' && Array.isArray(block.input?.todos);
-          const emitsTaskCard = isTodoWriteSnapshot
-            ? TASK_CARD_TOOLS.has(block.name)
-            : TASK_CARD_TOOLS.has(block.name) && block.id;
+          const emitsTaskCard = shouldEmitTaskCardForTool(block.name, block.input, block.id);
           if (emitsTaskCard && !taskCardEmittedInTurn) {
             taskCardChunkType = isTodoWriteSnapshot ? 'task' : 'plan';
             taskCardDisplayMode = isTodoWriteSnapshot ? 'plan' : 'timeline';
