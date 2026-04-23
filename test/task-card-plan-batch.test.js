@@ -7,7 +7,11 @@ import {
   replaceTaskCardSnapshotRows,
   shouldIncludeTaskCardPlanUpdate,
 } from '../src/scheduler.js';
-import { buildPlanSnapshotRows, buildPlanSnapshotTitle } from '../src/worker.js';
+import {
+  buildPlanSnapshotRows,
+  buildPlanSnapshotTitle,
+  shouldEmitTaskCardForTool,
+} from '../src/worker.js';
 
 test('buildPlanSnapshotRows batches TodoWrite todos into ordered plan rows', () => {
   const rows = buildPlanSnapshotRows([
@@ -141,4 +145,14 @@ test('ensureTaskCardStreamStarted gates concurrent startStream calls', async () 
   assert.equal(state.streamId, 'stream-1');
   assert.equal(state.streamTs, '123.456');
   assert.equal(state.startStreamPromise, null);
+});
+
+test('shouldEmitTaskCardForTool only keeps narrative tools on the task-card path', () => {
+  assert.equal(shouldEmitTaskCardForTool('Bash', { command: 'ls' }, 'toolu_1'), false);
+  assert.equal(shouldEmitTaskCardForTool('WebSearch', { query: 'orb' }, 'toolu_2'), false);
+  assert.equal(shouldEmitTaskCardForTool('Task', { description: 'delegate' }, 'toolu_3'), true);
+  assert.equal(shouldEmitTaskCardForTool('Skill', { skill_name: 'openai-docs' }, 'toolu_4'), true);
+  assert.equal(shouldEmitTaskCardForTool('TodoWrite', {
+    todos: [{ content: '第一步', status: 'in_progress' }],
+  }), true);
 });
