@@ -1016,18 +1016,28 @@ export class SlackAdapter extends PlatformAdapter {
     info(TAG, `block_action released: message_ts=${messageTs}`);
   }
 
-  async _updateBlockActionCard(channel, messageTs, text) {
+  async _updateBlockActionCard(channel, messageTs, text, originalBlocks = null) {
     const safeText = String(text || '');
-    return this._slack.chat.update({
-      channel,
-      ts: messageTs,
-      text: safeText,
-      blocks: [
+    const statusBlock = {
+      type: 'context',
+      elements: [{ type: 'mrkdwn', text: safeText }],
+    };
+    const preserved = Array.isArray(originalBlocks)
+      ? originalBlocks.filter((block) => block && block.type !== 'actions')
+      : [];
+    const blocks = preserved.length
+      ? [statusBlock, ...preserved]
+      : [
         {
           type: 'section',
           text: { type: 'mrkdwn', text: safeText },
         },
-      ],
+      ];
+    return this._slack.chat.update({
+      channel,
+      ts: messageTs,
+      text: safeText,
+      blocks,
     });
   }
 
@@ -1053,6 +1063,7 @@ export class SlackAdapter extends PlatformAdapter {
     const threadTs = body.message?.thread_ts || messageTs || null;
     const userId = body.user?.id || '';
     const rawActionId = String(actionId || '');
+    const originalBlocks = Array.isArray(body.message?.blocks) ? body.message.blocks : null;
 
     if (!channel || !messageTs) {
       warn(TAG, `block_action missing channel/message_ts: action_id=${rawActionId || 'unknown'}`);
@@ -1065,7 +1076,8 @@ export class SlackAdapter extends PlatformAdapter {
         await this._updateBlockActionCard(
           channel,
           messageTs,
-          `⚠️ 未注册 handler: ${formatSlackInlineCode(rawActionId || 'unknown')} · <@${userId || 'unknown'}>`
+          `⚠️ 未注册 handler: ${formatSlackInlineCode(rawActionId || 'unknown')} · <@${userId || 'unknown'}>`,
+          originalBlocks,
         );
       } catch (err) {
         logError(TAG, `failed to update invalid handler message: ${err.message}`);
@@ -1088,7 +1100,8 @@ export class SlackAdapter extends PlatformAdapter {
         await this._updateBlockActionCard(
           channel,
           messageTs,
-          `⚠️ 未注册 handler: ${formatSlackInlineCode(rawActionId)} · <@${userId || 'unknown'}>`
+          `⚠️ 未注册 handler: ${formatSlackInlineCode(rawActionId)} · <@${userId || 'unknown'}>`,
+          originalBlocks,
         );
       } catch (err) {
         logError(TAG, `failed to update unregistered handler message: ${err.message}`);
@@ -1104,7 +1117,7 @@ export class SlackAdapter extends PlatformAdapter {
 
     const processingText = `⏳ 处理中… <@${userId}> clicked ${formatSlackInlineCode(rawActionId)}`;
     try {
-      await this._updateBlockActionCard(channel, messageTs, processingText);
+      await this._updateBlockActionCard(channel, messageTs, processingText, originalBlocks);
     } catch (err) {
       logError(TAG, `failed to update handler processing message: ${err.message}`);
     }
@@ -1119,6 +1132,7 @@ export class SlackAdapter extends PlatformAdapter {
       thread_ts: threadTs,
       profile: profilePaths?.name || null,
       response_url: responseUrl,
+      message_blocks: originalBlocks,
     };
 
     mkdirSync(HANDLER_LOG_DIR, { recursive: true });
@@ -1148,7 +1162,8 @@ export class SlackAdapter extends PlatformAdapter {
         this._updateBlockActionCard(
           channel,
           messageTs,
-          `⚠️ handler 启动失败: ${formatSlackInlineCode(rawActionId)}`
+          `⚠️ handler 启动失败: ${formatSlackInlineCode(rawActionId)}`,
+          originalBlocks,
         ).catch((updateErr) => {
           logError(TAG, `failed to update handler spawn error message: ${updateErr.message}`);
         });
@@ -1170,7 +1185,12 @@ export class SlackAdapter extends PlatformAdapter {
       this._releaseBlockActionMessage(messageTs);
       logError(TAG, `failed to spawn handler: action_id=${rawActionId} message_ts=${messageTs} error=${err.message}`);
       try {
-        await this._updateBlockActionCard(channel, messageTs, `⚠️ handler 启动失败: ${formatSlackInlineCode(rawActionId)}`);
+        await this._updateBlockActionCard(
+          channel,
+          messageTs,
+          `⚠️ handler 启动失败: ${formatSlackInlineCode(rawActionId)}`,
+          originalBlocks,
+        );
       } catch (updateErr) {
         logError(TAG, `failed to update handler launch error message: ${updateErr.message}`);
       }
