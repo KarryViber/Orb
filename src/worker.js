@@ -36,6 +36,12 @@ import { storeConversation } from './memory.js';
  *   { type: 'final_snapshot', plan_title, categories }  — task-card path:
  *     non-TodoWrite final plan-mode snapshot; scheduler starts one stream with
  *     all initial chunks and immediately stops it.
+ *   { type: 'qi_start' }  — realtime Qi task-card path:
+ *     opens a plan-mode stream shell before non-TodoWrite tool rows append.
+ *   { type: 'qi_append', category, line }  — realtime Qi task-card path:
+ *     appends a single tool line into the category task_update.
+ *   { type: 'qi_finalize', tool_count }  — realtime Qi task-card path:
+ *     completes the realtime Qi stream and summary.
  *   { type: 'tool_call', task_id, tool_name, title, details, status?, chunk_type, display_mode? }  — legacy task-card path:
  *     scheduler compatibility handler for incremental task-card tool updates.
  *     TodoWrite synthetic per-todo ids now live inside plan_snapshot.rows[].task_id.
@@ -573,6 +579,8 @@ function runClaudeInteractive(args, initialContent, workspace) {
   let taskCardChunkType = 'plan';
   let taskCardDisplayMode = 'timeline';
   let turnCategoryBuffer = new Map();
+  let qiStreamOpened = false;
+  let qiCategoryLines = new Map();
   let turnStopReasonOverride = null;
   const pendingTaskCards = new Map();
   const inProgressTaskCards = new Map();
@@ -583,6 +591,8 @@ function runClaudeInteractive(args, initialContent, workspace) {
     taskCardChunkType = 'plan';
     taskCardDisplayMode = 'timeline';
     turnCategoryBuffer = new Map();
+    qiStreamOpened = false;
+    qiCategoryLines = new Map();
     turnToolCount = 0;
     turnStopReasonOverride = null;
     pendingTaskCards.clear();
@@ -711,6 +721,13 @@ function runClaudeInteractive(args, initialContent, workspace) {
           if (emitsTaskCard) {
             const title = truncate256(buildToolTitle(block.name, block.input));
             const category = categorizeTool(block.name);
+            if (!qiStreamOpened) {
+              await ipcSend({ type: 'qi_start' });
+              qiStreamOpened = true;
+            }
+            await ipcSend({ type: 'qi_append', category, line: title });
+            if (!qiCategoryLines.has(category)) qiCategoryLines.set(category, []);
+            qiCategoryLines.get(category).push(title);
             if (!turnCategoryBuffer.has(category)) turnCategoryBuffer.set(category, []);
             turnCategoryBuffer.get(category).push(title);
             pendingTaskCards.set(block.id, { toolName: block.name });
@@ -739,18 +756,10 @@ function runClaudeInteractive(args, initialContent, workspace) {
       lastStopReason = turnStopReasonOverride || msg.stop_reason || msg.subtype || null;
       const turnText = msg.result || turnBuffer.join('\n');
       if (turnOpen && onTurnEnd) {
-        if (turnCategoryBuffer.size > 0) {
-          const categories = [];
-          const order = ['工具执行', '其他操作'];
-          for (const cat of order) {
-            const lines = turnCategoryBuffer.get(cat) || [];
-            if (lines.length > 0) categories.push({ title: cat, details: lines.join('\n') });
-          }
-          categories.push({ title: '信息整合', details: `共调用 ${turnToolCount} 次工具` });
+        if (qiStreamOpened) {
           await ipcSend({
-            type: 'final_snapshot',
-            plan_title: '已完成思考',
-            categories,
+            type: 'qi_finalize',
+            tool_count: turnToolCount,
           }).catch(() => {});
         }
         turnOpen = false;
