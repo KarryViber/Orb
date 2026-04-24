@@ -563,43 +563,7 @@ function buildToolTitle(toolName, input) {
 }
 
 function buildStatusText(toolName, input) {
-  const parsedInput = parseToolInput(input);
-
-  if (toolName === 'TodoWrite') return 'updating plan';
-  if (toolName === 'Bash') {
-    const description = parsedInput?.description;
-    if (description && typeof description === 'string' && description.trim()) {
-      return truncateText(description.trim(), 80);
-    }
-    const rawCommand = String(parsedInput?.command ?? parsedInput?.cmd ?? input ?? '').trim();
-    const firstLine = rawCommand.split('\n')[0].trim();
-    const command = truncateText(firstLine, 80);
-    return command ? `running: ${command}` : 'running bash';
-  }
-  if (toolName === 'Write' || toolName === 'NotebookEdit') {
-    const filePath = parsedInput?.file_path || parsedInput?.notebook_path || 'unknown';
-    return `writing: ${String(filePath).split('/').filter(Boolean).pop() || filePath}`;
-  }
-  if (toolName === 'Edit') {
-    const filePath = parsedInput?.file_path || 'unknown';
-    return `editing: ${String(filePath).split('/').filter(Boolean).pop() || filePath}`;
-  }
-  if (toolName === 'Skill') {
-    const skillName = parsedInput?.skill_name || parsedInput?.name || parsedInput?.skill || 'skill';
-    return `using skill: ${truncateText(String(skillName), 40)}`;
-  }
-  if (toolName === 'WebFetch') {
-    const url = parsedInput?.url || '';
-    try {
-      return `fetching: ${new URL(url).hostname || url}`;
-    } catch {
-      return `fetching: ${truncateText(String(url), 60) || 'url'}`;
-    }
-  }
-  if (toolName === 'WebSearch') return 'searching web';
-  if (toolName === 'Task' || toolName === 'Agent') return 'delegating task';
-
-  return `working: ${truncateText(String(toolName || 'task'), 40)}`;
+  return truncateText(buildToolTitle(toolName, input), 80);
 }
 
 function extractToolResultText(content) {
@@ -844,11 +808,17 @@ function runClaudeInteractive(args, initialContent, workspace) {
     if (msg.type === 'user' && Array.isArray(msg.message?.content)) {
       for (const block of msg.message.content) {
         if (!block?.tool_use_id || !pendingTaskCards.has(block.tool_use_id)) continue;
+        const pending = pendingTaskCards.get(block.tool_use_id);
+        const toolName = pending?.toolName || '';
+        let output = '';
+        if (toolName === 'Task' || toolName === 'Agent' || toolName === 'Skill') {
+          output = truncateText(extractToolResultText(block.content), 160);
+        }
         ipcSend({
           type: 'tool_result',
           task_id: block.tool_use_id,
           status: block.is_error ? 'error' : 'complete',
-          output: truncate256(extractToolResultText(block.content)),
+          output,
         }).catch(() => {});
         pendingTaskCards.delete(block.tool_use_id);
         inProgressTaskCards.delete(block.tool_use_id);
