@@ -386,6 +386,20 @@ function assertStreamTaskField(fieldName, value) {
   return text;
 }
 
+function preserveStreamTaskField(fieldName, value) {
+  if (value == null) return '';
+  const text = String(value);
+  if (text.length > STREAM_TASK_FIELD_LIMIT) {
+    throw buildStreamAPIError(
+      'appendStream',
+      'invalid_chunks',
+      null,
+      `invalid_chunks (${fieldName} exceeds ${STREAM_TASK_FIELD_LIMIT} chars)`,
+    );
+  }
+  return text;
+}
+
 export class SlackAdapter extends PlatformAdapter {
   constructor({ botToken, appToken, allowBots, replyBroadcast, freeResponseChannels, freeResponseUsers, dmRouting, getProfilePaths }) {
     super();
@@ -1253,7 +1267,7 @@ export class SlackAdapter extends PlatformAdapter {
         chunk.status = 'in_progress';
       }
 
-      const details = typeof taskLike.details === 'string' ? assertStreamTaskField('details', taskLike.details) : '';
+      const details = typeof taskLike.details === 'string' ? preserveStreamTaskField('details', taskLike.details) : '';
       const output = typeof taskLike.output === 'string' ? assertStreamTaskField('output', taskLike.output) : '';
       if (details) chunk.details = details;
       if (output) chunk.output = output;

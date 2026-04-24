@@ -88,6 +88,7 @@ let _activeCli = null;   // reference to active interactive CLI session
 // exitResult.lastTurnText and suppresses duplicate result text when the
 // scheduler has already handled that turn through turn_complete delivery.
 let _lastEmittedTurnText = null;
+let _currentTurnTopic = '已完成思考';
 
 process.on('message', async (msg) => {
   if (msg.type === 'inject') {
@@ -95,6 +96,7 @@ process.on('message', async (msg) => {
       const injected = _activeCli.inject(msg.userText, msg.fileContent, msg.imagePaths);
       if (injected) {
         _lastEmittedTurnText = null;
+        _currentTurnTopic = summarizeTurnTopic(msg.userText);
         await ipcSend({ type: 'turn_start', injectId: msg.injectId || null }).catch(() => {});
         console.log(`[worker] injected: "${(msg.userText || '').slice(0, 60)}"`);
       } else {
@@ -124,6 +126,7 @@ process.on('message', async (msg) => {
   if (msg.type !== 'task') return;
 
   _lastEmittedTurnText = null;
+  _currentTurnTopic = summarizeTurnTopic(msg.userText);
   await ipcSend({ type: 'turn_start' }).catch(() => {});
 
   let { userText, fileContent, imagePaths, threadTs, channel, userId, platform, profile, threadHistory, model, effort, mode, priorConversation, disablePermissionPrompt, maxTurns } = msg;
@@ -353,6 +356,12 @@ function truncateText(text, maxChars) {
   return `${normalized.slice(0, maxChars - 3)}...`;
 }
 
+function summarizeTurnTopic(userText) {
+  const s = String(userText || '').trim().replace(/\s+/g, ' ');
+  if (!s) return '已完成思考';
+  return truncateText(s, 40);
+}
+
 function formatElapsedTime(startedAt, now = Date.now()) {
   const elapsedSeconds = Math.max(0, Math.floor((now - startedAt) / 1000));
   if (elapsedSeconds < 60) return `${elapsedSeconds}s`;
@@ -500,52 +509,52 @@ function buildToolTitle(toolName, input) {
   if (toolName === 'Bash') {
     const description = parsedInput?.description;
     if (description && typeof description === 'string' && description.trim()) {
-      return title(`执行: ${description.trim()}`);
+      return title(`Bash: ${description.trim()}`);
     }
     const command = parsedInput?.command ?? parsedInput?.cmd ?? input;
-    return title(`执行: ${firstNonFlagToken(command)}`);
+    return title(`Bash: ${firstNonFlagToken(command)}`);
   }
   if (toolName === 'Read') {
-    return title(`阅读 ${basename(parsedInput?.file_path)}`);
+    return title(`Read: ${basename(parsedInput?.file_path)}`);
   }
   if (toolName === 'Edit') {
-    return title(`修改 ${basename(parsedInput?.file_path)}`);
+    return title(`Edit: ${basename(parsedInput?.file_path)}`);
   }
   if (toolName === 'Write') {
-    return title(`新建 ${basename(parsedInput?.file_path)}`);
+    return title(`Write: ${basename(parsedInput?.file_path)}`);
   }
   if (toolName === 'Grep') {
-    return title(`搜索「${parsedInput?.pattern || 'unknown'}」`);
+    return title(`Grep: ${parsedInput?.pattern || 'unknown'}`);
   }
   if (toolName === 'Glob') {
-    return title(`查找 ${parsedInput?.pattern || 'unknown'}`);
+    return title(`Glob: ${parsedInput?.pattern || 'unknown'}`);
   }
   if (toolName === 'WebSearch') {
-    return title(`搜索「${parsedInput?.query || 'unknown'}」`);
+    return title(`WebSearch: ${parsedInput?.query || 'unknown'}`);
   }
   if (toolName === 'NotebookEdit') {
-    return title(`编辑 notebook ${basename(parsedInput?.notebook_path)}`);
+    return title(`NotebookEdit: ${basename(parsedInput?.notebook_path)}`);
   }
   if (toolName === 'Skill') {
     const description = parsedInput?.description || parsedInput?.skill_description;
     const skillName = parsedInput?.skill_name || parsedInput?.name || parsedInput?.skill || 'unknown';
-    return title(`调用技能: ${description || skillName}`);
+    return title(`Skill: ${description || skillName}`);
   }
   if (toolName === 'Task' || toolName === 'Agent') {
     const desc = parsedInput?.description || parsedInput?.subagent_type || 'sub-agent';
-    return title(`委派子任务: ${desc}`);
+    return title(`Agent: ${desc}`);
   }
   if (toolName === 'WebFetch') {
     const url = parsedInput?.url || '';
     try {
-      return title(`访问 ${new URL(url).hostname || url}`);
+      return title(`WebFetch: ${new URL(url).hostname || url}`);
     } catch {
-      return title(`访问 ${truncateText(url, 80) || 'unknown'}`);
+      return title(`WebFetch: ${truncateText(url, 80) || 'unknown'}`);
     }
   }
 
   const summary = summarizePrimitiveParams(parsedInput);
-  return title(summary ? `${toolName}: ${summary}` : String(toolName || 'unknown'));
+  return title(summary ? `${toolName}: ${summary}` : `${toolName || 'unknown'}:`);
 }
 
 function buildStatusText(toolName, input) {
@@ -722,7 +731,7 @@ function runClaudeInteractive(args, initialContent, workspace) {
             const title = truncate256(buildToolTitle(block.name, block.input));
             const category = categorizeTool(block.name);
             if (!qiStreamOpened) {
-              await ipcSend({ type: 'qi_start' });
+              await ipcSend({ type: 'qi_start', title: _currentTurnTopic });
               qiStreamOpened = true;
             }
             await ipcSend({ type: 'qi_append', category, line: title });
