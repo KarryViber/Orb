@@ -33,9 +33,6 @@ import { storeConversation } from './memory.js';
  *   { type: 'plan_snapshot', title, chunk_type, display_mode, rows }  — task-card path:
  *     TodoWrite-only full snapshot for plan rendering; rows replace the current
  *     plan-card contents in one scheduler update.
- *   { type: 'final_snapshot', plan_title, categories }  — task-card path:
- *     non-TodoWrite final plan-mode snapshot; scheduler starts one stream with
- *     all initial chunks and immediately stops it.
  *   { type: 'qi_start' }  — realtime Qi task-card path:
  *     opens a plan-mode stream shell before non-TodoWrite tool rows append.
  *   { type: 'qi_append', category, line }  — realtime Qi task-card path:
