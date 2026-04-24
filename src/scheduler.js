@@ -9,7 +9,7 @@ import { listFacts, storeLesson, storeCorrectionLesson, purgeTransient, lintMemo
 import { spawnWorker } from './spawn.js';
 import { getDefaults } from './config.js';
 import { EgressGate } from './egress.js';
-import { buildTaskUpdateChunks, extractSuggestedPrompts } from './adapters/slack-format.js';
+import { extractSuggestedPrompts } from './adapters/slack-format.js';
 const TAG = 'scheduler';
 const DRAIN_TIMEOUT = 30_000;
 const SKILL_REVIEW_THRESHOLD = 10;   // cumulative tool uses before triggering review
@@ -17,8 +17,6 @@ const MEMORY_SYNC_THRESHOLD = 20;    // cumulative tool uses before memory/user 
 const MEMORY_SYNC_INTERVAL = 6 * 60 * 60 * 1000;  // min 6h between syncs per profile
 const MAX_AUTO_CONTINUE = 2;  // max auto-retries on empty result (context overflow)
 const PERMISSION_APPROVAL_TIMEOUT_MS = parseInt(process.env.ORB_PERMISSION_TIMEOUT_MS, 10) || 300_000;
-const STREAM_KEEPALIVE_MS = 20_000;
-const STREAM_PHASE_SOFT_LIMIT_MS = 240_000;
 const STATUS_REFRESH_MS = 20_000;
 const SHUTDOWN_QUEUE_FILE = 'shutdown-queue.json';
 const SHUTDOWN_QUEUE_VERSION = 2;
@@ -111,28 +109,6 @@ function getTaskCardStreamErrorCode(err) {
   return match?.[1] || null;
 }
 
-function classifyTaskCardStreamError(err) {
-  const code = getTaskCardStreamErrorCode(err);
-  if (code === 'invalid_chunks' || code === 'invalid_auth') {
-    return { code, level: 'error' };
-  }
-  if (code === 'message_not_in_streaming_state' || code === 'message_not_owned_by_app') {
-    return { code, level: 'warn' };
-  }
-  return { code, level: 'error' };
-}
-
-function resolveTaskCardDisplayMode(chunkType, fallback = 'timeline') {
-  if (chunkType === 'task') return 'plan';
-  return fallback;
-}
-
-function normalizeTaskCardStatus(status, fallback = 'pending') {
-  if (status === 'completed') return 'complete';
-  if (status === 'pending' || status === 'in_progress' || status === 'complete' || status === 'error') return status;
-  return fallback;
-}
-
 export function subtractDeliveredText(finalText, deliveredTexts = []) {
   const text = typeof finalText === 'string' ? finalText : '';
   if (!text.trim()) return '';
@@ -174,119 +150,17 @@ export function makeTaskCardState({ enabled = false, deferred = false } = {}) {
     enabled: Boolean(enabled),
     deferred: Boolean(deferred),
     streamId: null,
-    streamTs: null,
-    streamStartedAt: null,
-    startStreamPromise: null,
-    rotatePromise: null,
-    planSectionPromise: null,
-    pendingAppendPromise: null,
-    chunkType: null,
-    displayMode: null,
-    planTitle: '',
-    lastSentPlanTitle: null,
-    pendingPlanSection: null,
-    taskCards: new Map(),
     failed: false,
-    failureNotified: false,
-    missingThreadWarned: false,
-    bubbleCleared: false,
-    keepaliveTimer: null,
   };
-}
-
-export function buildTaskCardChunksFromState(taskCardState, { updateOnly = false, includePlanUpdate = true } = {}) {
-  const chunks = [];
-  if (includePlanUpdate && taskCardState?.displayMode === 'plan') {
-    const pendingPlanSection = String(taskCardState?.pendingPlanSection || '').trim();
-    if (pendingPlanSection) chunks.push({ type: 'plan_update', title: pendingPlanSection.slice(0, 256) });
-    const planTitle = String(taskCardState?.planTitle || '').trim();
-    if (planTitle) chunks.push({ type: 'plan_update', title: planTitle });
-  }
-  return chunks.concat(buildTaskUpdateChunks(taskCardState?.taskCards, { updateOnly }));
-}
-
-export function shouldIncludeTaskCardPlanUpdate(taskCardState) {
-  if (taskCardState?.displayMode !== 'plan') return false;
-  const planTitle = String(taskCardState?.planTitle || '').trim();
-  if (!planTitle) return false;
-  return planTitle !== String(taskCardState?.lastSentPlanTitle || '').trim();
-}
-
-export function replaceTaskCardSnapshotRows(rows) {
-  const next = new Map();
-  for (const row of Array.isArray(rows) ? rows : []) {
-    const taskId = String(row?.task_id || row?.id || '').trim();
-    if (!taskId) continue;
-    next.set(taskId, {
-      title: String(row?.title || row?.text || 'Task').slice(0, 256),
-      details: '',
-      status: normalizeTaskCardStatus(row?.status),
-      output: String(row?.output || '').trim().slice(0, 256),
-    });
-  }
-  return next;
-}
-
-export async function ensureTaskCardStreamStarted({
-  taskCardState,
-  hasTaskCardThread,
-  disableTaskCardStreaming,
-  adapter,
-  channel,
-  effectiveThreadTs,
-  teamId = null,
-  buildTaskCardChunks,
-  armKeepalive,
-  failTaskCardStream,
-  onStreamStarted,
-}) {
-  if (!taskCardState.enabled || taskCardState.failed) return false;
-  if (!hasTaskCardThread()) {
-    disableTaskCardStreaming('live');
-    return false;
-  }
-  if (taskCardState.streamId) return true;
-  if (taskCardState.startStreamPromise) return taskCardState.startStreamPromise;
-  taskCardState.startStreamPromise = (async () => {
-    try {
-      const stream = await adapter.startStream(channel, effectiveThreadTs, {
-        task_display_mode: taskCardState.displayMode || resolveTaskCardDisplayMode(taskCardState.chunkType, 'timeline'),
-        initial_chunks: buildTaskCardChunks(),
-        team_id: teamId,
-      });
-      taskCardState.streamId = stream?.stream_id || null;
-      taskCardState.streamTs = stream?.ts || null;
-      taskCardState.streamStartedAt = taskCardState.streamId ? Date.now() : null;
-      if (taskCardState.streamId && taskCardState.displayMode === 'plan') {
-        const planTitle = String(taskCardState.planTitle || '').trim();
-        taskCardState.lastSentPlanTitle = planTitle || null;
-      }
-      if (typeof onStreamStarted === 'function') onStreamStarted(stream);
-      if (taskCardState.streamId) armKeepalive();
-      return Boolean(taskCardState.streamId);
-    } catch (err) {
-      await failTaskCardStream(err);
-      return false;
-    } finally {
-      taskCardState.startStreamPromise = null;
-    }
-  })();
-  return taskCardState.startStreamPromise;
 }
 
 function makeTurnState(log, taskCardConfig) {
   return {
-    progressTs: null,
     intermediateDeliveredThisTurn: false,
     typingActive: false,
     pendingThreadStatus: '',
     pendingStatusLoadingMessages: null,
     statusRefreshTimer: null,
-    qiStreamId: null,
-    qiStreamTs: null,
-    qiStartPromise: null,
-    qiAppendPromise: null,
-    qiStreamFailed: false,
     abandoned: false,
     egress: new EgressGate(log),
     taskCardState: makeTaskCardState(taskCardConfig),
@@ -305,58 +179,8 @@ export function buildQiSettledChunks(toolCount = 0, reason = '') {
   ];
 }
 
-export async function closeQiStreamState({
-  turn,
-  adapter,
-  channel,
-  streamId = turn?.qiStreamId,
-  streamTs = turn?.qiStreamTs,
-  toolCount = 0,
-  reason = '',
-  emitFinalize = true,
-  warnFn = () => {},
-}) {
-  if (!turn || !streamId) return false;
-  const chunks = buildQiSettledChunks(toolCount, reason);
-  if (turn.qiAppendPromise) await turn.qiAppendPromise.catch(() => {});
-  if (emitFinalize && typeof adapter?.appendStream === 'function') {
-    try {
-      await adapter.appendStream(streamId, chunks);
-    } catch (err) {
-      warnFn(`[qi_finalize] append failed: ${err.message}`);
-    }
-  }
-  let closed = false;
-  if (typeof adapter?.stopStream === 'function') {
-    try {
-      await adapter.stopStream(streamId, { chunks });
-      closed = true;
-    } catch (err) {
-      warnFn(`[qi_finalize] stop failed: ${err.message}`);
-    }
-  }
-  if (!closed && streamTs && typeof adapter?.editMessage === 'function') {
-    try {
-      await adapter.editMessage(channel, streamTs, 'Settled');
-      closed = true;
-    } catch (err) {
-      warnFn(`[qi_finalize] edit fallback failed: ${err.message}`);
-    }
-  }
-  if (turn.qiStreamId === streamId) {
-    turn.qiStreamId = null;
-    turn.qiStreamTs = null;
-  }
-  turn.qiStreamFailed = false;
-  return closed;
-}
-
 export async function abandonTurnState({
   turn,
-  adapter,
-  channel,
-  taskCardStopPayload = {},
-  warnFn = () => {},
 }) {
   if (!turn || turn.abandoned) return false;
   turn.abandoned = true;
@@ -364,51 +188,8 @@ export async function abandonTurnState({
     clearTimeout(turn.statusRefreshTimer);
     turn.statusRefreshTimer = null;
   }
-  if (turn.taskCardState?.keepaliveTimer) {
-    clearTimeout(turn.taskCardState.keepaliveTimer);
-    turn.taskCardState.keepaliveTimer = null;
-  }
   turn.egress?.reset?.();
-  try {
-    if (turn.taskCardState?.streamId && !turn.taskCardState.failed) {
-      await adapter.stopStream(turn.taskCardState.streamId, {
-        chunks: buildTaskCardChunksFromState(turn.taskCardState),
-        ...taskCardStopPayload,
-      });
-    }
-  } catch (err) {
-    warnFn(`failed to stop abandoned task-card stream: ${err.message}`);
-  } finally {
-    if (turn.taskCardState) {
-      turn.taskCardState.streamId = null;
-      turn.taskCardState.streamTs = null;
-    }
-  }
-  await closeQiStreamState({
-    turn,
-    adapter,
-    channel,
-    reason: 'turn abandoned',
-    emitFinalize: true,
-    warnFn,
-  });
   return true;
-}
-
-function buildTaskCardFallbackMarkdown(taskCards) {
-  if (!(taskCards instanceof Map) || taskCards.size === 0) return '';
-  const lines = [];
-  for (const taskCard of taskCards.values()) {
-    const statusIcon = taskCard.status === 'complete'
-      ? '✅'
-      : taskCard.status === 'error'
-        ? '❌'
-        : '⏳';
-    const title = String(taskCard.title || 'Task').trim();
-    const details = String(taskCard.details || '').trim();
-    lines.push(details ? `${statusIcon} ${title}: ${details}` : `${statusIcon} ${title}`);
-  }
-  return lines.join('\n');
 }
 
 export class EventBus {
@@ -932,26 +713,19 @@ export class Scheduler {
     let workerFailure = null;
     let completionSettled = false;
     let worker;
-    const syncActiveWorkerDeliveryThread = () => {
-      const activeEntry = this.activeWorkers.get(threadTs);
-      if (activeEntry?.worker === worker) {
-        activeEntry.deliveryThreadTs = effectiveThreadTs;
-      }
-    };
-    const hasTaskCardThread = () => effectiveThreadTs != null;
     const canManageThreadStatus = !deferDeliveryUntilResult
       && platform === 'slack'
       && channel != null
       && typeof adapter?.setThreadStatus === 'function';
     const taskCardConfig = {
       enabled: !deferDeliveryUntilResult
-        && platform === 'slack' && channel != null && hasTaskCardThread()
+        && platform === 'slack' && channel != null && effectiveThreadTs != null
         && task.enableTaskCard !== false
         && typeof adapter?.startStream === 'function'
         && typeof adapter?.appendStream === 'function'
         && typeof adapter?.stopStream === 'function',
       deferred: deferDeliveryUntilResult
-        && platform === 'slack' && channel != null && hasTaskCardThread()
+        && platform === 'slack' && channel != null && effectiveThreadTs != null
         && task.enableTaskCard !== false
         && typeof adapter?.startStream === 'function'
         && typeof adapter?.stopStream === 'function',
@@ -1021,462 +795,22 @@ export class Scheduler {
       await applyThreadStatus('');
     };
 
-    const clearKeepalive = (targetTurn = turn) => {
-      if (targetTurn?.taskCardState?.keepaliveTimer) {
-        clearTimeout(targetTurn.taskCardState.keepaliveTimer);
-        targetTurn.taskCardState.keepaliveTimer = null;
-      }
-    };
-    const armKeepalive = () => {
-      clearKeepalive();
-      if (!turn.taskCardState.streamId || turn.taskCardState.failed) return;
-      const capturedTurn = turn;
-      turn.taskCardState.keepaliveTimer = setTimeout(async () => {
-        capturedTurn.taskCardState.keepaliveTimer = null;
-        if (turn !== capturedTurn || capturedTurn.abandoned) return;
-        if (!capturedTurn.taskCardState.streamId || capturedTurn.taskCardState.failed) return;
-        try {
-          await chainTaskCardAppend(async () => {
-            if (turn !== capturedTurn || capturedTurn.abandoned) return false;
-            if (!turn.taskCardState.streamId || turn.taskCardState.failed) return false;
-            const chunks = buildTaskCardChunks();
-            if (!chunks.length) {
-              armKeepalive();
-              return false;
-            }
-            if (!await rotateTaskCardStreamIfNeeded()) return false;
-            await adapter.appendStream(turn.taskCardState.streamId, chunks);
-            armKeepalive();
-            return true;
-          });
-        } catch (err) {
-          warn(TAG, `[task_card] keepalive failed: ${err.message}`);
-          await failTaskCardStream(err);
-        }
-      }, STREAM_KEEPALIVE_MS);
-    };
-
-    const closeQiStream = async (targetTurn = turn, { reason = '', emitFinalize = true, toolCount = 0 } = {}) => {
-      const streamId = targetTurn?.qiStreamId;
-      if (!streamId) return false;
-      return closeQiStreamState({
-        turn: targetTurn,
-        adapter,
-        channel,
-        streamId,
-        streamTs: targetTurn.qiStreamTs,
-        toolCount,
-        reason,
-        emitFinalize,
-        warnFn: (message) => warn(TAG, message),
-      });
-    };
-
     const abandonTurn = async (prevTurn) => {
       if (!prevTurn || prevTurn.abandoned) return;
       clearStatusRefresh(prevTurn);
-      clearKeepalive(prevTurn);
       prevTurn.egress?.reset?.();
       for (const key of [...this._pendingPermissionRequests.keys()]) {
         if (key.startsWith(`${threadTs}:`)) this._pendingPermissionRequests.delete(key);
       }
-      await abandonTurnState({
-        turn: prevTurn,
-        adapter,
-        channel,
-        taskCardStopPayload: { markdown_text: '⚠️ [turn abandoned]' },
-        warnFn: (message) => warn(TAG, message),
-      });
+      await abandonTurnState({ turn: prevTurn });
     };
 
     const resetTaskCardState = () => {
-      // Slack streaming is per-message; every turn starts a fresh stream.
       turn.taskCardState.streamId = null;
-      turn.taskCardState.streamTs = null;
-      turn.taskCardState.streamStartedAt = null;
-      turn.taskCardState.startStreamPromise = null;
-      turn.taskCardState.rotatePromise = null;
-      turn.taskCardState.planSectionPromise = null;
-      turn.taskCardState.pendingAppendPromise = null;
-      turn.taskCardState.chunkType = null;
-      turn.taskCardState.displayMode = null;
-      turn.taskCardState.planTitle = '';
-      turn.taskCardState.lastSentPlanTitle = null;
-      turn.taskCardState.pendingPlanSection = null;
-      turn.taskCardState.taskCards.clear();
       turn.taskCardState.failed = false;
-      turn.taskCardState.failureNotified = false;
-      turn.taskCardState.bubbleCleared = false;
-      clearKeepalive();
-    };
-
-    const markTaskCardFailed = () => {
-      turn.taskCardState.failed = true;
-      turn.egress.reset();
-    };
-
-    const failTaskCardStream = async (err) => {
-      if (turn.taskCardState.failed && turn.taskCardState.failureNotified) return;
-      const failure = classifyTaskCardStreamError(err);
-      const fallbackMarkdown = failure.level === 'warn'
-        ? buildTaskCardFallbackMarkdown(turn.taskCardState.taskCards)
-        : '';
-      const editableTs = turn.taskCardState.streamTs;
-      turn.taskCardState.failed = true;
-      turn.egress.reset(); // [EGF-2] stream 失败后清空 fingerprints，避免污染 fallback 路径的 final/后续 intermediate
-      turn.taskCardState.streamId = null;
-      turn.taskCardState.streamTs = null;
-      turn.taskCardState.streamStartedAt = null;
-      turn.taskCardState.startStreamPromise = null;
-      turn.taskCardState.rotatePromise = null;
-      turn.taskCardState.planSectionPromise = null;
-      turn.taskCardState.pendingAppendPromise = null;
-      clearKeepalive();
-      turn.taskCardState.chunkType = null;
-      turn.taskCardState.displayMode = null;
-      turn.taskCardState.planTitle = '';
-      turn.taskCardState.lastSentPlanTitle = null;
-      turn.taskCardState.pendingPlanSection = null;
-      if (fallbackMarkdown) {
-        let edited = false;
-        if (editableTs && typeof adapter?.editMessage === 'function') {
-          try {
-            await adapter.editMessage(channel, editableTs, fallbackMarkdown);
-            edited = true;
-          } catch (editErr) {
-            warn(TAG, `[task_card] edit-over-canvas failed: ${editErr.message}`);
-          }
-        }
-        if (!edited) {
-          try {
-            await adapter.sendReply(channel, effectiveThreadTs, fallbackMarkdown);
-          } catch (sendErr) {
-            warn(TAG, `[task_card] fallback delivery failed: ${sendErr.message}`);
-          }
-        }
-      }
-      turn.taskCardState.taskCards.clear();
-      const detail = failure.code ? `${failure.code}: ${err.message}` : err.message;
-      if (failure.level === 'warn') warn(TAG, `[task_card] stream degraded: ${detail}`);
-      else logError(TAG, `[task_card] stream failed: ${detail}`);
-      turn.taskCardState.failureNotified = true;
-      if (turn.typingActive) {
-        await startThreadStatusRefresh().catch(() => {});
-      }
-    };
-
-    const disableTaskCardStreaming = (mode) => {
-      if (!turn.taskCardState.missingThreadWarned) {
-        warn(TAG, `[task_card] skipping ${mode} stream: missing delivery thread ts`);
-        turn.taskCardState.missingThreadWarned = true;
-      }
-      turn.taskCardState.enabled = false;
-      turn.taskCardState.deferred = false;
-      turn.taskCardState.streamId = null;
-      turn.taskCardState.streamStartedAt = null;
-      turn.taskCardState.startStreamPromise = null;
-      turn.taskCardState.rotatePromise = null;
-      turn.taskCardState.planSectionPromise = null;
-      turn.taskCardState.pendingAppendPromise = null;
-      turn.taskCardState.chunkType = null;
-      turn.taskCardState.displayMode = null;
-      turn.taskCardState.planTitle = '';
-      turn.taskCardState.lastSentPlanTitle = null;
-      turn.taskCardState.pendingPlanSection = null;
-      turn.taskCardState.taskCards.clear();
-      clearKeepalive();
-    };
-
-    const buildTaskCardChunks = ({ updateOnly = false, includePlanUpdate = true, consumePendingPlanSection = false } = {}) => {
-      const chunks = buildTaskCardChunksFromState(turn.taskCardState, { updateOnly, includePlanUpdate });
-      if (consumePendingPlanSection && includePlanUpdate) {
-        turn.taskCardState.pendingPlanSection = null;
-      }
-      return chunks;
-    };
-
-    const waitForPendingTaskCardAppend = async () => {
-      while (turn.taskCardState.pendingAppendPromise) {
-        const pending = turn.taskCardState.pendingAppendPromise;
-        await pending.catch(() => {});
-        if (turn.taskCardState.pendingAppendPromise === pending) break;
-      }
-    };
-
-    const chainTaskCardAppend = (operation) => {
-      const capturedTurn = turn;
-      const previous = capturedTurn.taskCardState.pendingAppendPromise || Promise.resolve();
-      const current = previous.catch(() => {}).then(operation);
-      const tracked = current.finally(() => {
-        if (turn === capturedTurn && capturedTurn.taskCardState.pendingAppendPromise === tracked) {
-          capturedTurn.taskCardState.pendingAppendPromise = null;
-        }
-      });
-      capturedTurn.taskCardState.pendingAppendPromise = tracked;
-      return tracked;
-    };
-
-    const chainQiAppend = (operation) => {
-      const capturedTurn = turn;
-      const previous = capturedTurn.qiAppendPromise || Promise.resolve();
-      const current = previous.catch(() => {}).then(operation);
-      const tracked = current.finally(() => {
-        if (turn === capturedTurn && capturedTurn.qiAppendPromise === tracked) capturedTurn.qiAppendPromise = null;
-      });
-      capturedTurn.qiAppendPromise = tracked;
-      return tracked;
-    };
-
-    const replaceTaskCardSnapshot = (rows) => {
-      turn.taskCardState.taskCards = replaceTaskCardSnapshotRows(rows);
-    };
-
-    const ensureTaskCardStream = async () => ensureTaskCardStreamStarted({
-      taskCardState: turn.taskCardState,
-      hasTaskCardThread,
-      disableTaskCardStreaming,
-      adapter,
-      channel,
-      effectiveThreadTs,
-      teamId: task.teamId || null,
-      buildTaskCardChunks: () => buildTaskCardChunks({ consumePendingPlanSection: true }),
-      armKeepalive,
-      failTaskCardStream,
-      onStreamStarted: (stream) => {
-        if (!effectiveThreadTs && stream?.ts) {
-          effectiveThreadTs = stream.ts;
-          syncActiveWorkerDeliveryThread();
-        }
-      },
-    });
-
-    const buildTaskCardContinuationBlocks = () => ([
-      {
-        type: 'context',
-        elements: [{ type: 'mrkdwn', text: '↓ 任务继续中…' }],
-      },
-    ]);
-
-    const rotateStream = async () => {
-      if (!turn.taskCardState.streamId || turn.taskCardState.failed) return false;
-      const prevStreamId = turn.taskCardState.streamId;
-      const prevStreamTs = turn.taskCardState.streamTs;
-      clearKeepalive();
-      try {
-        await adapter.stopStream(prevStreamId, {
-          chunks: buildTaskCardChunks(),
-          blocks: buildTaskCardContinuationBlocks(),
-        });
-      } catch (err) {
-        warn(TAG, `rotateStream: stopStream failed, degrading: ${err.message}`);
-        const fallbackMarkdown = [
-          buildTaskCardFallbackMarkdown(turn.taskCardState.taskCards),
-          '↓ 任务继续中…',
-        ].filter(Boolean).join('\n');
-        if (fallbackMarkdown) {
-          let edited = false;
-          if (prevStreamTs && typeof adapter?.editMessage === 'function') {
-            try {
-              await adapter.editMessage(channel, prevStreamTs, fallbackMarkdown);
-              edited = true;
-            } catch (editErr) {
-              warn(TAG, `rotateStream edit-over-canvas failed: ${editErr.message}`);
-            }
-          }
-          if (!edited) {
-            try {
-              await adapter.sendReply(channel, effectiveThreadTs, fallbackMarkdown);
-            } catch (sendErr) {
-              warn(TAG, `rotateStream fallback delivery failed: ${sendErr.message}`);
-            }
-          }
-        }
-      }
-
-      turn.taskCardState.streamId = null;
-      turn.taskCardState.streamTs = null;
-      turn.taskCardState.streamStartedAt = null;
-      turn.taskCardState.startStreamPromise = null;
-      try {
-        const stream = await adapter.startStream(channel, effectiveThreadTs, {
-          task_display_mode: turn.taskCardState.displayMode || resolveTaskCardDisplayMode(turn.taskCardState.chunkType, 'timeline'),
-          initial_chunks: buildTaskCardChunks({ consumePendingPlanSection: true }),
-          team_id: task.teamId || null,
-        });
-        turn.taskCardState.streamId = stream?.stream_id || null;
-        turn.taskCardState.streamTs = stream?.ts || null;
-        turn.taskCardState.streamStartedAt = turn.taskCardState.streamId ? Date.now() : null;
-        if (!effectiveThreadTs && stream?.ts) {
-          effectiveThreadTs = stream.ts;
-          syncActiveWorkerDeliveryThread();
-        }
-        if (turn.taskCardState.streamId && turn.taskCardState.displayMode === 'plan') {
-          turn.taskCardState.lastSentPlanTitle = String(turn.taskCardState.planTitle || '').trim() || null;
-        }
-        if (turn.taskCardState.streamId) armKeepalive();
-        if (turn.taskCardState.streamId) turn.egress.reset();
-        info(TAG, `stream rotated: ${prevStreamId} -> ${turn.taskCardState.streamId} (cards=${turn.taskCardState.taskCards.size})`);
-        return Boolean(turn.taskCardState.streamId);
-      } catch (err) {
-        await failTaskCardStream(err);
-        return false;
-      }
-    };
-
-    const rotateTaskCardStreamIfNeeded = async () => {
-      if (turn.taskCardState.rotatePromise) {
-        const ok = await turn.taskCardState.rotatePromise;
-        return ok && Boolean(turn.taskCardState.streamId) && !turn.taskCardState.failed;
-      }
-      if (!turn.taskCardState.streamId || turn.taskCardState.failed) return false;
-      const startedAt = turn.taskCardState.streamStartedAt;
-      if (!startedAt) {
-        turn.taskCardState.streamStartedAt = Date.now();
-        return true;
-      }
-      if (Date.now() - startedAt < STREAM_PHASE_SOFT_LIMIT_MS) return true;
-      const p = rotateStream().finally(() => {
-        if (turn.taskCardState.rotatePromise === p) {
-          turn.taskCardState.rotatePromise = null;
-        }
-      });
-      turn.taskCardState.rotatePromise = p;
-      return p;
-    };
-
-    const appendTaskCardPlan = async (task_id, updateOnly = false) => {
-      return chainTaskCardAppend(async () => {
-        if (!turn.taskCardState.streamId || turn.taskCardState.failed) return false;
-        const card = turn.taskCardState.taskCards.get(task_id);
-        if (!card) return false;
-        try {
-          const single = new Map([[task_id, card]]);
-          if (!await rotateTaskCardStreamIfNeeded()) return false;
-          await adapter.appendStream(turn.taskCardState.streamId, buildTaskUpdateChunks(single, { updateOnly }));
-          armKeepalive();
-          return true;
-        } catch (err) {
-          await failTaskCardStream(err);
-          return false;
-        }
-      });
-    };
-
-    const appendTaskCardSnapshot = async () => {
-      return chainTaskCardAppend(async () => {
-        if (!turn.taskCardState.streamId || turn.taskCardState.failed) return false;
-        const includePlanUpdate = shouldIncludeTaskCardPlanUpdate(turn.taskCardState);
-        try {
-          if (!await rotateTaskCardStreamIfNeeded()) return false;
-          await adapter.appendStream(
-            turn.taskCardState.streamId,
-            buildTaskCardChunks({ includePlanUpdate }),
-          );
-          if (includePlanUpdate) {
-            turn.taskCardState.lastSentPlanTitle = String(turn.taskCardState.planTitle || '').trim() || null;
-          }
-          armKeepalive();
-          return true;
-        } catch (err) {
-          await failTaskCardStream(err);
-          return false;
-        }
-      });
-    };
-
-    const finalizePendingTaskCards = () => {
-      let changed = false;
-      for (const taskCard of turn.taskCardState.taskCards.values()) {
-        if (taskCard.status === 'in_progress') {
-          taskCard.status = 'error';
-          taskCard.output = taskCard.output || '(no result from tool)';
-          changed = true;
-        }
-      }
-      return changed;
-    };
-
-    const buildFinalTextPayloads = (text) => {
-      const trimmed = String(text || '').trim();
-      if (!trimmed) return [];
-      return adapter.buildPayloads(trimmed);
-    };
-
-    const stopTaskCardStream = async (text) => {
-      if (!turn.taskCardState.streamId || turn.taskCardState.failed) return false;
-      await waitForPendingTaskCardAppend();
-      if (!turn.taskCardState.streamId || turn.taskCardState.failed) return false;
-      clearKeepalive();
-      finalizePendingTaskCards();
-      const finalText = String(text || '').trim();
-      const finalPayloads = buildFinalTextPayloads(finalText);
-      const primaryPayload = finalPayloads.shift() || null;
-      const hasBlocks = !!primaryPayload?.blocks?.length;
-      const wantsMarkdownText = Boolean(finalText) && !hasBlocks;
-      const markdownAllowed = wantsMarkdownText
-        ? turn.egress.admit(finalText, 'stream-close')
-        : false;
-      const stopPayload = {
-        chunks: buildTaskCardChunks(),
-        ...(markdownAllowed ? { markdown_text: finalText } : {}),
-        ...(hasBlocks ? { blocks: primaryPayload.blocks } : {}),
-      };
-      try {
-        await adapter.stopStream(turn.taskCardState.streamId, stopPayload);
-      } catch (err) {
-        const failure = classifyTaskCardStreamError(err);
-        if (failure.code === 'message_not_in_streaming_state' || failure.code === 'message_not_owned_by_app') {
-          warn(TAG, `stopStream degraded to plain message: ${err.message}`);
-          markTaskCardFailed(); // [EGF-2] reset 确保 ssfe-edit / fallback admit 不被前轮 fingerprint 拦截
-          const editableTs = turn.taskCardState.streamTs;
-          let edited = false;
-          if (finalText && editableTs && typeof adapter?.editMessage === 'function') {
-            if (!turn.egress.admit(finalText, 'ssfe-edit')) {
-              // Already delivered via another path — skip the canvas edit
-              // and the raw-send fallback to avoid a duplicate message.
-              edited = true;
-            } else {
-              try {
-                await adapter.editMessage(channel, editableTs, finalText);
-                edited = true;
-              } catch (editErr) {
-                warn(TAG, `stopStream edit-over-canvas failed: ${editErr.message}`);
-              }
-            }
-          }
-          if (!edited) {
-            if (finalText && primaryPayload) await emitPayload(primaryPayload);
-            else if (finalText) await adapter.sendReply(channel, effectiveThreadTs, finalText);
-          }
-          resetTaskCardState();
-          for (const payload of finalPayloads) await emitPayload(payload);
-          return true;
-        }
-        throw err;
-      }
-      resetTaskCardState();
-      for (const payload of finalPayloads) {
-        await emitPayload(payload);
-      }
-      return true;
     };
 
     const finalizeStreamsOnAbnormalExit = async () => {
-      try {
-        if (turn.taskCardState.streamId && !turn.taskCardState.failed) {
-          finalizePendingTaskCards();
-          await stopTaskCardStream('⚠️ [worker 异常终止：timeout/crash/killed]');
-        }
-      } catch (err) {
-        warn(TAG, `failed to finalize task cards after worker exit: ${err.message}`);
-      }
-      try {
-        if (turn.qiStreamId) {
-          await closeQiStream(turn, { reason: 'worker abnormal exit', emitFinalize: true });
-        }
-      } catch (err) {
-        warn(TAG, `failed to finalize Qi stream after worker exit: ${err.message}`);
-      }
       try {
         if (channel != null && effectiveThreadTs != null && !turnDelivered) {
           await adapter.sendReply(channel, effectiveThreadTs, '⚠️ 本轮任务异常终止（worker timeout 或 crash），可发「继续」让我从失败点续做。');
@@ -1523,54 +857,6 @@ export class Scheduler {
 
     const deliverDeferredFinalResult = async (text) => {
       if (!text) return false;
-      if (turn.taskCardState.deferred && turn.taskCardState.taskCards.size > 0) {
-        if (!hasTaskCardThread()) {
-          disableTaskCardStreaming('deferred');
-        } else {
-          try {
-            finalizePendingTaskCards();
-            const finalPayloads = buildFinalTextPayloads(text);
-            const primaryPayload = finalPayloads.shift() || null;
-            const stream = await adapter.startStream(channel, effectiveThreadTs, {
-              task_display_mode: turn.taskCardState.displayMode || resolveTaskCardDisplayMode(turn.taskCardState.chunkType, 'timeline'),
-              initial_chunks: buildTaskCardChunks({ consumePendingPlanSection: true }),
-              team_id: task.teamId || null,
-            });
-            if (!effectiveThreadTs && stream?.ts) {
-              effectiveThreadTs = stream.ts;
-              syncActiveWorkerDeliveryThread();
-            }
-            const stopPayload = {
-              chunks: buildTaskCardChunks(),
-              markdown_text: text,
-              ...(primaryPayload?.blocks?.length ? { blocks: primaryPayload.blocks } : {}),
-            };
-            await adapter.stopStream(stream?.stream_id, stopPayload);
-            for (const payload of finalPayloads) {
-              await emitPayload(payload);
-            }
-            resetTaskCardState();
-            return true;
-          } catch (err) {
-            const failure = classifyTaskCardStreamError(err);
-            if (failure.level === 'warn') {
-              warn(TAG, `deferred task_card delivery degraded to plain message: ${err.message}`);
-              markTaskCardFailed(); // defensive; deferred path doesn't admit today but keep parity with other degrade sites
-              try {
-                const fallbackPayloads = buildFinalTextPayloads(text);
-                for (const payload of fallbackPayloads) await emitPayload(payload);
-                resetTaskCardState();
-                return true;
-              } catch (fallbackErr) {
-                logError(TAG, `deferred fallback delivery failed: ${fallbackErr.message}`);
-              }
-            } else {
-              logError(TAG, `deferred task_card delivery failed: ${err.message}`);
-            }
-          }
-        }
-      }
-
       if (!turn.egress.admit(text, 'deferred')) return true;
       const payloads = adapter.buildPayloads(text);
       for (const payload of payloads) {
@@ -1605,6 +891,10 @@ export class Scheduler {
         timeout: this.timeoutMs,
         label: threadTs,
         onMessage: async (msg) => {
+          // Worker IPC is now lifecycle + event-stream only:
+          // turn_start, turn_end, turn_complete, cc_event, inject_failed,
+          // error, and the process-exit result signal. Slack UI rendering is
+          // driven by cc_event subscribers; legacy UI IPC handlers were removed.
           if (!msg || !msg.type) {
             warn(TAG, `invalid worker message: ${JSON.stringify(msg)?.slice(0, 200)}`);
             return;
@@ -1630,216 +920,6 @@ export class Scheduler {
             }
             return;
           }
-
-          if (msg.type === 'progress_update') {
-            if (deferDeliveryUntilResult) return;
-            if (turn.taskCardState.enabled) return;
-            try {
-              if (!turn.progressTs) {
-                const result = await adapter.sendReply(channel, effectiveThreadTs, msg.text);
-                turn.progressTs = result?.ts || null;
-              } else {
-                await adapter.editMessage(channel, turn.progressTs, msg.text);
-              }
-            } catch (err) {
-              warn(TAG, `progress message failed: ${err.message}`);
-            }
-            return;
-          }
-
-          if (msg.type === 'status_update') {
-            if (deferDeliveryUntilResult) return;
-            await applyThreadStatus(msg.text || '');
-            return;
-          }
-
-          if (msg.type === 'plan_section') {
-            if ((!turn.taskCardState.enabled && !turn.taskCardState.deferred) || turn.taskCardState.failed) return;
-            const title = String(msg.title || '').trim().slice(0, 256);
-            if (!title) return;
-            turn.taskCardState.displayMode = 'plan';
-            if (!turn.taskCardState.enabled || !turn.taskCardState.streamId) {
-              turn.taskCardState.pendingPlanSection = title;
-              return;
-            }
-            const appendPlanSection = chainTaskCardAppend(async () => {
-              turn.taskCardState.pendingPlanSection = null;
-              if (!await rotateTaskCardStreamIfNeeded()) return;
-              await adapter.appendStream(turn.taskCardState.streamId, [{ type: 'plan_update', title }]);
-              armKeepalive();
-            });
-            let trackedPlanSectionPromise;
-            trackedPlanSectionPromise = appendPlanSection.finally(() => {
-              if (turn.taskCardState.planSectionPromise === trackedPlanSectionPromise) {
-                turn.taskCardState.planSectionPromise = null;
-              }
-            });
-            turn.taskCardState.planSectionPromise = trackedPlanSectionPromise;
-            try {
-              await turn.taskCardState.planSectionPromise;
-            } catch (err) {
-              await failTaskCardStream(err);
-            }
-            return;
-          }
-
-          if (msg.type === 'tool_call') {
-            if ((!turn.taskCardState.enabled && !turn.taskCardState.deferred) || turn.taskCardState.failed) return;
-            if (!turn.taskCardState.chunkType && typeof msg.chunk_type === 'string') {
-              turn.taskCardState.chunkType = msg.chunk_type;
-            }
-            if ((msg.override_display_mode || msg.display_mode === 'plan') && typeof msg.display_mode === 'string') {
-              turn.taskCardState.displayMode = msg.display_mode;
-            } else if (!turn.taskCardState.displayMode && typeof msg.display_mode === 'string') {
-              turn.taskCardState.displayMode = msg.display_mode;
-            }
-            if (!turn.taskCardState.displayMode && turn.taskCardState.chunkType) {
-              turn.taskCardState.displayMode = resolveTaskCardDisplayMode(turn.taskCardState.chunkType);
-            }
-            turn.taskCardState.taskCards.set(msg.task_id, {
-              title: msg.title || msg.tool_name || 'Task',
-              details: msg.details || '',
-              status: normalizeTaskCardStatus(msg.status, 'in_progress'),
-              output: '',
-            });
-            if (!turn.taskCardState.enabled) return;
-            const hadStream = Boolean(turn.taskCardState.streamId);
-            const streamReady = await ensureTaskCardStream();
-            if (streamReady && hadStream) {
-              if (turn.taskCardState.planSectionPromise) await turn.taskCardState.planSectionPromise;
-              await appendTaskCardPlan(msg.task_id, true);
-            }
-            return;
-          }
-
-          if (msg.type === 'qi_start') {
-            if (turn.taskCardState.failed) return;
-            if (!turn.taskCardState.enabled && !turn.taskCardState.deferred) return;
-            if (turn.qiStreamId) return;
-            turn.qiStreamFailed = false;
-            if (turn.qiStartPromise) {
-              await turn.qiStartPromise;
-              return;
-            }
-            const initialChunks = [
-              { type: 'plan_update', title: 'Orbiting...' },
-              { type: 'task_update', id: 'qi-exec', title: 'Probe', status: 'in_progress', details: '' },
-              { type: 'task_update', id: 'qi-other', title: 'Delegate', status: 'in_progress', details: '' },
-              { type: 'task_update', id: 'qi-summary', title: 'Distill', status: 'in_progress', details: '' },
-            ];
-            turn.qiStartPromise = (async () => {
-              try {
-                const result = await adapter.startStream(channel, effectiveThreadTs, {
-                  task_display_mode: 'plan',
-                  initial_chunks: initialChunks,
-                  team_id: task.teamId || null,
-                });
-                turn.qiStreamId = result?.stream_id || (result?.ts ? `${channel}:${result.ts}` : null);
-                turn.qiStreamTs = result?.ts || null;
-              } catch (err) {
-                turn.qiStreamFailed = true;
-                warn(TAG, `[qi_start] failed: ${err.message}`);
-              } finally {
-                turn.qiStartPromise = null;
-              }
-            })();
-            await turn.qiStartPromise;
-            return;
-          }
-
-          if (msg.type === 'qi_append') {
-            if (turn.qiStartPromise) await turn.qiStartPromise;
-            const idMap = { Probe: 'qi-exec', Delegate: 'qi-other' };
-            const taskId = idMap[msg.category];
-            if (turn.qiStreamFailed) {
-              warn(TAG, `[qi_append] skipped after qi_start failure: ${msg.category || 'unknown'}`);
-              return;
-            }
-            if (!taskId || !turn.qiStreamId) return;
-            const tracked = chainQiAppend(async () => {
-              if (!turn.qiStreamId) return;
-              await adapter.appendStream(turn.qiStreamId, [
-                { type: 'task_update', id: taskId, title: msg.category, details: `\n${msg.line}\n` },
-              ]);
-            });
-            try {
-              await tracked;
-            } catch (err) {
-              warn(TAG, `[qi_append] failed: ${err.message}`);
-            }
-            return;
-          }
-
-          if (msg.type === 'qi_finalize') {
-            if (turn.qiStartPromise) await turn.qiStartPromise;
-            if (turn.qiAppendPromise) await turn.qiAppendPromise.catch(() => {});
-            if (!turn.qiStreamId) return;
-            const streamId = turn.qiStreamId;
-            await closeQiStream(turn, { reason: '', emitFinalize: true, toolCount: msg.tool_count });
-            if (turn.qiStreamId === streamId) turn.qiStreamId = null;
-            return;
-          }
-
-          if (msg.type === 'plan_title_update') {
-            if ((!turn.taskCardState.enabled && !turn.taskCardState.deferred) || turn.taskCardState.failed) return;
-            const title = String(msg.title || '').trim();
-            if (!title) return;
-            turn.taskCardState.planTitle = title;
-            if (!turn.taskCardState.displayMode) {
-              turn.taskCardState.displayMode = 'plan';
-            }
-            if (!turn.taskCardState.enabled || !turn.taskCardState.streamId) return;
-            try {
-              await chainTaskCardAppend(async () => {
-                if (!turn.taskCardState.streamId || turn.taskCardState.failed) return;
-                if (!await rotateTaskCardStreamIfNeeded()) return;
-                await adapter.appendStream(turn.taskCardState.streamId, [{ type: 'plan_update', title }]);
-                turn.taskCardState.lastSentPlanTitle = title;
-                armKeepalive();
-              });
-            } catch (err) {
-              await failTaskCardStream(err);
-            }
-            return;
-          }
-
-          if (msg.type === 'plan_snapshot') {
-            if ((!turn.taskCardState.enabled && !turn.taskCardState.deferred) || turn.taskCardState.failed) return;
-            if (!turn.taskCardState.chunkType && typeof msg.chunk_type === 'string') {
-              turn.taskCardState.chunkType = msg.chunk_type;
-            }
-            if (!turn.taskCardState.displayMode && typeof msg.display_mode === 'string') {
-              turn.taskCardState.displayMode = msg.display_mode;
-            }
-            if (!turn.taskCardState.displayMode && turn.taskCardState.chunkType) {
-              turn.taskCardState.displayMode = resolveTaskCardDisplayMode(turn.taskCardState.chunkType);
-            }
-            if (typeof msg.title === 'string' && msg.title.trim()) {
-              turn.taskCardState.planTitle = msg.title.trim();
-            }
-            replaceTaskCardSnapshot(msg.rows);
-            if (!turn.taskCardState.enabled) return;
-            const hadStream = Boolean(turn.taskCardState.streamId);
-            const streamReady = await ensureTaskCardStream();
-            if (streamReady && hadStream) {
-              await appendTaskCardSnapshot();
-            }
-            return;
-          }
-
-          if (msg.type === 'tool_result') {
-            if (turn.taskCardState.failed) return;
-            const taskCard = turn.taskCardState.taskCards.get(msg.task_id);
-            if (!taskCard) return;
-            taskCard.status = msg.status || 'complete';
-            taskCard.output = msg.output || '';
-            if (!turn.taskCardState.enabled) return;
-            if (turn.taskCardState.streamId) {
-              await appendTaskCardPlan(msg.task_id, true);
-            }
-            return;
-          }
-
           if (msg.type === 'inject_failed') {
             responded = true;
             const activeEntry = this.activeWorkers.get(threadTs);
@@ -1895,57 +975,6 @@ export class Scheduler {
             return;
           }
 
-          if (msg.type === 'intermediate_text') {
-            if (deferDeliveryUntilResult) return;
-            if (!msg.text?.trim()) return;
-
-            // task-card stream 开着时：把 Orb 的中间 text 作为 markdown_text chunk
-            // append 进流里，形成段落间意图说明的叙事节奏。
-            if (turn.taskCardState.streamId && !turn.taskCardState.failed) {
-              try {
-                const appended = await chainTaskCardAppend(async () => {
-                  if (!turn.taskCardState.streamId || turn.taskCardState.failed) return false;
-                  if (!await rotateTaskCardStreamIfNeeded()) return false;
-                  await adapter.appendStream(turn.taskCardState.streamId, [
-                    { type: 'markdown_text', text: msg.text.trim() },
-                  ]);
-                  return true;
-                });
-                if (appended) {
-                  turn.intermediateDeliveredThisTurn = true;
-                  turn.egress.admit(msg.text, 'intermediate'); // 让 turn_complete 能正确 dedupe
-                  return;
-                }
-              } catch (err) {
-                // ownership / stream-state 错误：标记 failed 并 fall through 到 sendReply
-                const code = err?.data?.error || err?.code || '';
-                if (code === 'message_not_in_streaming_state' || code === 'message_not_owned_by_app') {
-                  warn(TAG, `stream ownership lost, degrading to sendReply: ${code}`);
-                  markTaskCardFailed(); // [EGF-2] reset 避免污染 fallback 路径的 final/后续 intermediate
-                } else {
-                  warn(TAG, `failed to append intermediate markdown_text to stream: ${err.message}`);
-                  return;
-                }
-              }
-            }
-
-            // stream 未开或刚 failed：走原 sendReply 路径
-            if (!turn.egress.admit(msg.text, 'intermediate')) {
-              turn.intermediateDeliveredThisTurn = true;
-              return;
-            }
-            try {
-              const payloads = adapter.buildPayloads(msg.text);
-              for (const payload of payloads) {
-                await adapter.sendReply(channel, effectiveThreadTs, payload.text, payload.blocks ? { blocks: payload.blocks } : {});
-              }
-              turn.intermediateDeliveredThisTurn = true;
-            } catch (err) {
-              warn(TAG, `failed to send intermediate text: ${err.message}`);
-            }
-            return;
-          }
-
           responded = true;
 
           if (msg.type === 'turn_complete') {
@@ -1965,12 +994,6 @@ export class Scheduler {
                 resetTaskCardState();
                 return;
               }
-              if (turn.taskCardState.streamId && !turn.taskCardState.failed) {
-                await stopTaskCardStream(deliveryText);
-                turnDelivered = true;
-                await updateThreadMetadata(metadataText);
-                return;
-              }
               if (deliveryText.trim()) {
                 turnDelivered = true;
                 if (deferDeliveryUntilResult) await deliverDeferredFinalResult(deliveryText);
@@ -1987,7 +1010,6 @@ export class Scheduler {
               await updateThreadMetadata(metadataText);
               resetTaskCardState();
             } catch (err) {
-              if (turn.taskCardState.streamId) await failTaskCardStream(err);
               logError(TAG, `failed to send turn_complete: ${err.message}`);
               const fallbackText = deliveryText;
               const silentDeferredFallback = deferDeliveryUntilResult && isSilentResultText(fallbackText);
@@ -2019,10 +1041,6 @@ export class Scheduler {
             finalResultText = text || '';
             finalStopReason = msg.stopReason || finalStopReason;
             try {
-              if (turn.taskCardState.streamId && !turn.taskCardState.failed && !turnDelivered) {
-                await stopTaskCardStream(text);
-                turnDelivered = true;
-              }
               // 正常流程：turn_complete 已交付内容后，CLI exit 的空 result 是预期的收尾信号
               // 不是真·失败，不应该触发 auto-continue
               if (!text && turnDelivered) {
