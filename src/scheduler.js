@@ -30,6 +30,27 @@ const LOADING_MESSAGES = [
   'Analyzing…',
 ];
 const THINKING_STATUS = LOADING_MESSAGES[0];
+const PERSISTED_TASK_FIELDS = [
+  'userText',
+  'fileContent',
+  'imagePaths',
+  'threadTs',
+  'channel',
+  'userId',
+  'platform',
+  'teamId',
+  'profile',
+  'model',
+  'effort',
+  'maxTurns',
+  'deliveryThreadTs',
+  'rerun',
+  'targetMessageTs',
+  'forceNewWorker',
+  'mode',
+  'priorConversation',
+  'deferDeliveryUntilResult',
+];
 
 // --- Effort escalation keywords ---
 // 命中任一关键词且消息长度 > 20 字 → 升到 xhigh
@@ -64,6 +85,17 @@ function shouldEscalateEffort(text) {
     if (re.test(text)) return true;
   }
   return false;
+}
+
+function sanitizeTaskForPersistence(task) {
+  if (!task || typeof task !== 'object') return null;
+  const persisted = {};
+  for (const field of PERSISTED_TASK_FIELDS) {
+    if (Object.prototype.hasOwnProperty.call(task, field)) {
+      persisted[field] = task[field];
+    }
+  }
+  return persisted;
 }
 
 function isSilentResultText(text) {
@@ -1666,6 +1698,7 @@ export class Scheduler {
       userId,
       deliveryThreadTs: effectiveThreadTs,
       pendingInjects: new Map(),
+      task: sanitizeTaskForPersistence(task),
     });
     worker.on('error', (err) => {
       logError(TAG, `worker error event: pid=${worker.pid} err=${err.message}`);
@@ -1875,10 +1908,12 @@ export class Scheduler {
       }
       const byProfile = new Map();
       const addPersistedTask = (task, threadTs = null) => {
+        const persistedTask = sanitizeTaskForPersistence(task);
+        if (!persistedTask) return;
         let profileName = 'unknown';
         let dataDir = null;
         try {
-          const profile = this.getProfile(task.userId);
+          const profile = this.getProfile(persistedTask.userId);
           profileName = profile.name;
           dataDir = profile.dataDir;
         } catch {}
@@ -1889,15 +1924,25 @@ export class Scheduler {
         const entry = byProfile.get(profileName);
         if (threadTs) {
           if (!entry.threadQueues[threadTs]) entry.threadQueues[threadTs] = [];
-          entry.threadQueues[threadTs].push(task);
+          entry.threadQueues[threadTs].push(persistedTask);
         } else {
-          entry.globalQueue.push(task);
+          entry.globalQueue.push(persistedTask);
         }
       };
 
       for (const task of drained || []) addPersistedTask(task);
       for (const [threadTs, queue] of this.threadQueues) {
         for (const task of queue) addPersistedTask(task, threadTs);
+      }
+      for (const [threadTs, entry] of this.activeWorkers) {
+        if (entry.task) {
+          addPersistedTask(entry.task, threadTs);
+        }
+        if (entry.pendingInjects && entry.pendingInjects.size > 0) {
+          for (const injectTask of entry.pendingInjects.values()) {
+            addPersistedTask(injectTask, threadTs);
+          }
+        }
       }
 
       if (byProfile.size > 0) {
