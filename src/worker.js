@@ -24,20 +24,12 @@ import { storeConversation } from './memory.js';
  *   { type: 'result', text, toolCount, lastTool?, stopReason? }
  *   { type: 'error', error, errorContext? }
  *   { type: 'turn_complete', text, toolCount, lastTool, stopReason, deliveredTexts, undeliveredText? }  — Phase ③: includes delivered set + remaining text
- *   { type: 'progress_update', text }  — Phase ①: fired on each TodoWrite event;
- *     scheduler posts/edits a single progress message in-thread (ts owned by scheduler)
- *     only outside the task-card path / error fallback scenes.
  *   { type: 'plan_title_update', title }  — task-card path:
  *     compatibility path for callers that want to label plan-mode cards.
  *   { type: 'plan_section', title }  — legacy task-card path:
  *     scheduler compatibility handler for non-TodoWrite plan-mode section headers.
- *   { type: 'plan_snapshot', title, chunk_type, display_mode, override_display_mode?, rows }  — task-card path:
- *     TodoWrite-only full snapshot for plan rendering; rows replace the current
- *     plan-card contents in one scheduler update. override_display_mode lets
- *     TodoWrite snapshots force plan mode after earlier non-TodoWrite cards.
  *   { type: 'tool_call', task_id, tool_name, title, details, status?, chunk_type, display_mode? }  — legacy task-card path:
  *     scheduler compatibility handler for incremental task-card tool updates.
- *     TodoWrite synthetic per-todo ids now live inside plan_snapshot.rows[].task_id.
  *   { type: 'tool_result', task_id, status, output }  — legacy task-card path:
  *     scheduler compatibility handler for tool_result completion updates.
  *   { type: 'status_update', text }  — short assistant thread status text;
@@ -343,15 +335,6 @@ process.on('message', async (msg) => {
 const IDLE_TIMEOUT = parseInt(process.env.WORKER_IDLE_TIMEOUT_MS, 10) || 60_000; // idle → close stdin → CLI exits
 const STATUS_HEARTBEAT_MS = 90_000;
 
-function renderTodos(todos) {
-  const lines = [`📋 ${buildPlanSnapshotTitle(todos)}`];
-  for (const t of todos) {
-    const icon = t.status === 'completed' ? '✅' : t.status === 'in_progress' ? '🔄' : '⬜';
-    lines.push(`${icon} ${t.content}`);
-  }
-  return lines.join('\n');
-}
-
 function truncateText(text, maxChars) {
   const normalized = String(text || '').replace(/\s+\n/g, '\n').trim();
   if (normalized.length <= maxChars) return normalized;
@@ -422,36 +405,6 @@ function truncate256(text) {
   const normalized = String(text || '').replace(/\s+\n/g, '\n').trim();
   if (normalized.length <= 256) return normalized;
   return `${normalized.slice(0, 255)}…`;
-}
-
-function mapTodoStatus(status) {
-  if (status === 'completed') return 'complete';
-  if (status === 'in_progress') return 'in_progress';
-  return 'pending';
-}
-
-export function buildPlanSnapshotRows(todos) {
-  if (!Array.isArray(todos)) return [];
-  return todos.map((todo, index) => ({
-    task_id: `todowrite-todo-${index}`,
-    title: truncate256(todo?.content || `Todo ${index + 1}`),
-    status: mapTodoStatus(todo?.status),
-  }));
-}
-
-export function buildPlanSnapshotTitle(todos) {
-  const list = Array.isArray(todos) ? todos : [];
-  const total = list.length;
-  const completed = list.filter((todo) => todo?.status === 'completed').length;
-  const activeTodo = list.find((todo) => todo?.status === 'in_progress');
-
-  if (activeTodo) {
-    return `进度 ${completed}/${total}｜${truncateText(activeTodo.content || '进行中', 40)}`;
-  }
-  if (total > 0 && completed === total) {
-    return `进度 ${total}/${total}｜完成`;
-  }
-  return `进度 ${completed}/${total}`;
 }
 
 export function shouldEmitTaskCardForTool(toolName, input, toolUseId = null) {
@@ -762,19 +715,9 @@ function runClaudeInteractive(args, initialContent, workspace) {
             text: buildStatusText(block.name, block.input),
           }).catch(() => {});
           if (isTodoWriteSnapshot) {
-            const rows = buildPlanSnapshotRows(block.input.todos);
-            if (rows.length > 0) {
-              ipcSend({
-                type: 'plan_snapshot',
-                title: buildPlanSnapshotTitle(block.input.todos),
-                chunk_type: taskCardChunkType,
-                display_mode: taskCardDisplayMode,
-                override_display_mode: true,
-                rows,
-              }).catch(() => {});
+            if (block.input.todos.length > 0) {
               taskCardEmittedInTurn = true;
             }
-            ipcSend({ type: 'progress_update', text: renderTodos(block.input.todos) }).catch(() => {});
             continue;
           }
           if (emitsTaskCard) {

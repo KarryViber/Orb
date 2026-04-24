@@ -618,6 +618,48 @@ function normalizeTaskStatus(status, fallback = 'in_progress') {
   return fallback;
 }
 
+function truncateText(text, maxChars) {
+  const normalized = String(text || '').replace(/\s+\n/g, '\n').trim();
+  if (normalized.length <= maxChars) return normalized;
+  return `${normalized.slice(0, maxChars - 3)}...`;
+}
+
+function truncateTaskField(text) {
+  const normalized = String(text || '').replace(/\s+\n/g, '\n').trim();
+  if (normalized.length <= 256) return normalized;
+  return `${normalized.slice(0, 255)}…`;
+}
+
+function mapTodoStatus(status) {
+  if (status === 'completed') return 'complete';
+  if (status === 'in_progress') return 'in_progress';
+  return 'pending';
+}
+
+export function buildPlanSnapshotRows(todos) {
+  if (!Array.isArray(todos)) return [];
+  return todos.map((todo, index) => ({
+    task_id: `todowrite-todo-${index}`,
+    title: truncateTaskField(todo?.content || `Todo ${index + 1}`),
+    status: mapTodoStatus(todo?.status),
+  }));
+}
+
+export function buildPlanSnapshotTitle(todos) {
+  const list = Array.isArray(todos) ? todos : [];
+  const total = list.length;
+  const completed = list.filter((todo) => todo?.status === 'completed').length;
+  const activeTodo = list.find((todo) => todo?.status === 'in_progress');
+
+  if (activeTodo) {
+    return `进度 ${completed}/${total}｜${truncateText(activeTodo.content || '进行中', 40)}`;
+  }
+  if (total > 0 && completed === total) {
+    return `进度 ${total}/${total}｜完成`;
+  }
+  return `进度 ${completed}/${total}`;
+}
+
 export function buildTaskUpdateChunks(taskCardsMap, { updateOnly = false } = {}) {
   return [...(taskCardsMap?.entries?.() || [])].map(([task_id, card]) => {
     const chunk = {

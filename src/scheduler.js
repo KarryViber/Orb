@@ -472,6 +472,9 @@ export class Scheduler {
     if (name === 'slack' && typeof adapter?.createQiSubscriber === 'function' && !adapter.__orbQiSubscriberUnsubscribe) {
       adapter.__orbQiSubscriberUnsubscribe = this.eventBus.subscribe(adapter.createQiSubscriber());
     }
+    if (name === 'slack' && typeof adapter?.createPlanSubscriber === 'function' && !adapter.__orbPlanSubscriberUnsubscribe) {
+      adapter.__orbPlanSubscriberUnsubscribe = this.eventBus.subscribe(adapter.createPlanSubscriber());
+    }
     setImmediate(() => {
       this.replayQueuedTasks().catch((err) => {
         warn(TAG, `startup replay dispatch failed: ${err.message}`);
