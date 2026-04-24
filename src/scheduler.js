@@ -18,6 +18,7 @@ const MEMORY_SYNC_INTERVAL = 6 * 60 * 60 * 1000;  // min 6h between syncs per pr
 const MAX_AUTO_CONTINUE = 2;  // max auto-retries on empty result (context overflow)
 const PERMISSION_APPROVAL_TIMEOUT_MS = parseInt(process.env.ORB_PERMISSION_TIMEOUT_MS, 10) || 300_000;
 const STREAM_KEEPALIVE_MS = 20_000;
+const STREAM_PHASE_SOFT_LIMIT_MS = 240_000;
 const STATUS_REFRESH_MS = 20_000;
 const SHUTDOWN_QUEUE_FILE = 'shutdown-queue.json';
 const SHUTDOWN_QUEUE_VERSION = 2;
@@ -173,6 +174,7 @@ export function makeTaskCardState({ enabled = false, deferred = false } = {}) {
     deferred: Boolean(deferred),
     streamId: null,
     streamTs: null,
+    streamStartedAt: null,
     startStreamPromise: null,
     chunkType: null,
     displayMode: null,
@@ -247,6 +249,7 @@ export async function ensureTaskCardStreamStarted({
       });
       taskCardState.streamId = stream?.stream_id || null;
       taskCardState.streamTs = stream?.ts || null;
+      taskCardState.streamStartedAt = taskCardState.streamId ? Date.now() : null;
       if (taskCardState.streamId && taskCardState.displayMode === 'plan') {
         const planTitle = String(taskCardState.planTitle || '').trim();
         taskCardState.lastSentPlanTitle = planTitle || null;
@@ -872,6 +875,7 @@ export class Scheduler {
           return;
         }
         try {
+          if (!await rotateTaskCardStreamIfNeeded()) return;
           await adapter.appendStream(turn.taskCardState.streamId, chunks);
           armKeepalive();
         } catch (err) {
@@ -885,6 +889,7 @@ export class Scheduler {
       // Slack streaming is per-message; every turn starts a fresh stream.
       turn.taskCardState.streamId = null;
       turn.taskCardState.streamTs = null;
+      turn.taskCardState.streamStartedAt = null;
       turn.taskCardState.startStreamPromise = null;
       turn.taskCardState.chunkType = null;
       turn.taskCardState.displayMode = null;
@@ -913,6 +918,7 @@ export class Scheduler {
       turn.egress.reset(); // [EGF-2] stream 失败后清空 fingerprints，避免污染 fallback 路径的 final/后续 intermediate
       turn.taskCardState.streamId = null;
       turn.taskCardState.streamTs = null;
+      turn.taskCardState.streamStartedAt = null;
       turn.taskCardState.startStreamPromise = null;
       clearKeepalive();
       turn.taskCardState.chunkType = null;
@@ -955,6 +961,7 @@ export class Scheduler {
       turn.taskCardState.enabled = false;
       turn.taskCardState.deferred = false;
       turn.taskCardState.streamId = null;
+      turn.taskCardState.streamStartedAt = null;
       turn.taskCardState.startStreamPromise = null;
       turn.taskCardState.chunkType = null;
       turn.taskCardState.displayMode = null;
@@ -991,12 +998,96 @@ export class Scheduler {
       },
     });
 
+    const buildTaskCardContinuationBlocks = () => ([
+      {
+        type: 'context',
+        elements: [{ type: 'mrkdwn', text: '↓ 任务继续中…' }],
+      },
+    ]);
+
+    const rotateStream = async () => {
+      if (!turn.taskCardState.streamId || turn.taskCardState.failed) return false;
+      const prevStreamId = turn.taskCardState.streamId;
+      const prevStreamTs = turn.taskCardState.streamTs;
+      clearKeepalive();
+      try {
+        await adapter.stopStream(prevStreamId, {
+          chunks: buildTaskCardChunks(),
+          blocks: buildTaskCardContinuationBlocks(),
+        });
+      } catch (err) {
+        warn(TAG, `rotateStream: stopStream failed, degrading: ${err.message}`);
+        const fallbackMarkdown = [
+          buildTaskCardFallbackMarkdown(turn.taskCardState.taskCards),
+          '↓ 任务继续中…',
+        ].filter(Boolean).join('\n');
+        if (fallbackMarkdown) {
+          let edited = false;
+          if (prevStreamTs && typeof adapter?.editMessage === 'function') {
+            try {
+              await adapter.editMessage(channel, prevStreamTs, fallbackMarkdown);
+              edited = true;
+            } catch (editErr) {
+              warn(TAG, `rotateStream edit-over-canvas failed: ${editErr.message}`);
+            }
+          }
+          if (!edited) {
+            try {
+              await adapter.sendReply(channel, effectiveThreadTs, fallbackMarkdown);
+            } catch (sendErr) {
+              warn(TAG, `rotateStream fallback delivery failed: ${sendErr.message}`);
+            }
+          }
+        }
+      }
+
+      turn.taskCardState.streamId = null;
+      turn.taskCardState.streamTs = null;
+      turn.taskCardState.streamStartedAt = null;
+      turn.taskCardState.startStreamPromise = null;
+      try {
+        const stream = await adapter.startStream(channel, effectiveThreadTs, {
+          task_display_mode: turn.taskCardState.displayMode || resolveTaskCardDisplayMode(turn.taskCardState.chunkType, 'timeline'),
+          initial_chunks: buildTaskCardChunks(),
+          team_id: task.teamId || null,
+        });
+        turn.taskCardState.streamId = stream?.stream_id || null;
+        turn.taskCardState.streamTs = stream?.ts || null;
+        turn.taskCardState.streamStartedAt = turn.taskCardState.streamId ? Date.now() : null;
+        if (!effectiveThreadTs && stream?.ts) {
+          effectiveThreadTs = stream.ts;
+          syncActiveWorkerDeliveryThread();
+        }
+        if (turn.taskCardState.streamId && turn.taskCardState.displayMode === 'plan') {
+          turn.taskCardState.lastSentPlanTitle = String(turn.taskCardState.planTitle || '').trim() || null;
+        }
+        if (turn.taskCardState.streamId) armKeepalive();
+        info(TAG, `stream rotated: ${prevStreamId} -> ${turn.taskCardState.streamId} (cards=${turn.taskCardState.taskCards.size})`);
+        return Boolean(turn.taskCardState.streamId);
+      } catch (err) {
+        await failTaskCardStream(err);
+        return false;
+      }
+    };
+
+    const rotateTaskCardStreamIfNeeded = async () => {
+      if (!turn.taskCardState.streamId || turn.taskCardState.failed) return false;
+      const startedAt = turn.taskCardState.streamStartedAt;
+      if (!startedAt) {
+        turn.taskCardState.streamStartedAt = Date.now();
+        return true;
+      }
+      if (Date.now() - startedAt < STREAM_PHASE_SOFT_LIMIT_MS) return true;
+      return rotateStream();
+    };
+
     const appendTaskCardPlan = async (task_id, updateOnly = false) => {
       if (!turn.taskCardState.streamId || turn.taskCardState.failed) return false;
       const card = turn.taskCardState.taskCards.get(task_id);
       if (!card) return false;
       try {
         const single = new Map([[task_id, card]]);
+        if (!await rotateTaskCardStreamIfNeeded()) return false;
         await adapter.appendStream(turn.taskCardState.streamId, buildTaskUpdateChunks(single, { updateOnly }));
         armKeepalive();
         return true;
@@ -1010,6 +1101,7 @@ export class Scheduler {
       if (!turn.taskCardState.streamId || turn.taskCardState.failed) return false;
       const includePlanUpdate = shouldIncludeTaskCardPlanUpdate(turn.taskCardState);
       try {
+        if (!await rotateTaskCardStreamIfNeeded()) return false;
         await adapter.appendStream(
           turn.taskCardState.streamId,
           buildTaskCardChunks({ includePlanUpdate }),
@@ -1285,6 +1377,7 @@ export class Scheduler {
             }
             if (!turn.taskCardState.enabled || !turn.taskCardState.streamId) return;
             try {
+              if (!await rotateTaskCardStreamIfNeeded()) return;
               await adapter.appendStream(turn.taskCardState.streamId, [{ type: 'plan_update', title }]);
               turn.taskCardState.lastSentPlanTitle = title;
               armKeepalive();
@@ -1397,12 +1490,14 @@ export class Scheduler {
             // append 进流里，形成段落间意图说明的叙事节奏。
             if (turn.taskCardState.streamId && !turn.taskCardState.failed) {
               try {
-                await adapter.appendStream(turn.taskCardState.streamId, [
-                  { type: 'markdown_text', text: msg.text.trim() },
-                ]);
-                turn.intermediateDeliveredThisTurn = true;
-                turn.egress.admit(msg.text, 'intermediate'); // 让 turn_complete 能正确 dedupe
-                return;
+                if (await rotateTaskCardStreamIfNeeded()) {
+                  await adapter.appendStream(turn.taskCardState.streamId, [
+                    { type: 'markdown_text', text: msg.text.trim() },
+                  ]);
+                  turn.intermediateDeliveredThisTurn = true;
+                  turn.egress.admit(msg.text, 'intermediate'); // 让 turn_complete 能正确 dedupe
+                  return;
+                }
               } catch (err) {
                 // ownership / stream-state 错误：标记 failed 并 fall through 到 sendReply
                 const code = err?.data?.error || err?.code || '';
