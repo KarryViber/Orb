@@ -189,7 +189,7 @@ Worker no longer emits Slack UI primitives. It forwards Claude Code events as `c
 - Slack adapter subscriber owns per-turn Qi stream state.
 - It starts a `task_display_mode: 'plan'` stream with `Orbiting...` plus `Probe` / `Delegate` / `Distill` placeholders.
 - Per-tool appends use `task_update.details` deltas, relying on Slack's cross-append concat behavior for repeated `task_update.id`.
-- On `cc_event result`, it appends settled chunks and stops the stream.
+- On `cc_event result`, it stops the stream with settled chunks only; do not append the same final chunks first.
 
 **TodoWrite plan stream**:
 - Slack adapter subscriber owns per-turn plan stream state.

@@ -123,101 +123,17 @@ function buildPlanSnapshotChunks(todos) {
   ];
 }
 
-export function createSlackQiSubscriber(adapter) {
+function createCcSubscriber(adapter, {
+  matchTool,
+  makeState,
+  buildToolChunks,
+  getInitialChunks,
+  onResult,
+}) {
   const turns = new Map();
   const getState = (turnId) => {
-    const key = turnId || 'default';
-    if (!turns.has(key)) turns.set(key, makeQiTurnState());
-    return turns.get(key);
-  };
-
-  const ensureStarted = async (state, ctx) => {
-    if (state.streamId || state.failed) return Boolean(state.streamId);
-    if (state.startPromise) {
-      await state.startPromise;
-      return Boolean(state.streamId);
-    }
-    const channel = ctx?.channel || ctx?.task?.channel;
-    const threadTs = ctx?.effectiveThreadTs || ctx?.threadTs || ctx?.task?.threadTs;
-    if (!channel || !threadTs) return false;
-    state.startPromise = (async () => {
-      try {
-        const stream = await adapter.startStream(channel, threadTs, {
-          task_display_mode: 'plan',
-          initial_chunks: QI_INITIAL_CHUNKS,
-          team_id: ctx?.task?.teamId || ctx?.teamId || null,
-        });
-        state.streamId = stream?.stream_id || (stream?.ts ? `${channel}:${stream.ts}` : null);
-        state.streamTs = stream?.ts || null;
-      } catch (err) {
-        state.failed = true;
-        warn(TAG, `[qi_subscriber] start failed: ${err.message}`);
-      } finally {
-        state.startPromise = null;
-      }
-    })();
-    await state.startPromise;
-    return Boolean(state.streamId);
-  };
-
-  const chainAppend = (state, operation) => {
-    const previous = state.appendPromise || Promise.resolve();
-    const next = previous.catch(() => {}).then(operation);
-    state.appendPromise = next.finally(() => {
-      if (state.appendPromise === next) state.appendPromise = null;
-    });
-    return state.appendPromise;
-  };
-
-  return {
-    match: (msg) => msg?.type === 'cc_event' && (msg.eventType === 'tool_use' || msg.eventType === 'result'),
-    async handle(msg, ctx = {}) {
-      const state = getState(msg.turnId);
-      if (msg.eventType === 'tool_use') {
-        const category = categorizeTool(msg.payload?.name);
-        if (!category) return;
-        const taskCardState = ctx?.turn?.taskCardState;
-        if (taskCardState && !taskCardState.enabled && !taskCardState.deferred) return;
-        if (taskCardState?.failed) return;
-        state.toolCount += 1;
-        if (!await ensureStarted(state, ctx)) return;
-        const taskId = QI_TASK_IDS[category];
-        if (!taskId || state.failed || !state.streamId) return;
-        await chainAppend(state, async () => {
-          if (!state.streamId) return;
-          await adapter.appendStream(state.streamId, [
-            { type: 'task_update', id: taskId, title: category, details: `\n${buildQiToolLine(msg.payload)}\n` },
-          ]);
-        }).catch((err) => {
-          warn(TAG, `[qi_subscriber] append failed: ${err.message}`);
-        });
-        return;
-      }
-
-      if (state.startPromise) await state.startPromise;
-      if (state.appendPromise) await state.appendPromise.catch(() => {});
-      if (!state.streamId) {
-        turns.delete(msg.turnId || 'default');
-        return;
-      }
-      const streamId = state.streamId;
-      const chunks = buildQiSettledChunks(state.toolCount);
-      try {
-        await adapter.stopStream(streamId, { chunks });
-      } catch (err) {
-        warn(TAG, `[qi_subscriber] stop failed: ${err.message}`);
-      } finally {
-        turns.delete(msg.turnId || 'default');
-      }
-    },
-  };
-}
-
-export function createSlackPlanSubscriber(adapter) {
-  const turns = new Map();
-  const getState = (turnId) => {
-    const key = turnId || 'default';
-    if (!turns.has(key)) turns.set(key, makePlanTurnState());
+    const key = getTurnKey(turnId);
+    if (!turns.has(key)) turns.set(key, makeState());
     return turns.get(key);
   };
 
@@ -241,7 +157,7 @@ export function createSlackPlanSubscriber(adapter) {
         state.streamTs = stream?.ts || null;
       } catch (err) {
         state.failed = true;
-        warn(TAG, `[plan_subscriber] start failed: ${err.message}`);
+        warn(TAG, `[cc_subscriber] start failed: ${err.message}`);
       } finally {
         state.startPromise = null;
       }
@@ -262,22 +178,22 @@ export function createSlackPlanSubscriber(adapter) {
   return {
     match: (msg) => msg?.type === 'cc_event' && (msg.eventType === 'tool_use' || msg.eventType === 'result'),
     async handle(msg, ctx = {}) {
-      const key = msg.turnId || 'default';
+      const key = getTurnKey(msg.turnId);
       const state = getState(msg.turnId);
-
       if (msg.eventType === 'tool_use') {
-        if (msg.payload?.name !== 'TodoWrite' || !Array.isArray(msg.payload?.input?.todos)) return;
-        const chunks = buildPlanSnapshotChunks(msg.payload.input.todos);
-        if (chunks.length === 0) return;
-        state.lastChunks = chunks;
+        if (!matchTool(msg, ctx, state)) return;
+        const chunks = buildToolChunks(msg, ctx, state);
+        if (!Array.isArray(chunks) || chunks.length === 0) return;
         const hadStream = Boolean(state.streamId);
-        if (!await ensureStarted(state, ctx, chunks)) return;
-        if (!hadStream) return;
+        const initialChunks = getInitialChunks(msg, ctx, state, chunks);
+        if (!await ensureStarted(state, ctx, initialChunks)) return;
+        if (!hadStream && initialChunks === chunks) return;
+        if (state.failed || !state.streamId) return;
         await chainAppend(state, async () => {
           if (!state.streamId) return;
           await adapter.appendStream(state.streamId, chunks);
         }).catch((err) => {
-          warn(TAG, `[plan_subscriber] append failed: ${err.message}`);
+          warn(TAG, `[cc_subscriber] append failed: ${err.message}`);
         });
         return;
       }
@@ -289,15 +205,54 @@ export function createSlackPlanSubscriber(adapter) {
         return;
       }
       const streamId = state.streamId;
+      const chunks = onResult(msg, ctx, state);
       try {
-        await adapter.stopStream(streamId, { chunks: state.lastChunks });
+        await adapter.stopStream(streamId, { chunks });
       } catch (err) {
-        warn(TAG, `[plan_subscriber] stop failed: ${err.message}`);
+        warn(TAG, `[cc_subscriber] stop failed: ${err.message}`);
       } finally {
         turns.delete(key);
       }
     },
   };
+}
+
+export function createSlackQiSubscriber(adapter) {
+  return createCcSubscriber(adapter, {
+    makeState: makeQiTurnState,
+    matchTool(msg, ctx) {
+      const category = categorizeTool(msg.payload?.name);
+      if (!category) return false;
+      const taskCardState = ctx?.turn?.taskCardState;
+      if (taskCardState && !taskCardState.enabled && !taskCardState.deferred) return false;
+      return !taskCardState?.failed;
+    },
+    buildToolChunks(msg, ctx, state) {
+      const category = categorizeTool(msg.payload?.name);
+      const taskId = QI_TASK_IDS[category];
+      if (!taskId) return [];
+      state.toolCount += 1;
+      return [
+        { type: 'task_update', id: taskId, title: category, details: `\n${buildQiToolLine(msg.payload)}\n` },
+      ];
+    },
+    getInitialChunks: () => QI_INITIAL_CHUNKS,
+    onResult: (msg, ctx, state) => buildQiSettledChunks(state.toolCount),
+  });
+}
+
+export function createSlackPlanSubscriber(adapter) {
+  return createCcSubscriber(adapter, {
+    makeState: makePlanTurnState,
+    matchTool: (msg) => msg.payload?.name === 'TodoWrite' && Array.isArray(msg.payload?.input?.todos),
+    buildToolChunks(msg, ctx, state) {
+      const chunks = buildPlanSnapshotChunks(msg.payload.input.todos);
+      state.lastChunks = chunks;
+      return chunks;
+    },
+    getInitialChunks: (msg, ctx, state, chunks) => chunks,
+    onResult: (msg, ctx, state) => state.lastChunks,
+  });
 }
 
 export function createSlackTextSubscriber(adapter, { debounceMs = TEXT_DEBOUNCE_MS } = {}) {
