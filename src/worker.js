@@ -32,11 +32,8 @@ import { storeConversation } from './memory.js';
  *     scheduler compatibility handler for incremental task-card tool updates.
  *   { type: 'tool_result', task_id, status, output }  — legacy task-card path:
  *     scheduler compatibility handler for tool_result completion updates.
- *   { type: 'status_update', text }  — short assistant thread status text;
- *     emitted when a tool starts, refreshed during long task-card tools, and cleared with empty text on turn_complete.
  *   { type: 'turn_start', injectId? }  — explicit turn ownership start on task/inject receipt
  *   { type: 'turn_end' }  — explicit turn ownership end when Claude emits result
- *   { type: 'intermediate_text', text }  — Phase ③: mid-turn text block, debounced 2s
  *   { type: 'inject_failed', injectId?, userText, fileContent?, imagePaths? }  — follow-up inject could not reach CLI;
  *     scheduler should respawn a fresh worker and replay the user payload.
  */
@@ -248,11 +245,6 @@ process.on('message', async (msg) => {
         clearCcTurn();
       });
 
-      // Phase ③: stream mid-turn text blocks as they arrive
-      cli.setOnIntermediateText(async (text) => {
-        await ipcSend({ type: 'intermediate_text', text }).catch(() => {});
-      });
-
       return cli;
     };
 
@@ -333,8 +325,6 @@ process.on('message', async (msg) => {
 });
 
 const IDLE_TIMEOUT = parseInt(process.env.WORKER_IDLE_TIMEOUT_MS, 10) || 60_000; // idle → close stdin → CLI exits
-const STATUS_HEARTBEAT_MS = 90_000;
-
 function truncateText(text, maxChars) {
   const normalized = String(text || '').replace(/\s+\n/g, '\n').trim();
   if (normalized.length <= maxChars) return normalized;
@@ -391,14 +381,6 @@ function sendCcEvent(eventType, payload) {
     eventType,
     payload,
   }).catch(() => {});
-}
-
-function formatElapsedTime(startedAt, now = Date.now()) {
-  const elapsedSeconds = Math.max(0, Math.floor((now - startedAt) / 1000));
-  if (elapsedSeconds < 60) return `${elapsedSeconds}s`;
-  const elapsedMinutes = Math.floor(elapsedSeconds / 60);
-  if (elapsedMinutes < 60) return `${elapsedMinutes}m ${elapsedSeconds % 60}s`;
-  return `${Math.floor(elapsedMinutes / 60)}h ${elapsedMinutes % 60}m`;
 }
 
 function truncate256(text) {
@@ -552,10 +534,6 @@ function buildToolTitle(toolName, input) {
   return title(summary ? `${toolName}: ${summary}` : `${toolName || 'unknown'}:`);
 }
 
-function buildStatusText(toolName, input) {
-  return truncateText(buildToolTitle(toolName, input), 80);
-}
-
 function runClaudeInteractive(args, initialContent, workspace) {
   const child = spawn(CLAUDE_PATH, args, {
     cwd: workspace,
@@ -571,12 +549,9 @@ function runClaudeInteractive(args, initialContent, workspace) {
   let lastSessionId = null;
   let lastTurnText = '';
   let onTurnComplete = null;
-  let onIntermediateText = null;
   let onTurnEnd = null;
   let deliveredTexts = [];
   let accumulatedDelivered = '';
-  let pendingText = '';
-  let pendingTimer = null;
   let closed = false;
   let turnOpen = true;
   let taskCardEmittedInTurn = false;
@@ -585,7 +560,6 @@ function runClaudeInteractive(args, initialContent, workspace) {
   let turnStopReasonOverride = null;
   const pendingTaskCards = new Map();
   const inProgressTaskCards = new Map();
-  let statusHeartbeatTimer = null;
 
   const resetTurnStreamingState = () => {
     taskCardEmittedInTurn = false;
@@ -595,59 +569,6 @@ function runClaudeInteractive(args, initialContent, workspace) {
     turnStopReasonOverride = null;
     pendingTaskCards.clear();
     inProgressTaskCards.clear();
-    clearTurnHeartbeatTimers();
-  };
-
-  const clearTurnHeartbeatTimers = () => {
-    if (statusHeartbeatTimer) {
-      clearInterval(statusHeartbeatTimer);
-      statusHeartbeatTimer = null;
-    }
-  };
-
-  const getActiveTaskCard = () => {
-    let active = null;
-    for (const [taskId, card] of inProgressTaskCards.entries()) {
-      if (!pendingTaskCards.has(taskId)) {
-        inProgressTaskCards.delete(taskId);
-        continue;
-      }
-      if (!active || card.startedAt > active.card.startedAt) active = { taskId, card };
-    }
-    return active;
-  };
-
-  const buildElapsedStatusText = (card) => (
-    truncateText(`${buildStatusText(card.toolName, card.input)} (${formatElapsedTime(card.startedAt)})`, 100)
-  );
-
-  const ensureTurnHeartbeatTimers = () => {
-    if (!statusHeartbeatTimer) {
-      statusHeartbeatTimer = setInterval(() => {
-        const active = getActiveTaskCard();
-        if (!active) return;
-        ipcSend({
-          type: 'status_update',
-          text: buildElapsedStatusText(active.card),
-        }).catch(() => {});
-      }, STATUS_HEARTBEAT_MS);
-    }
-  };
-
-  const queueIntermediate = (text) => {
-    if (!text?.trim() || !onIntermediateText) return;
-    if (pendingTimer) clearTimeout(pendingTimer);
-    pendingText = pendingText ? pendingText + '\n' + text : text;
-    pendingTimer = setTimeout(() => {
-      pendingTimer = null;
-      const toSend = pendingText.trim();
-      pendingText = '';
-      if (toSend) {
-        deliveredTexts.push(toSend);
-        accumulatedDelivered += toSend;
-        onIntermediateText(toSend);
-      }
-    }, 2000);
   };
 
   // ── stdout: incremental NDJSON parse ──
@@ -690,7 +611,6 @@ function runClaudeInteractive(args, initialContent, workspace) {
             payload: { text_summary: truncateText(block.text, 300) },
           });
           sendCcEvent('text', block);
-          queueIntermediate(block.text);
         }
         if (block.type === 'tool_use') {
           totalToolCount++;
@@ -710,10 +630,6 @@ function runClaudeInteractive(args, initialContent, workspace) {
             taskCardChunkType = isTodoWriteSnapshot ? 'task' : 'plan';
             taskCardDisplayMode = 'plan';
           }
-          ipcSend({
-            type: 'status_update',
-            text: buildStatusText(block.name, block.input),
-          }).catch(() => {});
           if (isTodoWriteSnapshot) {
             if (block.input.todos.length > 0) {
               taskCardEmittedInTurn = true;
@@ -730,7 +646,6 @@ function runClaudeInteractive(args, initialContent, workspace) {
               input: block.input,
               startedAt: Date.now(),
             });
-            ensureTurnHeartbeatTimers();
             taskCardEmittedInTurn = true;
           }
         }
@@ -772,9 +687,6 @@ function runClaudeInteractive(args, initialContent, workspace) {
         await onTurnEnd();
       }
 
-      // Cancel pending intermediate flush — turn is done, onTurnComplete takes over
-      if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null; pendingText = ''; }
-
       // 防止同一段文本重复触发（CLI 可能输出多个 result 行）
       if (turnText && turnText !== lastTurnText) {
         lastTurnText = turnText;
@@ -791,7 +703,6 @@ function runClaudeInteractive(args, initialContent, workspace) {
       } else if (!lastTurnText && turnText) {
         lastTurnText = turnText;
       }
-      ipcSend({ type: 'status_update', text: '' }).catch(() => {});
       resetTurnStreamingState();
       deliveredTexts = [];
       accumulatedDelivered = '';
@@ -839,7 +750,6 @@ function runClaudeInteractive(args, initialContent, workspace) {
     child.on('close', (code) => {
       closed = true;
       if (idleTimer) clearTimeout(idleTimer);
-      clearTurnHeartbeatTimers();
       resolve({
         code,
         stderr: Buffer.concat(errChunks).toString(),
@@ -864,7 +774,6 @@ function runClaudeInteractive(args, initialContent, workspace) {
     exitPromise,
     child,
     setOnTurnComplete: (fn) => { onTurnComplete = fn; },
-    setOnIntermediateText: (fn) => { onIntermediateText = fn; },
     setOnTurnEnd: (fn) => { onTurnEnd = fn; },
   };
 }

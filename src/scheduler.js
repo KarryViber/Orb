@@ -475,6 +475,12 @@ export class Scheduler {
     if (name === 'slack' && typeof adapter?.createPlanSubscriber === 'function' && !adapter.__orbPlanSubscriberUnsubscribe) {
       adapter.__orbPlanSubscriberUnsubscribe = this.eventBus.subscribe(adapter.createPlanSubscriber());
     }
+    if (name === 'slack' && typeof adapter?.createTextSubscriber === 'function' && !adapter.__orbTextSubscriberUnsubscribe) {
+      adapter.__orbTextSubscriberUnsubscribe = this.eventBus.subscribe(adapter.createTextSubscriber());
+    }
+    if (name === 'slack' && typeof adapter?.createStatusSubscriber === 'function' && !adapter.__orbStatusSubscriberUnsubscribe) {
+      adapter.__orbStatusSubscriberUnsubscribe = this.eventBus.subscribe(adapter.createStatusSubscriber());
+    }
     setImmediate(() => {
       this.replayQueuedTasks().catch((err) => {
         warn(TAG, `startup replay dispatch failed: ${err.message}`);
@@ -1616,6 +1622,8 @@ export class Scheduler {
                 threadTs,
                 effectiveThreadTs,
                 platform,
+                deferDeliveryUntilResult,
+                applyThreadStatus,
               });
             } catch (err) {
               warn(TAG, `eventBus publish failed: ${err.message}`);
@@ -1943,7 +1951,10 @@ export class Scheduler {
           if (msg.type === 'turn_complete') {
             finalStopReason = msg.stopReason || finalStopReason;
             await stopTyping();
-            const deliveryText = resolveTurnCompleteDeliveryText(msg);
+            let deliveryText = resolveTurnCompleteDeliveryText(msg);
+            if (turn.intermediateDeliveredThisTurn && deliveryText) {
+              deliveryText = subtractDeliveredText(deliveryText, turn.egress?.deliveredTexts || []);
+            }
             const metadataText = typeof msg.text === 'string' ? msg.text : deliveryText;
             // 中间轮次完成 — 优先使用 worker 提供的 undeliveredText，
             // 否则按 deliveredTexts 从完整文本中扣掉已发部分。
