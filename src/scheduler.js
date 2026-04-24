@@ -282,6 +282,9 @@ function makeTurnState(log, taskCardConfig) {
     pendingThreadStatus: '',
     pendingStatusLoadingMessages: null,
     statusRefreshTimer: null,
+    qiStreamId: null,
+    qiStartPromise: null,
+    qiAppendPromise: null,
     egress: new EgressGate(log),
     taskCardState: makeTaskCardState(taskCardConfig),
   };
@@ -1503,6 +1506,82 @@ export class Scheduler {
               }
             } catch (err) {
               warn(TAG, `[final_snapshot] failed: ${err.message}`);
+            }
+            return;
+          }
+
+          if (msg.type === 'qi_start') {
+            if (turn.taskCardState.failed) return;
+            if (!turn.taskCardState.enabled && !turn.taskCardState.deferred) return;
+            if (turn.qiStreamId) return;
+            if (turn.qiStartPromise) {
+              await turn.qiStartPromise;
+              return;
+            }
+            const initialChunks = [
+              { type: 'plan_update', title: '已完成思考' },
+              { type: 'task_update', id: 'qi-exec', title: '工具执行', status: 'in_progress', details: '' },
+              { type: 'task_update', id: 'qi-other', title: '其他操作', status: 'in_progress', details: '' },
+              { type: 'task_update', id: 'qi-summary', title: '信息整合', status: 'in_progress', details: '' },
+            ];
+            turn.qiStartPromise = (async () => {
+              try {
+                const result = await adapter.startStream(channel, effectiveThreadTs, {
+                  task_display_mode: 'plan',
+                  initial_chunks: initialChunks,
+                  team_id: task.teamId || null,
+                });
+                turn.qiStreamId = result?.stream_id || (result?.ts ? `${channel}:${result.ts}` : null);
+              } catch (err) {
+                warn(TAG, `[qi_start] failed: ${err.message}`);
+              } finally {
+                turn.qiStartPromise = null;
+              }
+            })();
+            await turn.qiStartPromise;
+            return;
+          }
+
+          if (msg.type === 'qi_append') {
+            if (turn.qiStartPromise) await turn.qiStartPromise;
+            const idMap = { '工具执行': 'qi-exec', '其他操作': 'qi-other' };
+            const taskId = idMap[msg.category];
+            if (!taskId || !turn.qiStreamId) return;
+            const previous = turn.qiAppendPromise || Promise.resolve();
+            const current = previous.catch(() => {}).then(async () => {
+              if (!turn.qiStreamId) return;
+              await adapter.appendStream(turn.qiStreamId, [
+                { type: 'task_update', id: taskId, title: msg.category, details: `\n${msg.line}\n` },
+              ]);
+            });
+            const tracked = current.finally(() => {
+              if (turn.qiAppendPromise === tracked) turn.qiAppendPromise = null;
+            });
+            turn.qiAppendPromise = tracked;
+            try {
+              await tracked;
+            } catch (err) {
+              warn(TAG, `[qi_append] failed: ${err.message}`);
+            }
+            return;
+          }
+
+          if (msg.type === 'qi_finalize') {
+            if (turn.qiStartPromise) await turn.qiStartPromise;
+            if (turn.qiAppendPromise) await turn.qiAppendPromise.catch(() => {});
+            if (!turn.qiStreamId) return;
+            const streamId = turn.qiStreamId;
+            try {
+              await adapter.appendStream(streamId, [
+                { type: 'task_update', id: 'qi-exec', title: '工具执行', status: 'complete' },
+                { type: 'task_update', id: 'qi-other', title: '其他操作', status: 'complete' },
+                { type: 'task_update', id: 'qi-summary', title: '信息整合', status: 'complete', details: `共调用 ${msg.tool_count} 次工具` },
+              ]);
+              await adapter.stopStream(streamId);
+            } catch (err) {
+              warn(TAG, `[qi_finalize] failed: ${err.message}`);
+            } finally {
+              if (turn.qiStreamId === streamId) turn.qiStreamId = null;
             }
             return;
           }
