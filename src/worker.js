@@ -752,13 +752,13 @@ function runClaudeInteractive(args, initialContent, workspace) {
       lastSessionId = msg.session_id || lastSessionId;
       lastStopReason = turnStopReasonOverride || msg.stop_reason || msg.subtype || null;
       const turnText = msg.result || turnBuffer.join('\n');
+      if (qiStreamOpened) {
+        await ipcSend({
+          type: 'qi_finalize',
+          tool_count: turnToolCount,
+        }).catch(() => {});
+      }
       if (turnOpen && onTurnEnd) {
-        if (qiStreamOpened) {
-          await ipcSend({
-            type: 'qi_finalize',
-            tool_count: turnToolCount,
-          }).catch(() => {});
-        }
         turnOpen = false;
         await onTurnEnd();
       }
