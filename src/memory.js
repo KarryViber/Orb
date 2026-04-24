@@ -324,10 +324,11 @@ export async function storeLesson({ userText, errorText, responseText, threadTs,
         limit: 1,
       }).catch((error) => {
         logBridgeFallback('storeLesson.dedupSearch', dbPath, error);
-        return [];
+        return null;
       });
 
-      if (Array.isArray(existing) && existing.length > 0 && existing[0].similarity > 0.85) {
+      if (!Array.isArray(existing)) continue;
+      if (existing.length > 0 && existing[0].similarity > 0.85) {
         continue; // 语义高度相似，跳过
       }
 
@@ -385,9 +386,10 @@ export async function storeCorrectionLesson({ userText, responseText, threadHist
         limit: 1,
       }).catch((error) => {
         logBridgeFallback('storeCorrectionLesson.dedupSearch', dbPath, error);
-        return [];
+        return null;
       });
-      if (Array.isArray(existing) && existing.length > 0 && existing[0].similarity > 0.85) {
+      if (!Array.isArray(existing)) continue;
+      if (existing.length > 0 && existing[0].similarity > 0.85) {
         continue;
       }
       await holographicBridge(dbPath, 'add', {
