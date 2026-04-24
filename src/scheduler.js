@@ -51,6 +51,7 @@ const PERSISTED_TASK_FIELDS = [
   'mode',
   'priorConversation',
   'deferDeliveryUntilResult',
+  'enableTaskCard',
 ];
 
 // --- Effort escalation keywords ---
@@ -176,6 +177,7 @@ export function makeTaskCardState({ enabled = false, deferred = false } = {}) {
     streamTs: null,
     streamStartedAt: null,
     startStreamPromise: null,
+    rotatePromise: null,
     chunkType: null,
     displayMode: null,
     planTitle: '',
@@ -884,6 +886,7 @@ export class Scheduler {
       turn.taskCardState.streamTs = null;
       turn.taskCardState.streamStartedAt = null;
       turn.taskCardState.startStreamPromise = null;
+      turn.taskCardState.rotatePromise = null;
       turn.taskCardState.chunkType = null;
       turn.taskCardState.displayMode = null;
       turn.taskCardState.planTitle = '';
@@ -913,6 +916,7 @@ export class Scheduler {
       turn.taskCardState.streamTs = null;
       turn.taskCardState.streamStartedAt = null;
       turn.taskCardState.startStreamPromise = null;
+      turn.taskCardState.rotatePromise = null;
       clearKeepalive();
       turn.taskCardState.chunkType = null;
       turn.taskCardState.displayMode = null;
@@ -956,6 +960,7 @@ export class Scheduler {
       turn.taskCardState.streamId = null;
       turn.taskCardState.streamStartedAt = null;
       turn.taskCardState.startStreamPromise = null;
+      turn.taskCardState.rotatePromise = null;
       turn.taskCardState.chunkType = null;
       turn.taskCardState.displayMode = null;
       turn.taskCardState.planTitle = '';
@@ -1064,6 +1069,10 @@ export class Scheduler {
     };
 
     const rotateTaskCardStreamIfNeeded = async () => {
+      if (turn.taskCardState.rotatePromise) {
+        const ok = await turn.taskCardState.rotatePromise;
+        return ok && Boolean(turn.taskCardState.streamId) && !turn.taskCardState.failed;
+      }
       if (!turn.taskCardState.streamId || turn.taskCardState.failed) return false;
       const startedAt = turn.taskCardState.streamStartedAt;
       if (!startedAt) {
@@ -1071,7 +1080,13 @@ export class Scheduler {
         return true;
       }
       if (Date.now() - startedAt < STREAM_PHASE_SOFT_LIMIT_MS) return true;
-      return rotateStream();
+      const p = rotateStream().finally(() => {
+        if (turn.taskCardState.rotatePromise === p) {
+          turn.taskCardState.rotatePromise = null;
+        }
+      });
+      turn.taskCardState.rotatePromise = p;
+      return p;
     };
 
     const appendTaskCardPlan = async (task_id, updateOnly = false) => {
@@ -1477,6 +1492,8 @@ export class Scheduler {
             clearStatusRefresh();
             clearKeepalive();
             turn = makeTurnState(turnLog, taskCardConfig);
+            turnDelivered = false;
+            turn.intermediateDeliveredThisTurn = false;
             metadataUpdatedForTurn = false;
             await startTyping();
             return;
@@ -1688,8 +1705,6 @@ export class Scheduler {
                   }
                   turnDelivered = true;
                 }
-              } else {
-                turnDelivered = false;
               }
               resetTaskCardState();
               if (!silentDeferredResult) await updateThreadMetadata(text);
@@ -1757,7 +1772,7 @@ export class Scheduler {
 
           info(TAG, `worker exited: pid=${worker.pid} code=${code} signal=${signal} responded=${responded} thread=${threadTs}`);
 
-          const abnormalExit = signal !== null || (code !== 0 && code !== null) || !responded;
+          const abnormalExit = !responded && (signal !== null || (code !== 0 && code !== null));
           if (abnormalExit) {
             await finalizeTaskCardsOnAbnormalExit();
           }
