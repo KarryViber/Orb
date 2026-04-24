@@ -28,17 +28,19 @@ import { storeConversation } from './memory.js';
  *     only outside the task-card path / error fallback scenes.
  *   { type: 'plan_title_update', title }  — task-card path:
  *     compatibility path for callers that want to label plan-mode cards.
- *   { type: 'plan_section', title }  — task-card path:
- *     non-TodoWrite plan-mode section header; scheduler either appends it to
- *     the active stream or folds it into the first stream's initial chunks.
+ *   { type: 'plan_section', title }  — legacy task-card path:
+ *     scheduler compatibility handler for non-TodoWrite plan-mode section headers.
  *   { type: 'plan_snapshot', title, chunk_type, display_mode, rows }  — task-card path:
  *     TodoWrite-only full snapshot for plan rendering; rows replace the current
  *     plan-card contents in one scheduler update.
- *   { type: 'tool_call', task_id, tool_name, title, details, status?, chunk_type, display_mode? }  — task-card path:
- *     emitted for selected tool_use blocks so scheduler can update Slack task cards.
+ *   { type: 'final_snapshot', plan_title, categories }  — task-card path:
+ *     non-TodoWrite final plan-mode snapshot; scheduler starts one stream with
+ *     all initial chunks and immediately stops it.
+ *   { type: 'tool_call', task_id, tool_name, title, details, status?, chunk_type, display_mode? }  — legacy task-card path:
+ *     scheduler compatibility handler for incremental task-card tool updates.
  *     TodoWrite synthetic per-todo ids now live inside plan_snapshot.rows[].task_id.
- *   { type: 'tool_result', task_id, status, output }  — task-card path:
- *     emitted from tool_result blocks for tools that wait on a result; status is 'complete' | 'error'.
+ *   { type: 'tool_result', task_id, status, output }  — legacy task-card path:
+ *     scheduler compatibility handler for tool_result completion updates.
  *   { type: 'status_update', text }  — short assistant thread status text;
  *     emitted when a tool starts, refreshed during long task-card tools, and cleared with empty text on turn_complete.
  *   { type: 'turn_start', injectId? }  — explicit turn ownership start on task/inject receipt
@@ -328,7 +330,6 @@ process.on('message', async (msg) => {
 });
 
 const IDLE_TIMEOUT = parseInt(process.env.WORKER_IDLE_TIMEOUT_MS, 10) || 60_000; // idle → close stdin → CLI exits
-const TASK_CARD_HEARTBEAT_MS = 30_000;
 const STATUS_HEARTBEAT_MS = 90_000;
 
 function renderTodos(todos) {
@@ -481,27 +482,6 @@ function summarizeTodos(todos) {
   }).join('\n');
 }
 
-function summarizeToolDetails(toolName, input) {
-  const parsedInput = parseToolInput(input);
-
-  if (toolName === 'Skill') {
-    return truncateText(
-      parsedInput?.skill_description
-      || parsedInput?.description
-      || '',
-      120,
-    );
-  }
-  if (toolName === 'Task' || toolName === 'Agent') {
-    const parts = [];
-    if (parsedInput?.subagent_type) parts.push(`type: ${parsedInput.subagent_type}`);
-    if (parsedInput?.description) parts.push(parsedInput.description);
-    return truncateText(parts.join(' · '), 120);
-  }
-
-  return '';
-}
-
 function buildToolTitle(toolName, input) {
   const parsedInput = parseToolInput(input);
   const title = (value) => truncate256(value);
@@ -566,16 +546,6 @@ function buildStatusText(toolName, input) {
   return truncateText(buildToolTitle(toolName, input), 80);
 }
 
-function extractToolResultText(content) {
-  if (typeof content === 'string') return content;
-  if (!Array.isArray(content)) return stringifyToolValue(content);
-  return content.map((item) => {
-    if (typeof item === 'string') return item;
-    if (item?.type === 'text' && typeof item.text === 'string') return item.text;
-    return stringifyToolValue(item);
-  }).filter(Boolean).join('\n');
-}
-
 function runClaudeInteractive(args, initialContent, workspace) {
   const child = spawn(CLAUDE_PATH, args, {
     cwd: workspace,
@@ -602,20 +572,17 @@ function runClaudeInteractive(args, initialContent, workspace) {
   let taskCardEmittedInTurn = false;
   let taskCardChunkType = 'plan';
   let taskCardDisplayMode = 'timeline';
-  let nonTodoTaskCardEmittedInTurn = false;
-  let currentTaskCardCategory = null;
+  let turnCategoryBuffer = new Map();
   let turnStopReasonOverride = null;
   const pendingTaskCards = new Map();
   const inProgressTaskCards = new Map();
-  let taskCardHeartbeatTimer = null;
   let statusHeartbeatTimer = null;
 
   const resetTurnStreamingState = () => {
     taskCardEmittedInTurn = false;
     taskCardChunkType = 'plan';
     taskCardDisplayMode = 'timeline';
-    nonTodoTaskCardEmittedInTurn = false;
-    currentTaskCardCategory = null;
+    turnCategoryBuffer = new Map();
     turnToolCount = 0;
     turnStopReasonOverride = null;
     pendingTaskCards.clear();
@@ -624,10 +591,6 @@ function runClaudeInteractive(args, initialContent, workspace) {
   };
 
   const clearTurnHeartbeatTimers = () => {
-    if (taskCardHeartbeatTimer) {
-      clearInterval(taskCardHeartbeatTimer);
-      taskCardHeartbeatTimer = null;
-    }
     if (statusHeartbeatTimer) {
       clearInterval(statusHeartbeatTimer);
       statusHeartbeatTimer = null;
@@ -646,35 +609,11 @@ function runClaudeInteractive(args, initialContent, workspace) {
     return active;
   };
 
-  const appendElapsedToTitle = (title, startedAt) => {
-    const suffix = `（${formatElapsedTime(startedAt)}）`;
-    const maxBaseLength = Math.max(1, 256 - suffix.length);
-    return `${truncateText(title || 'Task', maxBaseLength)}${suffix}`;
-  };
-
   const buildElapsedStatusText = (card) => (
     truncateText(`${buildStatusText(card.toolName, card.input)} (${formatElapsedTime(card.startedAt)})`, 100)
   );
 
   const ensureTurnHeartbeatTimers = () => {
-    if (!taskCardHeartbeatTimer) {
-      taskCardHeartbeatTimer = setInterval(() => {
-        for (const [taskId, card] of inProgressTaskCards.entries()) {
-          if (!pendingTaskCards.has(taskId)) {
-            inProgressTaskCards.delete(taskId);
-            continue;
-          }
-          ipcSend({
-            type: 'tool_call',
-            task_id: taskId,
-            tool_name: card.toolName,
-            title: appendElapsedToTitle(card.title, card.startedAt),
-            details: card.details,
-            chunk_type: taskCardChunkType,
-          }).catch(() => {});
-        }
-      }, TASK_CARD_HEARTBEAT_MS);
-    }
     if (!statusHeartbeatTimer) {
       statusHeartbeatTimer = setInterval(() => {
         const active = getActiveTaskCard();
@@ -771,36 +710,19 @@ function runClaudeInteractive(args, initialContent, workspace) {
           }
           if (emitsTaskCard) {
             const title = truncate256(buildToolTitle(block.name, block.input));
-            const details = truncate256(summarizeToolDetails(block.name, block.input));
-            const newCategory = categorizeTool(block.name);
-            if (newCategory !== currentTaskCardCategory) {
-              ipcSend({ type: 'plan_section', title: newCategory }).catch(() => {});
-              currentTaskCardCategory = newCategory;
-            }
+            const category = categorizeTool(block.name);
+            if (!turnCategoryBuffer.has(category)) turnCategoryBuffer.set(category, []);
+            turnCategoryBuffer.get(category).push(title);
             pendingTaskCards.set(block.id, { toolName: block.name });
             inProgressTaskCards.set(block.id, {
               taskId: block.id,
               toolName: block.name,
               title,
               input: block.input,
-              details,
               startedAt: Date.now(),
             });
             ensureTurnHeartbeatTimers();
-            const taskCardPayload = {
-              type: 'tool_call',
-              task_id: block.id,
-              tool_name: block.name,
-              title,
-              details,
-              chunk_type: taskCardChunkType,
-            };
-            if (!taskCardEmittedInTurn) {
-              taskCardPayload.display_mode = taskCardDisplayMode;
-            }
-            ipcSend(taskCardPayload).catch(() => {});
             taskCardEmittedInTurn = true;
-            nonTodoTaskCardEmittedInTurn = true;
           }
         }
       }
@@ -808,18 +730,6 @@ function runClaudeInteractive(args, initialContent, workspace) {
     if (msg.type === 'user' && Array.isArray(msg.message?.content)) {
       for (const block of msg.message.content) {
         if (!block?.tool_use_id || !pendingTaskCards.has(block.tool_use_id)) continue;
-        const pending = pendingTaskCards.get(block.tool_use_id);
-        const toolName = pending?.toolName || '';
-        let output = '';
-        if (toolName === 'Task' || toolName === 'Agent' || toolName === 'Skill') {
-          output = truncateText(extractToolResultText(block.content), 160);
-        }
-        ipcSend({
-          type: 'tool_result',
-          task_id: block.tool_use_id,
-          status: block.is_error ? 'error' : 'complete',
-          output,
-        }).catch(() => {});
         pendingTaskCards.delete(block.tool_use_id);
         inProgressTaskCards.delete(block.tool_use_id);
       }
@@ -829,16 +739,18 @@ function runClaudeInteractive(args, initialContent, workspace) {
       lastStopReason = turnStopReasonOverride || msg.stop_reason || msg.subtype || null;
       const turnText = msg.result || turnBuffer.join('\n');
       if (turnOpen && onTurnEnd) {
-        if (nonTodoTaskCardEmittedInTurn) {
-          await ipcSend({ type: 'plan_section', title: '信息整合' }).catch(() => {});
+        if (turnCategoryBuffer.size > 0) {
+          const categories = [];
+          const order = ['工具执行', '其他操作'];
+          for (const cat of order) {
+            const lines = turnCategoryBuffer.get(cat) || [];
+            if (lines.length > 0) categories.push({ title: cat, details: lines.join('\n') });
+          }
+          categories.push({ title: '信息整合', details: `共调用 ${turnToolCount} 次工具` });
           await ipcSend({
-            type: 'tool_call',
-            task_id: 'turn-summary',
-            tool_name: 'summary',
-            title: `共调用 ${turnToolCount} 次工具`,
-            details: '',
-            status: 'complete',
-            chunk_type: taskCardChunkType,
+            type: 'final_snapshot',
+            plan_title: '已完成思考',
+            categories,
           }).catch(() => {});
         }
         turnOpen = false;
