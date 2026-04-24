@@ -532,7 +532,13 @@ function buildStatusText(toolName, input) {
 
   if (toolName === 'TodoWrite') return 'updating plan';
   if (toolName === 'Bash') {
-    const command = truncateText(String(parsedInput?.command ?? parsedInput?.cmd ?? input ?? '').trim(), 80);
+    const description = parsedInput?.description;
+    if (description && typeof description === 'string' && description.trim()) {
+      return truncateText(description.trim(), 80);
+    }
+    const rawCommand = String(parsedInput?.command ?? parsedInput?.cmd ?? input ?? '').trim();
+    const firstLine = rawCommand.split('\n')[0].trim();
+    const command = truncateText(firstLine, 80);
     return command ? `running: ${command}` : 'running bash';
   }
   if (toolName === 'Write' || toolName === 'NotebookEdit') {
