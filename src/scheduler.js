@@ -411,11 +411,37 @@ function buildTaskCardFallbackMarkdown(taskCards) {
   return lines.join('\n');
 }
 
+export class EventBus {
+  constructor() {
+    this.subscribers = new Set();
+  }
+
+  subscribe(subscriber) {
+    if (!subscriber || (typeof subscriber !== 'function' && typeof subscriber.handle !== 'function')) {
+      throw new TypeError('EventBus subscriber must be a function or an object with handle()');
+    }
+    this.subscribers.add(subscriber);
+    return () => this.subscribers.delete(subscriber);
+  }
+
+  async publish(msg, ctx = {}) {
+    for (const subscriber of [...this.subscribers]) {
+      const match = typeof subscriber === 'function'
+        ? true
+        : (typeof subscriber.match === 'function' ? await subscriber.match(msg, ctx) : true);
+      if (!match) continue;
+      if (typeof subscriber === 'function') await subscriber(msg, ctx);
+      else await subscriber.handle(msg, ctx);
+    }
+  }
+}
+
 export class Scheduler {
-  constructor({ maxWorkers, timeoutMs, getProfile }) {
+  constructor({ maxWorkers, timeoutMs, getProfile, startPermissionServer = true }) {
     this.maxWorkers = maxWorkers || 3;
     this.timeoutMs = timeoutMs || parseInt(process.env.ORB_WORKER_TIMEOUT_MS, 10) || 1_800_000;
     this.getProfile = getProfile;
+    this.eventBus = new EventBus();
     this.adapters = new Map();     // platform → adapter
     this.activeWorkers = new Map();
     this.threadQueues = new Map();
@@ -430,8 +456,14 @@ export class Scheduler {
     this._permissionApprovalMode = process.env.ORB_PERMISSION_APPROVAL_MODE || 'auto-allow';
     this._permissionSocketPath = join(tmpdir(), `orb-permission-scheduler-${process.pid}.sock`);
     this._permissionServer = null;
+    if (process.env.ORB_EVENTBUS_SMOKE_LOG === '1') {
+      this.eventBus.subscribe({
+        match: (msg) => msg?.type === 'cc_event',
+        handle: (msg) => info(TAG, `eventBus cc_event: turn=${msg.turnId || 'unknown'} event=${msg.eventType || 'unknown'}`),
+      });
+    }
     globalThis.__orbSchedulerInstance = this;
-    this._startPermissionServer();
+    if (startPermissionServer !== false) this._startPermissionServer();
     this._restoreShutdownQueues();
   }
 
@@ -820,6 +852,13 @@ export class Scheduler {
       if (queue.length === 0) this.threadQueues.delete(threadTs);
       await this.submit(nextTask);
     }
+  }
+
+  async _publishWorkerCcEvent(msg, ctx = {}) {
+    await this.eventBus.publish(msg, {
+      scheduler: this,
+      ...ctx,
+    });
   }
 
   async _spawnWorker(task) {
@@ -1559,6 +1598,24 @@ export class Scheduler {
             return;
           }
           info(TAG, `worker response: type=${msg.type} thread=${threadTs} textLen=${msg.text?.length || 0}`);
+
+          if (msg.type === 'cc_event') {
+            try {
+              await this._publishWorkerCcEvent(msg, {
+                task,
+                turn,
+                worker,
+                adapter,
+                channel,
+                threadTs,
+                effectiveThreadTs,
+                platform,
+              });
+            } catch (err) {
+              warn(TAG, `eventBus publish failed: ${err.message}`);
+            }
+            return;
+          }
 
           if (msg.type === 'progress_update') {
             if (deferDeliveryUntilResult) return;

@@ -4,8 +4,10 @@ import {
   abandonTurnState,
   buildQiSettledChunks,
   closeQiStreamState,
+  EventBus,
   ensureTaskCardStreamStarted,
   makeTaskCardState,
+  Scheduler,
   subtractDeliveredText,
 } from '../src/scheduler.js';
 import { EgressGate } from '../src/egress.js';
@@ -117,4 +119,38 @@ test('Qi abnormal exit and turn abandon close task-card and Qi streams', async (
 test('result dedupe keeps text not delivered by intermediate_text', () => {
   const remaining = subtractDeliveredText('第一段\n第二段', ['第一段\n']);
   assert.equal(remaining, '第二段');
+});
+
+test('EventBus publishes matching cc_event messages to subscribers', async () => {
+  const bus = new EventBus();
+  const received = [];
+  bus.subscribe({
+    match: (msg) => msg.type === 'cc_event' && msg.eventType === 'tool_use',
+    handle: (msg, ctx) => received.push({ msg, ctx }),
+  });
+
+  const payload = { type: 'tool_use', id: 'toolu_1', name: 'Bash', input: { command: 'echo ok' } };
+  await bus.publish({ type: 'cc_event', turnId: 'turn-1', eventType: 'tool_use', payload }, { threadTs: '111.222' });
+
+  assert.equal(received.length, 1);
+  assert.equal(received[0].msg.turnId, 'turn-1');
+  assert.equal(received[0].msg.payload, payload);
+  assert.equal(received[0].ctx.threadTs, '111.222');
+});
+
+test('Scheduler cc_event route publishes fake tool_use without handling legacy IPC branches', async () => {
+  const scheduler = new Scheduler({ getProfile: () => ({ name: 'test' }), startPermissionServer: false });
+  const received = [];
+  scheduler.eventBus.subscribe((msg, ctx) => received.push({ msg, ctx }));
+
+  const payload = { type: 'tool_use', id: 'toolu_fake', name: 'Bash', input: { command: 'echo fake' } };
+  await scheduler._publishWorkerCcEvent(
+    { type: 'cc_event', turnId: 'turn-fake', eventType: 'tool_use', payload },
+    { threadTs: '123.456', platform: 'slack' },
+  );
+
+  assert.equal(received.length, 1);
+  assert.equal(received[0].msg.payload, payload);
+  assert.equal(received[0].ctx.scheduler, scheduler);
+  assert.equal(received[0].ctx.threadTs, '123.456');
 });
