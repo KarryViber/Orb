@@ -879,7 +879,6 @@ function runClaudeInteractive(args, initialContent, workspace) {
     if (closed) return;
     closed = true;
     if (idleTimer) clearTimeout(idleTimer);
-    clearTurnHeartbeatTimers();
     try { child.stdin.end(); } catch {}
   }
 
