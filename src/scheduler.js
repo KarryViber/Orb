@@ -865,6 +865,150 @@ export class Scheduler {
       return true;
     };
 
+    const handleExitResult = async (msg) => {
+      const text = msg.text?.trim() || null;
+      const silentDeferredResult = deferDeliveryUntilResult && isSilentResultText(text);
+      finalResultText = text || '';
+      finalStopReason = msg.stopReason || finalStopReason;
+
+      try {
+        // Exit signal: empty text after turn_complete delivery is expected and
+        // should not enter auto-continue or fallback delivery.
+        if (!text && turnDelivered) {
+          this._autoContinueCount.delete(threadTs);
+          return;
+        }
+
+        if (!text) {
+          const isMaxTurnsReached = msg.stopReason === 'max_turns_reached';
+          const isToolOnlyCompletion = !isMaxTurnsReached && (msg.toolCount || 0) > 0;
+
+          // tool-only turn（如 GitHub 调研卡片流）：最后一个 turn 只有 tool_use、
+          // 外投通过 Bash → Slack API 完成，没有 assistant text。这是预期的正常结束，
+          // 不应触发 auto-continue 也不应发提示。
+          if (isToolOnlyCompletion) {
+            info(TAG, `tool-only turn completed without text, skipping auto-continue: thread=${threadTs} toolCount=${msg.toolCount} lastTool=${msg.lastTool || 'none'}`);
+            this._autoContinueCount.delete(threadTs);
+            return;
+          }
+
+          const retries = this._autoContinueCount.get(threadTs) || 0;
+          if (retries < MAX_AUTO_CONTINUE) {
+            this._autoContinueCount.set(threadTs, retries + 1);
+            const reasonTag = isMaxTurnsReached ? 'max_turns_reached' : 'empty';
+            warn(TAG, `${reasonTag} result, auto-continue ${retries + 1}/${MAX_AUTO_CONTINUE} for thread=${threadTs}`);
+            const suppressAutoContinueNotice = platform === 'slack'
+              && typeof channel === 'string'
+              && channel.startsWith('D');
+            if (!deferDeliveryUntilResult && !suppressAutoContinueNotice) {
+              const notice = isMaxTurnsReached
+                ? `⏳ 到达回合上限，自动续接中 (${retries + 1}/${MAX_AUTO_CONTINUE})…`
+                : `⏳ 本轮无输出，自动续接中 (${retries + 1}/${MAX_AUTO_CONTINUE})…`;
+              await adapter.sendReply(channel, effectiveThreadTs, notice).catch(() => {});
+            } else if (suppressAutoContinueNotice) {
+              info(TAG, `${reasonTag} result auto-continue notice suppressed in Slack DM: thread=${threadTs}`);
+            }
+            // Defer submit to onExit — avoid race with worker's process.exit(0)
+            pendingAutoContinue = {
+              userText: '继续',
+              fileContent: '',
+              imagePaths: [],
+              threadTs,
+              deliveryThreadTs: effectiveThreadTs,
+              channel,
+              userId,
+              platform,
+              teamId: task.teamId || null,
+              threadHistory: task.threadHistory,
+              profile,
+              maxTurns: task.maxTurns || null,
+              enableTaskCard: task.enableTaskCard,
+              deferDeliveryUntilResult,
+              _autoContinue: true,
+              _completion: task._completion,
+            };
+            return;
+          }
+          warn(TAG, `empty result after ${MAX_AUTO_CONTINUE} auto-continues for thread=${threadTs}`);
+          this._autoContinueCount.delete(threadTs);
+        } else {
+          this._autoContinueCount.delete(threadTs);
+        }
+
+        if (silentDeferredResult) {
+          info(TAG, `silent deferred result suppressed: thread=${threadTs}`);
+          turnDelivered = true;
+        }
+
+        // Fallback delivery remains here for exit-only results that were not
+        // covered by turn_complete, such as fail-fast paths or older CLI exits.
+        if (!turnDelivered) {
+          if (deferDeliveryUntilResult && text) {
+            turnDelivered = await deliverDeferredFinalResult(text);
+          } else if (turn.intermediateDeliveredThisTurn && text) {
+            const remainingText = subtractDeliveredText(text, turn.egress?.deliveredTexts || []);
+            if (remainingText.trim()) {
+              const payloads = adapter.buildPayloads(remainingText);
+              info(TAG, `sending ${payloads.length} deduped result payload(s) to thread=${threadTs}`);
+              for (const payload of payloads) {
+                await emitPayload(payload);
+              }
+            } else {
+              info(TAG, `result text already delivered via intermediate stream, skip sendReply`);
+            }
+            turnDelivered = true;
+          } else {
+            const finalText = text || '⚠️ 多次续接仍未生成回复，任务可能需要拆分。请用更小的指令重试。';
+            if (turn.egress.admit(finalText, 'result-final')) {
+              const payloads = adapter.buildPayloads(finalText);
+              info(TAG, `sending ${payloads.length} payload(s) to thread=${threadTs}`);
+              for (const payload of payloads) {
+                await emitPayload(payload);
+              }
+            }
+            turnDelivered = true;
+          }
+        }
+
+        resetTaskCardState();
+        if (!silentDeferredResult) await updateThreadMetadata(text);
+
+        if (text) {
+          const errorPatterns = /(?:error|failed|permission denied|ENOENT|not found|timed?\s*out|EACCES)/i;
+          if (errorPatterns.test(text) && text.length > 50) {
+            storeLesson({
+              userText: task.userText || '',
+              errorText: '',
+              responseText: text.slice(0, 2000),
+              threadTs,
+              userId,
+              dbPath: join(profile.dataDir, 'memory.db'),
+            }).catch(() => {});
+          }
+        }
+        const correctionPatterns = /不对|不是这样|重来|重新|按我说的|你搞错了|我要的是|不是我想要|改一下|错了|再试|not what I|wrong|redo|try again/i;
+        if (correctionPatterns.test(task.userText || '')) {
+          storeCorrectionLesson({
+            userText: task.userText || '',
+            responseText: (text || '').slice(0, 2000),
+            threadHistory: (task.threadHistory || '').slice(0, 3000),
+            threadTs,
+            userId,
+            dbPath: join(profile.dataDir, 'memory.db'),
+          }).catch(() => {});
+        }
+      } catch (err) {
+        const errCode = typeof getTaskCardStreamErrorCode === 'function' ? getTaskCardStreamErrorCode(err) : null;
+        logError(TAG, `failed to send result: ${err.message}${errCode ? ` (code=${errCode})` : ''}`);
+        await adapter.sendReply(channel, effectiveThreadTs, ':warning: 回复发送失败。').catch(() => {});
+      }
+
+      if (msg.toolCount > 0) {
+        try { this._checkSkillReview(profile.name, msg.toolCount, task, text); } catch (_) {}
+        try { this._checkMemorySync(profile.name, msg.toolCount, task); } catch (_) {}
+      }
+    };
+
     try {
       ({ worker } = spawnWorker({
         task: {
@@ -1036,140 +1180,7 @@ export class Scheduler {
           }
 
           if (msg.type === 'result') {
-            let text = msg.text?.trim() || null;
-            const silentDeferredResult = deferDeliveryUntilResult && isSilentResultText(text);
-            finalResultText = text || '';
-            finalStopReason = msg.stopReason || finalStopReason;
-            try {
-              // 正常流程：turn_complete 已交付内容后，CLI exit 的空 result 是预期的收尾信号
-              // 不是真·失败，不应该触发 auto-continue
-              if (!text && turnDelivered) {
-                this._autoContinueCount.delete(threadTs);
-                return;
-              }
-              if (!text) {
-                const isMaxTurnsReached = msg.stopReason === 'max_turns_reached';
-                const isToolOnlyCompletion = !isMaxTurnsReached && (msg.toolCount || 0) > 0;
-
-                // tool-only turn（如 GitHub 调研卡片流）：最后一个 turn 只有 tool_use、
-                // 外投通过 Bash → Slack API 完成，没有 assistant text。这是预期的正常结束，
-                // 不应触发 auto-continue 也不应发提示。
-                if (isToolOnlyCompletion) {
-                  info(TAG, `tool-only turn completed without text, skipping auto-continue: thread=${threadTs} toolCount=${msg.toolCount} lastTool=${msg.lastTool || 'none'}`);
-                  this._autoContinueCount.delete(threadTs);
-                  return;
-                }
-
-                const retries = this._autoContinueCount.get(threadTs) || 0;
-                if (retries < MAX_AUTO_CONTINUE) {
-                  this._autoContinueCount.set(threadTs, retries + 1);
-                  const reasonTag = isMaxTurnsReached ? 'max_turns_reached' : 'empty';
-                  warn(TAG, `${reasonTag} result, auto-continue ${retries + 1}/${MAX_AUTO_CONTINUE} for thread=${threadTs}`);
-                  const suppressAutoContinueNotice = platform === 'slack'
-                    && typeof channel === 'string'
-                    && channel.startsWith('D');
-                  if (!deferDeliveryUntilResult && !suppressAutoContinueNotice) {
-                    const notice = isMaxTurnsReached
-                      ? `⏳ 到达回合上限，自动续接中 (${retries + 1}/${MAX_AUTO_CONTINUE})…`
-                      : `⏳ 本轮无输出，自动续接中 (${retries + 1}/${MAX_AUTO_CONTINUE})…`;
-                    await adapter.sendReply(channel, effectiveThreadTs, notice).catch(() => {});
-                  } else if (suppressAutoContinueNotice) {
-                    info(TAG, `${reasonTag} result auto-continue notice suppressed in Slack DM: thread=${threadTs}`);
-                  }
-                  // Defer submit to onExit — avoid race with worker's process.exit(0)
-                  pendingAutoContinue = {
-                    userText: '继续',
-                    fileContent: '',
-                    imagePaths: [],
-                    threadTs,
-                    deliveryThreadTs: effectiveThreadTs,
-                    channel,
-                    userId,
-                    platform,
-                    teamId: task.teamId || null,
-                    threadHistory: task.threadHistory,
-                    profile,
-                    maxTurns: task.maxTurns || null,
-                    enableTaskCard: task.enableTaskCard,
-                    deferDeliveryUntilResult,
-                    _autoContinue: true,
-                    _completion: task._completion,
-                  };
-                  return;
-                }
-                warn(TAG, `empty result after ${MAX_AUTO_CONTINUE} auto-continues for thread=${threadTs}`);
-                this._autoContinueCount.delete(threadTs);
-              } else {
-                this._autoContinueCount.delete(threadTs);
-              }
-              if (silentDeferredResult) {
-                info(TAG, `silent deferred result suppressed: thread=${threadTs}`);
-                turnDelivered = true;
-              }
-              if (!turnDelivered) {
-                if (deferDeliveryUntilResult && text) {
-                  turnDelivered = await deliverDeferredFinalResult(text);
-                } else if (turn.intermediateDeliveredThisTurn && text) {
-                  const remainingText = subtractDeliveredText(text, turn.egress?.deliveredTexts || []);
-                  if (remainingText.trim()) {
-                    const payloads = adapter.buildPayloads(remainingText);
-                    info(TAG, `sending ${payloads.length} deduped result payload(s) to thread=${threadTs}`);
-                    for (const payload of payloads) {
-                      await emitPayload(payload);
-                    }
-                  } else {
-                    info(TAG, `result text already delivered via intermediate stream, skip sendReply`);
-                  }
-                  turnDelivered = true;
-                } else {
-                  const finalText = text || '⚠️ 多次续接仍未生成回复，任务可能需要拆分。请用更小的指令重试。';
-                  if (turn.egress.admit(finalText, 'result-final')) {
-                    const payloads = adapter.buildPayloads(finalText);
-                    info(TAG, `sending ${payloads.length} payload(s) to thread=${threadTs}`);
-                    for (const payload of payloads) {
-                      await emitPayload(payload);
-                    }
-                  }
-                  turnDelivered = true;
-                }
-              }
-              resetTaskCardState();
-              if (!silentDeferredResult) await updateThreadMetadata(text);
-              await stopTyping();
-              if (text) {
-                const errorPatterns = /(?:error|failed|permission denied|ENOENT|not found|timed?\s*out|EACCES)/i;
-                if (errorPatterns.test(text) && text.length > 50) {
-                  storeLesson({
-                    userText: task.userText || '',
-                    errorText: '',
-                    responseText: text.slice(0, 2000),
-                    threadTs,
-                    userId,
-                    dbPath: join(profile.dataDir, 'memory.db'),
-                  }).catch(() => {});
-                }
-              }
-              const correctionPatterns = /不对|不是这样|重来|重新|按我说的|你搞错了|我要的是|不是我想要|改一下|错了|再试|not what I|wrong|redo|try again/i;
-              if (correctionPatterns.test(task.userText || '')) {
-                storeCorrectionLesson({
-                  userText: task.userText || '',
-                  responseText: (text || '').slice(0, 2000),
-                  threadHistory: (task.threadHistory || '').slice(0, 3000),
-                  threadTs,
-                  userId,
-                  dbPath: join(profile.dataDir, 'memory.db'),
-                }).catch(() => {});
-              }
-            } catch (err) {
-              await stopTyping();
-              const errCode = typeof getTaskCardStreamErrorCode === 'function' ? getTaskCardStreamErrorCode(err) : null;
-              logError(TAG, `failed to send result: ${err.message}${errCode ? ` (code=${errCode})` : ''}`);
-              await adapter.sendReply(channel, effectiveThreadTs, ':warning: 回复发送失败。').catch(() => {});
-            }
-            if (msg.toolCount > 0) {
-              try { this._checkSkillReview(profile.name, msg.toolCount, task, text); } catch (_) {}
-              try { this._checkMemorySync(profile.name, msg.toolCount, task); } catch (_) {}
-            }
+            await handleExitResult(msg);
           } else if (msg.type === 'error') {
             const safeError = sanitizeErrorText(msg.error || '未知错误');
             workerFailure = new Error(safeError);
