@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { mkdirSync, copyFileSync, readFileSync, existsSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, copyFileSync, readFileSync, existsSync, rmSync, writeFileSync, readdirSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -169,11 +169,12 @@ process.on('message', async (msg) => {
     ensureWorkspaceClaudeSettings(WORKSPACE);
     const permissionPromptDisabled = disablePermissionPrompt === true || platform === 'system' || channel == null;
     if (!permissionPromptDisabled) {
-      mcpConfigPath = writePermissionMcpConfig({
+      mcpConfigPath = buildWorkerMcpConfig({
         threadTs,
         channel,
         userId,
         permissionTimeoutMs: DEFAULT_PERMISSION_TIMEOUT_MS,
+        workspace: WORKSPACE,
       });
     }
 
@@ -269,11 +270,12 @@ process.on('message', async (msg) => {
       console.log('[worker] MCP race detected, retrying after 500ms (1/1)');
       cleanupTempFile(mcpConfigPath);
       await new Promise((resolve) => setTimeout(resolve, 500));
-      mcpConfigPath = writePermissionMcpConfig({
+      mcpConfigPath = buildWorkerMcpConfig({
         threadTs,
         channel,
         userId,
         permissionTimeoutMs: DEFAULT_PERMISSION_TIMEOUT_MS,
+        workspace: WORKSPACE,
       });
       const mcpConfigIndex = streamArgs.indexOf('--mcp-config');
       if (mcpConfigIndex >= 0 && streamArgs[mcpConfigIndex + 1]) {
@@ -894,33 +896,77 @@ function schedulerSocketPathForPid(pid) {
   return join(tmpdir(), `orb-permission-scheduler-${pid}.sock`);
 }
 
-function writePermissionMcpConfig({ threadTs, channel, userId, permissionTimeoutMs }) {
+function buildWorkerMcpConfig({ threadTs, channel, userId, permissionTimeoutMs, workspace }) {
+  const workspaceDir = workspace || process.env.WORKSPACE_DIR || process.cwd();
   const configPath = join(
     tmpdir(),
     `orb-mcp-${process.pid}-${sanitizeFileToken(threadTs)}.json`,
   );
   const serverPath = join(dirname(fileURLToPath(import.meta.url)), 'mcp-permission-server.js');
-  const config = {
-    mcpServers: {
-      orb_permission: {
-        type: 'stdio',
-        command: process.execPath,
-        args: [serverPath],
-        env: {
-          ORB_SCHEDULER_SOCKET: schedulerSocketPathForPid(process.ppid),
-          ORB_THREAD_TS: String(threadTs || ''),
-          ORB_CHANNEL: String(channel || ''),
-          ORB_USER_ID: String(userId || ''),
-          ORB_PERMISSION_TIMEOUT_MS: String(permissionTimeoutMs || DEFAULT_PERMISSION_TIMEOUT_MS),
-          ...(process.env.ORB_MCP_PERMISSION_LOG ? { ORB_MCP_PERMISSION_LOG: process.env.ORB_MCP_PERMISSION_LOG } : {}),
-        },
+  const baseServers = {
+    orb_permission: {
+      type: 'stdio',
+      command: process.execPath,
+      args: [serverPath],
+      env: {
+        ORB_SCHEDULER_SOCKET: schedulerSocketPathForPid(process.ppid),
+        ORB_THREAD_TS: String(threadTs || ''),
+        ORB_CHANNEL: String(channel || ''),
+        ORB_USER_ID: String(userId || ''),
+        ORB_PERMISSION_TIMEOUT_MS: String(permissionTimeoutMs || DEFAULT_PERMISSION_TIMEOUT_MS),
+        ...(process.env.ORB_MCP_PERMISSION_LOG ? { ORB_MCP_PERMISSION_LOG: process.env.ORB_MCP_PERMISSION_LOG } : {}),
       },
     },
+  };
+  const extServers = collectWorkspaceMcpServers(workspaceDir, {
+    ORB_THREAD_TS: String(threadTs || ''),
+    ORB_CHANNEL: String(channel || ''),
+    ORB_USER_ID: String(userId || ''),
+    ORB_WORKSPACE_DIR: workspaceDir,
+  });
+  const mergedServers = { ...extServers, ...baseServers };
+  const config = {
+    mcpServers: mergedServers,
   };
   writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`);
   console.log(`[worker] wrote MCP config: ${configPath}`);
   return configPath;
 }
+
+function collectWorkspaceMcpServers(workspace, extraEnv) {
+  const dir = join(workspace, '.claude', 'mcp-servers');
+  if (!existsSync(dir)) return {};
+
+  const result = {};
+  for (const fname of readdirSync(dir)) {
+    if (!fname.endsWith('.json')) continue;
+    try {
+      const raw = JSON.parse(readFileSync(join(dir, fname), 'utf8'));
+      for (const [name, def] of Object.entries(raw)) {
+        if (!def || typeof def !== 'object' || !def.command) continue;
+        const args = Array.isArray(def.args)
+          ? def.args.map((arg) => (
+              typeof arg === 'string' && !arg.startsWith('/') && !arg.startsWith('-')
+                ? join(workspace, arg)
+                : arg
+            ))
+          : [];
+        // Workspace MCP runs inside the worker child process and can access Orb env.
+        result[name] = {
+          type: def.type || 'stdio',
+          command: def.command,
+          args,
+          env: { ...(def.env || {}), ...extraEnv },
+        };
+      }
+    } catch (err) {
+      console.warn(`[worker] failed to load MCP registration ${fname}: ${err.message}`);
+    }
+  }
+  return result;
+}
+
+const writePermissionMcpConfig = buildWorkerMcpConfig;
 
 function cleanupTempFile(filePath) {
   if (!filePath) return;
