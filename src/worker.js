@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
-import { mkdirSync, copyFileSync, readFileSync, existsSync, rmSync, writeFileSync, readdirSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { mkdirSync, copyFileSync, readFileSync, existsSync, rmSync, writeFileSync, readdirSync, appendFileSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -82,6 +83,11 @@ const TASK_CARD_TOOLS = new Set([
 ]);
 
 let _activeCli = null;   // reference to active interactive CLI session
+let _currentTurnId = null;
+let _currentJobId = null;
+let _currentThreadTs = null;
+let _currentProfileName = null;
+let _currentDataDir = null;
 // Last full turn text emitted via turn_complete IPC. Exit path compares against
 // exitResult.lastTurnText and suppresses duplicate result text when the
 // scheduler has already handled that turn through turn_complete delivery.
@@ -90,12 +96,14 @@ let _lastEmittedTurnText = null;
 process.on('message', async (msg) => {
   if (msg.type === 'inject') {
     if (_activeCli) {
+      beginCcTurn();
       const injected = _activeCli.inject(msg.userText, msg.fileContent, msg.imagePaths);
       if (injected) {
         _lastEmittedTurnText = null;
         await ipcSend({ type: 'turn_start', injectId: msg.injectId || null }).catch(() => {});
         console.log(`[worker] injected: "${(msg.userText || '').slice(0, 60)}"`);
       } else {
+        clearCcTurn();
         console.warn('[worker] inject rejected by CLI — signaling fail-forward');
         await ipcSend({
           type: 'inject_failed',
@@ -121,10 +129,14 @@ process.on('message', async (msg) => {
   }
   if (msg.type !== 'task') return;
 
-  _lastEmittedTurnText = null;
-  await ipcSend({ type: 'turn_start' }).catch(() => {});
-
   let { userText, fileContent, imagePaths, threadTs, channel, userId, platform, profile, threadHistory, model, effort, mode, priorConversation, disablePermissionPrompt, maxTurns } = msg;
+  _lastEmittedTurnText = null;
+  beginCcTurn({
+    threadTs,
+    profileName: profile?.name,
+    dataDir: profile?.dataDir || process.cwd(),
+  });
+  await ipcSend({ type: 'turn_start' }).catch(() => {});
 
   // Fail-fast: skill-review mode without context produces "no skill" noise.
   // Without real content to review the worker is just burning tokens on nothing.
@@ -247,6 +259,7 @@ process.on('message', async (msg) => {
       });
       cli.setOnTurnEnd(async () => {
         await ipcSend({ type: 'turn_end' }).catch(() => {});
+        clearCcTurn();
       });
 
       // Phase ③: stream mid-turn text blocks as they arrive
@@ -349,6 +362,48 @@ function truncateText(text, maxChars) {
   const normalized = String(text || '').replace(/\s+\n/g, '\n').trim();
   if (normalized.length <= maxChars) return normalized;
   return `${normalized.slice(0, maxChars - 3)}...`;
+}
+
+function beginCcTurn({ threadTs, profileName, dataDir } = {}) {
+  if (threadTs !== undefined) {
+    _currentThreadTs = threadTs;
+    _currentJobId = typeof threadTs === 'string' && threadTs.startsWith('cron:') ? threadTs : null;
+  }
+  if (profileName !== undefined) _currentProfileName = profileName || 'default';
+  if (dataDir !== undefined) _currentDataDir = dataDir;
+  _currentTurnId = randomUUID();
+}
+
+function clearCcTurn() {
+  _currentTurnId = null;
+}
+
+function todayJstDate() {
+  return new Date(Date.now() + 9 * 60 * 60 * 1000).toISOString().slice(0, 10);
+}
+
+function timestampJst() {
+  const shifted = new Date(Date.now() + 9 * 60 * 60 * 1000).toISOString();
+  return `${shifted.slice(0, -1)}+09:00`;
+}
+
+function writeCcEvent({ event_type, payload }) {
+  if (!_currentTurnId || !_currentDataDir) return;
+  try {
+    const dir = join(_currentDataDir, 'cc-events');
+    mkdirSync(dir, { recursive: true });
+    appendFileSync(join(dir, `${todayJstDate()}.jsonl`), `${JSON.stringify({
+      ts: timestampJst(),
+      thread_ts: _currentThreadTs || null,
+      turn_id: _currentTurnId,
+      job_id: _currentJobId,
+      profile: _currentProfileName || 'default',
+      event_type,
+      payload: payload || {},
+    })}\n`);
+  } catch (err) {
+    console.warn(`[worker] failed to write cc event: ${err.message}`);
+  }
 }
 
 function formatElapsedTime(startedAt, now = Date.now()) {
@@ -685,12 +740,23 @@ function runClaudeInteractive(args, initialContent, workspace) {
       for (const block of msg.message.content) {
         if (block.type === 'text') {
           turnBuffer.push(block.text);
+          writeCcEvent({
+            event_type: 'text',
+            payload: { text_summary: truncateText(block.text, 300) },
+          });
           queueIntermediate(block.text);
         }
         if (block.type === 'tool_use') {
           totalToolCount++;
           turnToolCount++;
           lastTool = block.name || null;
+          writeCcEvent({
+            event_type: 'tool_use',
+            payload: {
+              name: block.name || null,
+              input_summary: truncateText(stringifyToolValue(block.input), 300),
+            },
+          });
           const isTodoWriteSnapshot = block.name === 'TodoWrite' && Array.isArray(block.input?.todos);
           const emitsTaskCard = shouldEmitTaskCardForTool(block.name, block.input, block.id);
           if (emitsTaskCard && !taskCardEmittedInTurn) {
@@ -745,6 +811,16 @@ function runClaudeInteractive(args, initialContent, workspace) {
     }
     if (msg.type === 'user' && Array.isArray(msg.message?.content)) {
       for (const block of msg.message.content) {
+        if (block?.type === 'tool_result') {
+          writeCcEvent({
+            event_type: 'tool_result',
+            payload: {
+              tool_use_id: block.tool_use_id || null,
+              output_summary: truncateText(stringifyToolValue(block.content ?? block.output ?? ''), 500),
+              is_error: block.is_error === true,
+            },
+          });
+        }
         if (!block?.tool_use_id || !pendingTaskCards.has(block.tool_use_id)) continue;
         pendingTaskCards.delete(block.tool_use_id);
         inProgressTaskCards.delete(block.tool_use_id);
@@ -754,6 +830,14 @@ function runClaudeInteractive(args, initialContent, workspace) {
       lastSessionId = msg.session_id || lastSessionId;
       lastStopReason = turnStopReasonOverride || msg.stop_reason || msg.subtype || null;
       const turnText = msg.result || turnBuffer.join('\n');
+      writeCcEvent({
+        event_type: 'result',
+        payload: {
+          stop_reason: lastStopReason,
+          ...(msg.num_turns != null ? { num_turns: msg.num_turns } : {}),
+          ...(msg.usage != null ? { usage: msg.usage } : {}),
+        },
+      });
       if (qiStreamOpened) {
         await ipcSend({
           type: 'qi_finalize',
