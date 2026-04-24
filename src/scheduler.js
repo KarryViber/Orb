@@ -1482,17 +1482,33 @@ export class Scheduler {
                 return;
               }
               if (!text) {
+                const isMaxTurnsReached = msg.stopReason === 'max_turns_reached';
+                const isToolOnlyCompletion = !isMaxTurnsReached && (msg.toolCount || 0) > 0;
+
+                // tool-only turn（如 GitHub 调研卡片流）：最后一个 turn 只有 tool_use、
+                // 外投通过 Bash → Slack API 完成，没有 assistant text。这是预期的正常结束，
+                // 不应触发 auto-continue 也不应发提示。
+                if (isToolOnlyCompletion) {
+                  info(TAG, `tool-only turn completed without text, skipping auto-continue: thread=${threadTs} toolCount=${msg.toolCount} lastTool=${msg.lastTool || 'none'}`);
+                  this._autoContinueCount.delete(threadTs);
+                  return;
+                }
+
                 const retries = this._autoContinueCount.get(threadTs) || 0;
                 if (retries < MAX_AUTO_CONTINUE) {
                   this._autoContinueCount.set(threadTs, retries + 1);
-                  warn(TAG, `empty result, auto-continue ${retries + 1}/${MAX_AUTO_CONTINUE} for thread=${threadTs}`);
+                  const reasonTag = isMaxTurnsReached ? 'max_turns_reached' : 'empty';
+                  warn(TAG, `${reasonTag} result, auto-continue ${retries + 1}/${MAX_AUTO_CONTINUE} for thread=${threadTs}`);
                   const suppressAutoContinueNotice = platform === 'slack'
                     && typeof channel === 'string'
                     && channel.startsWith('D');
                   if (!deferDeliveryUntilResult && !suppressAutoContinueNotice) {
-                    await adapter.sendReply(channel, effectiveThreadTs, `⏳ 回合上限已达${msg.stopReason === 'tool_use' ? '（任务执行中）' : msg.lastTool ? '（正在: ' + msg.lastTool + '）' : ''}，自动续接中 (${retries + 1}/${MAX_AUTO_CONTINUE})…`).catch(() => {});
+                    const notice = isMaxTurnsReached
+                      ? `⏳ 到达回合上限，自动续接中 (${retries + 1}/${MAX_AUTO_CONTINUE})…`
+                      : `⏳ 本轮无输出，自动续接中 (${retries + 1}/${MAX_AUTO_CONTINUE})…`;
+                    await adapter.sendReply(channel, effectiveThreadTs, notice).catch(() => {});
                   } else if (suppressAutoContinueNotice) {
-                    info(TAG, `empty result auto-continue notice suppressed in Slack DM: thread=${threadTs}`);
+                    info(TAG, `${reasonTag} result auto-continue notice suppressed in Slack DM: thread=${threadTs}`);
                   }
                   // Defer submit to onExit — avoid race with worker's process.exit(0)
                   pendingAutoContinue = {
