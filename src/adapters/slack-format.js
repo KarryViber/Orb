@@ -627,6 +627,7 @@ export function buildTaskUpdateChunks(taskCardsMap, { updateOnly = false } = {})
     };
     const output = String(card?.output || '').trim();
     if (updateOnly) {
+      chunk.title = String(card?.title || 'Task').slice(0, 256);
       if (output) chunk.output = output.slice(0, 256);
       return chunk;
     }
