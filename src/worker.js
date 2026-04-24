@@ -402,9 +402,9 @@ export function shouldEmitTaskCardForTool(toolName, input, toolUseId = null) {
 }
 
 function categorizeTool(toolName) {
-  if (/^(Bash|Read|Edit|Write|Grep|Glob|NotebookEdit|WebFetch|WebSearch|LSP)$/.test(toolName)) return '工具执行';
-  if (/^(Task|Agent|Skill|mcp__)/.test(toolName)) return '其他操作';
-  return '工具执行';
+  if (/^(Bash|Read|Edit|Write|Grep|Glob|NotebookEdit|WebFetch|WebSearch|LSP)$/.test(toolName)) return 'Probe';
+  if (/^(Task|Agent|Skill|mcp__)/.test(toolName)) return 'Delegate';
+  return 'Probe';
 }
 
 function tokenizeShellCommand(command) {
