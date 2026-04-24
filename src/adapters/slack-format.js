@@ -639,6 +639,13 @@ export function buildTaskUpdateChunks(taskCardsMap, { updateOnly = false } = {})
   }).filter((chunk) => chunk.id);
 }
 
+export function categorizeTool(toolName) {
+  if (/^(Bash|Read|Edit|Write|Grep|Glob|NotebookEdit|WebFetch|WebSearch)$/.test(toolName)) return 'Probe';
+  if (/^(Task|Agent|Skill|mcp__)/.test(toolName)) return 'Delegate';
+  if (toolName === 'summary') return 'Distill';
+  return null;
+}
+
 
 
 export { sanitizeErrorText } from '../format-utils.js';

@@ -7,7 +7,7 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { info, error as logError, warn } from '../log.js';
 import { isSafeUrl } from '../format-utils.js';
-import { buildSendPayloads } from './slack-format.js';
+import { buildSendPayloads, categorizeTool } from './slack-format.js';
 import { PlatformAdapter } from './interface.js';
 import { downloadAndCacheImage, cleanImageCache, IMAGE_EXTENSIONS } from './image-cache.js';
 
@@ -15,6 +15,159 @@ const TAG = 'slack';
 const MAX_USERNAME_CACHE = 500;
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const streamTrace = () => process.env.ORB_STREAM_TRACE === '1';
+
+const QI_INITIAL_CHUNKS = [
+  { type: 'plan_update', title: 'Orbiting...' },
+  { type: 'task_update', id: 'qi-exec', title: 'Probe', status: 'in_progress', details: '' },
+  { type: 'task_update', id: 'qi-other', title: 'Delegate', status: 'in_progress', details: '' },
+  { type: 'task_update', id: 'qi-summary', title: 'Distill', status: 'in_progress', details: '' },
+];
+
+const QI_TASK_IDS = {
+  Probe: 'qi-exec',
+  Delegate: 'qi-other',
+  Distill: 'qi-summary',
+};
+
+function truncateQiText(text, max = 256) {
+  const normalized = String(text || '').replace(/\s+/g, ' ').trim();
+  return normalized.length <= max ? normalized : `${normalized.slice(0, max - 1)}…`;
+}
+
+function summarizeQiInput(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return '';
+  const keys = ['description', 'command', 'query', 'pattern', 'file_path', 'url', 'skill_name', 'subagent_type'];
+  for (const key of keys) {
+    if (input[key] != null && String(input[key]).trim()) return String(input[key]);
+  }
+  const first = Object.entries(input).find(([, value]) => (
+    value != null && ['string', 'number', 'boolean'].includes(typeof value)
+  ));
+  return first ? `${first[0]}: ${first[1]}` : '';
+}
+
+function buildQiToolLine(payload) {
+  const name = payload?.name || 'Tool';
+  const summary = summarizeQiInput(payload?.input);
+  return truncateQiText(summary ? `${name}: ${summary}` : name);
+}
+
+export function buildQiSettledChunks(toolCount = 0, reason = '') {
+  const count = Number.isFinite(Number(toolCount)) ? Number(toolCount) : 0;
+  const details = reason ? `Settled: ${reason}` : `Distilled from ${count} probes`;
+  return [
+    { type: 'plan_update', title: 'Settled' },
+    { type: 'task_update', id: 'qi-exec', title: 'Probe', status: 'complete' },
+    { type: 'task_update', id: 'qi-other', title: 'Delegate', status: 'complete' },
+    { type: 'task_update', id: 'qi-summary', title: 'Distill', status: 'complete', details },
+  ];
+}
+
+function makeQiTurnState() {
+  return {
+    streamId: null,
+    streamTs: null,
+    startPromise: null,
+    appendPromise: null,
+    failed: false,
+    toolCount: 0,
+  };
+}
+
+export function createSlackQiSubscriber(adapter) {
+  const turns = new Map();
+  const getState = (turnId) => {
+    const key = turnId || 'default';
+    if (!turns.has(key)) turns.set(key, makeQiTurnState());
+    return turns.get(key);
+  };
+
+  const ensureStarted = async (state, ctx) => {
+    if (state.streamId || state.failed) return Boolean(state.streamId);
+    if (state.startPromise) {
+      await state.startPromise;
+      return Boolean(state.streamId);
+    }
+    const channel = ctx?.channel || ctx?.task?.channel;
+    const threadTs = ctx?.effectiveThreadTs || ctx?.threadTs || ctx?.task?.threadTs;
+    if (!channel || !threadTs) return false;
+    state.startPromise = (async () => {
+      try {
+        const stream = await adapter.startStream(channel, threadTs, {
+          task_display_mode: 'plan',
+          initial_chunks: QI_INITIAL_CHUNKS,
+          team_id: ctx?.task?.teamId || ctx?.teamId || null,
+        });
+        state.streamId = stream?.stream_id || (stream?.ts ? `${channel}:${stream.ts}` : null);
+        state.streamTs = stream?.ts || null;
+      } catch (err) {
+        state.failed = true;
+        warn(TAG, `[qi_subscriber] start failed: ${err.message}`);
+      } finally {
+        state.startPromise = null;
+      }
+    })();
+    await state.startPromise;
+    return Boolean(state.streamId);
+  };
+
+  const chainAppend = (state, operation) => {
+    const previous = state.appendPromise || Promise.resolve();
+    const next = previous.catch(() => {}).then(operation);
+    state.appendPromise = next.finally(() => {
+      if (state.appendPromise === next) state.appendPromise = null;
+    });
+    return state.appendPromise;
+  };
+
+  return {
+    match: (msg) => msg?.type === 'cc_event' && (msg.eventType === 'tool_use' || msg.eventType === 'result'),
+    async handle(msg, ctx = {}) {
+      const state = getState(msg.turnId);
+      if (msg.eventType === 'tool_use') {
+        const category = categorizeTool(msg.payload?.name);
+        if (!category) return;
+        const taskCardState = ctx?.turn?.taskCardState;
+        if (taskCardState && !taskCardState.enabled && !taskCardState.deferred) return;
+        if (taskCardState?.failed) return;
+        state.toolCount += 1;
+        if (!await ensureStarted(state, ctx)) return;
+        const taskId = QI_TASK_IDS[category];
+        if (!taskId || state.failed || !state.streamId) return;
+        await chainAppend(state, async () => {
+          if (!state.streamId) return;
+          await adapter.appendStream(state.streamId, [
+            { type: 'task_update', id: taskId, title: category, details: `\n${buildQiToolLine(msg.payload)}\n` },
+          ]);
+        }).catch((err) => {
+          warn(TAG, `[qi_subscriber] append failed: ${err.message}`);
+        });
+        return;
+      }
+
+      if (state.startPromise) await state.startPromise;
+      if (state.appendPromise) await state.appendPromise.catch(() => {});
+      if (!state.streamId) {
+        turns.delete(msg.turnId || 'default');
+        return;
+      }
+      const streamId = state.streamId;
+      const chunks = buildQiSettledChunks(state.toolCount);
+      try {
+        await adapter.appendStream(streamId, chunks);
+      } catch (err) {
+        warn(TAG, `[qi_subscriber] finalize append failed: ${err.message}`);
+      }
+      try {
+        await adapter.stopStream(streamId, { chunks });
+      } catch (err) {
+        warn(TAG, `[qi_subscriber] stop failed: ${err.message}`);
+      } finally {
+        turns.delete(msg.turnId || 'default');
+      }
+    },
+  };
+}
 
 // --- Slack thread URL parsing ---
 
@@ -1239,6 +1392,10 @@ export class SlackAdapter extends PlatformAdapter {
 
   async editMessage(channel, ts, text, extra = {}) {
     return this._editMessage(channel, ts, text, extra);
+  }
+
+  createQiSubscriber() {
+    return createSlackQiSubscriber(this);
   }
 
   // --- Streaming helpers ---
