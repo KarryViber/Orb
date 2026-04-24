@@ -37,8 +37,6 @@ import { storeConversation } from './memory.js';
  *   { type: 'tool_call', task_id, tool_name, title, details, status?, chunk_type, display_mode? }  — task-card path:
  *     emitted for selected tool_use blocks so scheduler can update Slack task cards.
  *     TodoWrite synthetic per-todo ids now live inside plan_snapshot.rows[].task_id.
- *   { type: 'tool_result', task_id, status, output }  — task-card path:
- *     emitted from tool_result blocks for tools that wait on a result; status is 'complete' | 'error'.
  *   { type: 'status_update', text }  — short assistant thread status text;
  *     emitted when a tool starts, refreshed during long task-card tools, and cleared with empty text on turn_complete.
  *   { type: 'turn_start', injectId? }  — explicit turn ownership start on task/inject receipt
@@ -328,7 +326,6 @@ process.on('message', async (msg) => {
 });
 
 const IDLE_TIMEOUT = parseInt(process.env.WORKER_IDLE_TIMEOUT_MS, 10) || 60_000; // idle → close stdin → CLI exits
-const TASK_CARD_HEARTBEAT_MS = 30_000;
 const STATUS_HEARTBEAT_MS = 90_000;
 
 function renderTodos(todos) {
@@ -344,14 +341,6 @@ function truncateText(text, maxChars) {
   const normalized = String(text || '').replace(/\s+\n/g, '\n').trim();
   if (normalized.length <= maxChars) return normalized;
   return `${normalized.slice(0, maxChars - 3)}...`;
-}
-
-function formatElapsedTime(startedAt, now = Date.now()) {
-  const elapsedSeconds = Math.max(0, Math.floor((now - startedAt) / 1000));
-  if (elapsedSeconds < 60) return `${elapsedSeconds}s`;
-  const elapsedMinutes = Math.floor(elapsedSeconds / 60);
-  if (elapsedMinutes < 60) return `${elapsedMinutes}m ${elapsedSeconds % 60}s`;
-  return `${Math.floor(elapsedMinutes / 60)}h ${elapsedMinutes % 60}m`;
 }
 
 function truncate256(text) {
@@ -425,15 +414,6 @@ function parseToolInput(toolInput) {
   }
 }
 
-function stringifyToolValue(value) {
-  if (typeof value === 'string') return value;
-  try {
-    return JSON.stringify(value, null, 2);
-  } catch {
-    return String(value);
-  }
-}
-
 function summarizePrimitiveParams(input, limit = 4) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) return '';
   const parts = [];
@@ -452,54 +432,6 @@ function summarizePrimitiveParams(input, limit = 4) {
 function firstNonFlagToken(command) {
   const tokens = tokenizeShellCommand(command);
   return tokens.find((token) => token && token !== '--' && !token.startsWith('-')) || tokens[0] || 'sh';
-}
-
-function summarizeWriteDetails(parsedInput) {
-  const filePath = parsedInput?.file_path ? `path: ${parsedInput.file_path}` : '';
-  const content = parsedInput?.content != null
-    ? `content: ${truncateText(stringifyToolValue(parsedInput.content), 120)}`
-    : '';
-  return [filePath, content].filter(Boolean).join('\n');
-}
-
-function summarizeEditDetails(parsedInput) {
-  const filePath = parsedInput?.file_path ? `path: ${parsedInput.file_path}` : '';
-  const oldString = parsedInput?.old_string != null
-    ? `old: ${truncateText(stringifyToolValue(parsedInput.old_string), 80)}`
-    : '';
-  const newString = parsedInput?.new_string != null
-    ? `new: ${truncateText(stringifyToolValue(parsedInput.new_string), 80)}`
-    : '';
-  return [filePath, oldString, newString].filter(Boolean).join('\n');
-}
-
-function summarizeTodos(todos) {
-  if (!Array.isArray(todos) || todos.length === 0) return 'No todos';
-  return todos.map((todo) => {
-    const icon = todo.status === 'completed' ? 'complete' : todo.status === 'in_progress' ? 'in progress' : 'pending';
-    return `- [${icon}] ${todo.content || '(untitled)'}`;
-  }).join('\n');
-}
-
-function summarizeToolDetails(toolName, input) {
-  const parsedInput = parseToolInput(input);
-
-  if (toolName === 'Skill') {
-    return truncateText(
-      parsedInput?.skill_description
-      || parsedInput?.description
-      || '',
-      120,
-    );
-  }
-  if (toolName === 'Task' || toolName === 'Agent') {
-    const parts = [];
-    if (parsedInput?.subagent_type) parts.push(`type: ${parsedInput.subagent_type}`);
-    if (parsedInput?.description) parts.push(parsedInput.description);
-    return truncateText(parts.join(' · '), 120);
-  }
-
-  return '';
 }
 
 function buildToolTitle(toolName, input) {
@@ -566,16 +498,6 @@ function buildStatusText(toolName, input) {
   return truncateText(buildToolTitle(toolName, input), 80);
 }
 
-function extractToolResultText(content) {
-  if (typeof content === 'string') return content;
-  if (!Array.isArray(content)) return stringifyToolValue(content);
-  return content.map((item) => {
-    if (typeof item === 'string') return item;
-    if (item?.type === 'text' && typeof item.text === 'string') return item.text;
-    return stringifyToolValue(item);
-  }).filter(Boolean).join('\n');
-}
-
 function runClaudeInteractive(args, initialContent, workspace) {
   const child = spawn(CLAUDE_PATH, args, {
     cwd: workspace,
@@ -602,89 +524,78 @@ function runClaudeInteractive(args, initialContent, workspace) {
   let taskCardEmittedInTurn = false;
   let taskCardChunkType = 'plan';
   let taskCardDisplayMode = 'timeline';
-  let nonTodoTaskCardEmittedInTurn = false;
-  let currentTaskCardCategory = null;
   let turnStopReasonOverride = null;
-  const pendingTaskCards = new Map();
-  const inProgressTaskCards = new Map();
-  let taskCardHeartbeatTimer = null;
+  const turnCategoryBuffer = new Map();
+  let currentStatusTool = null;
   let statusHeartbeatTimer = null;
 
   const resetTurnStreamingState = () => {
     taskCardEmittedInTurn = false;
     taskCardChunkType = 'plan';
     taskCardDisplayMode = 'timeline';
-    nonTodoTaskCardEmittedInTurn = false;
-    currentTaskCardCategory = null;
     turnToolCount = 0;
     turnStopReasonOverride = null;
-    pendingTaskCards.clear();
-    inProgressTaskCards.clear();
+    turnCategoryBuffer.clear();
+    currentStatusTool = null;
     clearTurnHeartbeatTimers();
   };
 
   const clearTurnHeartbeatTimers = () => {
-    if (taskCardHeartbeatTimer) {
-      clearInterval(taskCardHeartbeatTimer);
-      taskCardHeartbeatTimer = null;
-    }
     if (statusHeartbeatTimer) {
       clearInterval(statusHeartbeatTimer);
       statusHeartbeatTimer = null;
     }
   };
 
-  const getActiveTaskCard = () => {
-    let active = null;
-    for (const [taskId, card] of inProgressTaskCards.entries()) {
-      if (!pendingTaskCards.has(taskId)) {
-        inProgressTaskCards.delete(taskId);
-        continue;
-      }
-      if (!active || card.startedAt > active.card.startedAt) active = { taskId, card };
-    }
-    return active;
-  };
-
-  const appendElapsedToTitle = (title, startedAt) => {
-    const suffix = `（${formatElapsedTime(startedAt)}）`;
-    const maxBaseLength = Math.max(1, 256 - suffix.length);
-    return `${truncateText(title || 'Task', maxBaseLength)}${suffix}`;
-  };
-
-  const buildElapsedStatusText = (card) => (
-    truncateText(`${buildStatusText(card.toolName, card.input)} (${formatElapsedTime(card.startedAt)})`, 100)
-  );
-
   const ensureTurnHeartbeatTimers = () => {
-    if (!taskCardHeartbeatTimer) {
-      taskCardHeartbeatTimer = setInterval(() => {
-        for (const [taskId, card] of inProgressTaskCards.entries()) {
-          if (!pendingTaskCards.has(taskId)) {
-            inProgressTaskCards.delete(taskId);
-            continue;
-          }
-          ipcSend({
-            type: 'tool_call',
-            task_id: taskId,
-            tool_name: card.toolName,
-            title: appendElapsedToTitle(card.title, card.startedAt),
-            details: card.details,
-            chunk_type: taskCardChunkType,
-          }).catch(() => {});
-        }
-      }, TASK_CARD_HEARTBEAT_MS);
-    }
     if (!statusHeartbeatTimer) {
       statusHeartbeatTimer = setInterval(() => {
-        const active = getActiveTaskCard();
-        if (!active) return;
+        if (!currentStatusTool) return;
         ipcSend({
           type: 'status_update',
-          text: buildElapsedStatusText(active.card),
+          text: buildStatusText(currentStatusTool.toolName, currentStatusTool.input),
         }).catch(() => {});
       }, STATUS_HEARTBEAT_MS);
     }
+  };
+
+  const recordTool = (toolName, input) => {
+    if (!TASK_CARD_TOOLS.has(toolName) || toolName === 'TodoWrite') return false;
+    const category = categorizeTool(toolName);
+    const title = buildToolTitle(toolName, input);
+    if (!turnCategoryBuffer.has(category)) turnCategoryBuffer.set(category, []);
+    turnCategoryBuffer.get(category).push(title);
+    return true;
+  };
+
+  const flushTurnCategoryBuffer = async () => {
+    if (turnCategoryBuffer.size === 0) return;
+    await ipcSend({ type: 'plan_section', title: '已完成思考' }).catch(() => {});
+
+    const categoryOrder = ['工具执行', '其他操作'];
+    for (const category of categoryOrder) {
+      const lines = turnCategoryBuffer.get(category) || [];
+      if (lines.length === 0) continue;
+      await ipcSend({
+        type: 'tool_call',
+        task_id: `category-${category}`,
+        tool_name: 'category',
+        title: category,
+        details: lines.join('\n'),
+        status: 'complete',
+        chunk_type: taskCardChunkType,
+      }).catch(() => {});
+    }
+
+    await ipcSend({
+      type: 'tool_call',
+      task_id: 'turn-summary',
+      tool_name: 'summary',
+      title: '信息整合',
+      details: `共调用 ${turnToolCount} 次工具`,
+      status: 'complete',
+      chunk_type: taskCardChunkType,
+    }).catch(() => {});
   };
 
   const queueIntermediate = (text) => {
@@ -754,6 +665,8 @@ function runClaudeInteractive(args, initialContent, workspace) {
             type: 'status_update',
             text: buildStatusText(block.name, block.input),
           }).catch(() => {});
+          currentStatusTool = { toolName: block.name, input: block.input };
+          ensureTurnHeartbeatTimers();
           if (isTodoWriteSnapshot) {
             const rows = buildPlanSnapshotRows(block.input.todos);
             if (rows.length > 0) {
@@ -770,58 +683,10 @@ function runClaudeInteractive(args, initialContent, workspace) {
             continue;
           }
           if (emitsTaskCard) {
-            const title = truncate256(buildToolTitle(block.name, block.input));
-            const details = truncate256(summarizeToolDetails(block.name, block.input));
-            const newCategory = categorizeTool(block.name);
-            if (newCategory !== currentTaskCardCategory) {
-              ipcSend({ type: 'plan_section', title: newCategory }).catch(() => {});
-              currentTaskCardCategory = newCategory;
-            }
-            pendingTaskCards.set(block.id, { toolName: block.name });
-            inProgressTaskCards.set(block.id, {
-              taskId: block.id,
-              toolName: block.name,
-              title,
-              input: block.input,
-              details,
-              startedAt: Date.now(),
-            });
-            ensureTurnHeartbeatTimers();
-            const taskCardPayload = {
-              type: 'tool_call',
-              task_id: block.id,
-              tool_name: block.name,
-              title,
-              details,
-              chunk_type: taskCardChunkType,
-            };
-            if (!taskCardEmittedInTurn) {
-              taskCardPayload.display_mode = taskCardDisplayMode;
-            }
-            ipcSend(taskCardPayload).catch(() => {});
+            recordTool(block.name, block.input);
             taskCardEmittedInTurn = true;
-            nonTodoTaskCardEmittedInTurn = true;
           }
         }
-      }
-    }
-    if (msg.type === 'user' && Array.isArray(msg.message?.content)) {
-      for (const block of msg.message.content) {
-        if (!block?.tool_use_id || !pendingTaskCards.has(block.tool_use_id)) continue;
-        const pending = pendingTaskCards.get(block.tool_use_id);
-        const toolName = pending?.toolName || '';
-        let output = '';
-        if (toolName === 'Task' || toolName === 'Agent' || toolName === 'Skill') {
-          output = truncateText(extractToolResultText(block.content), 160);
-        }
-        ipcSend({
-          type: 'tool_result',
-          task_id: block.tool_use_id,
-          status: block.is_error ? 'error' : 'complete',
-          output,
-        }).catch(() => {});
-        pendingTaskCards.delete(block.tool_use_id);
-        inProgressTaskCards.delete(block.tool_use_id);
       }
     }
     if (msg.type === 'result') {
@@ -829,18 +694,7 @@ function runClaudeInteractive(args, initialContent, workspace) {
       lastStopReason = turnStopReasonOverride || msg.stop_reason || msg.subtype || null;
       const turnText = msg.result || turnBuffer.join('\n');
       if (turnOpen && onTurnEnd) {
-        if (nonTodoTaskCardEmittedInTurn) {
-          await ipcSend({ type: 'plan_section', title: '信息整合' }).catch(() => {});
-          await ipcSend({
-            type: 'tool_call',
-            task_id: 'turn-summary',
-            tool_name: 'summary',
-            title: `共调用 ${turnToolCount} 次工具`,
-            details: '',
-            status: 'complete',
-            chunk_type: taskCardChunkType,
-          }).catch(() => {});
-        }
+        await flushTurnCategoryBuffer();
         turnOpen = false;
         await onTurnEnd();
       }
