@@ -29,7 +29,8 @@ import { storeConversation } from './memory.js';
  *   { type: 'inject_failed', injectId?, userText, fileContent?, imagePaths? }  — follow-up inject could not reach CLI;
  *     scheduler should respawn a fresh worker and replay the user payload.
  *   { type: 'error', error, errorContext? }
- *   { type: 'result', text, toolCount, lastTool?, stopReason? }  — process-exit completion signal, not a UI stream primitive
+ *   { type: 'result', text, stopReason?, exitOnly: true, toolCount?, lastTool? }
+ *     - process-exit completion signal, not a UI stream primitive.
  */
 
 const CLAUDE_PATH = process.env.CLAUDE_PATH || 'claude';
@@ -121,7 +122,7 @@ process.on('message', async (msg) => {
     const hasCtx = Array.isArray(priorConversation) && priorConversation.length > 0;
     if (!hasCtx) {
       console.error('[worker] skill-review invoked without priorConversation, skipping');
-      try { process.send({ type: 'result', text: '[skipped: no context]', toolCount: 0 }); } catch {}
+      try { process.send({ type: 'result', text: '[skipped: no context]', toolCount: 0, exitOnly: true }); } catch {}
       setImmediate(() => process.exit(0));
       return;
     }
@@ -297,6 +298,7 @@ process.on('message', async (msg) => {
       toolCount: exitResult.toolCount,
       lastTool: exitResult.lastTool,
       stopReason: exitResult.stopReason,
+      exitOnly: true,
     });
 
     const memDbPath = join(dataDir, 'memory.db');

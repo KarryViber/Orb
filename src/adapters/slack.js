@@ -203,11 +203,6 @@ export function createSlackQiSubscriber(adapter) {
       const streamId = state.streamId;
       const chunks = buildQiSettledChunks(state.toolCount);
       try {
-        await adapter.appendStream(streamId, chunks);
-      } catch (err) {
-        warn(TAG, `[qi_subscriber] finalize append failed: ${err.message}`);
-      }
-      try {
         await adapter.stopStream(streamId, { chunks });
       } catch (err) {
         warn(TAG, `[qi_subscriber] stop failed: ${err.message}`);

@@ -59,7 +59,7 @@ test('SlackQiSubscriber renders Qi stream from cc_event tool_use/result', async 
   assert.equal(startCalls[0][3].task_display_mode, 'plan');
   assert.deepEqual(startCalls[0][3].initial_chunks.map((chunk) => chunk.id).filter(Boolean), ['qi-exec', 'qi-other', 'qi-summary']);
 
-  assert.equal(appendCalls.length >= 3, true);
+  assert.equal(appendCalls.length, 3);
   const detailsById = new Map();
   for (const [, , chunks] of appendCalls) {
     for (const chunk of chunks) {
@@ -71,7 +71,6 @@ test('SlackQiSubscriber renders Qi stream from cc_event tool_use/result', async 
   assert.match(detailsById.get('qi-exec'), /Bash: Run tests/);
   assert.match(detailsById.get('qi-exec'), /WebSearch: OpenAI docs/);
   assert.match(detailsById.get('qi-other'), /Task: Investigate flaky test/);
-  assert.match(detailsById.get('qi-summary'), /Distilled from 3 probes/);
 
   assert.equal(stopCalls.length, 1);
   const finalChunks = stopCalls[0][2].chunks;
@@ -81,6 +80,7 @@ test('SlackQiSubscriber renders Qi stream from cc_event tool_use/result', async 
     finalChunks.filter((chunk) => chunk.type === 'task_update').map((chunk) => [chunk.id, chunk.status]),
     [['qi-exec', 'complete'], ['qi-other', 'complete'], ['qi-summary', 'complete']],
   );
+  assert.match(finalChunks.find((chunk) => chunk.id === 'qi-summary').details, /Distilled from 3 probes/);
 });
 
 test('SlackQiSubscriber serializes concurrent tool_use appends', async () => {
