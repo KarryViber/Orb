@@ -28,6 +28,9 @@ import { storeConversation } from './memory.js';
  *     only outside the task-card path / error fallback scenes.
  *   { type: 'plan_title_update', title }  — task-card path:
  *     compatibility path for callers that want to label plan-mode cards.
+ *   { type: 'plan_section', title }  — task-card path:
+ *     non-TodoWrite plan-mode section header; scheduler either appends it to
+ *     the active stream or folds it into the first stream's initial chunks.
  *   { type: 'plan_snapshot', title, chunk_type, display_mode, rows }  — task-card path:
  *     TodoWrite-only full snapshot for plan rendering; rows replace the current
  *     plan-card contents in one scheduler update.
@@ -392,6 +395,12 @@ export function shouldEmitTaskCardForTool(toolName, input, toolUseId = null) {
     : TASK_CARD_TOOLS.has(toolName) && Boolean(toolUseId);
 }
 
+function categorizeTool(toolName) {
+  if (/^(Bash|Read|Edit|Write|Grep|Glob|NotebookEdit|WebFetch|WebSearch|LSP)$/.test(toolName)) return '工具执行';
+  if (/^(Task|Agent|Skill|mcp__)/.test(toolName)) return '其他操作';
+  return '工具执行';
+}
+
 function tokenizeShellCommand(command) {
   return String(command || '')
     .match(/'[^']*'|"[^"]*"|\S+/g)
@@ -598,6 +607,7 @@ function runClaudeInteractive(args, initialContent, workspace) {
   let idleTimer = null;
   let turnBuffer = [];
   let totalToolCount = 0;
+  let turnToolCount = 0;
   let lastTool = null;
   let lastStopReason = null;
   let lastSessionId = null;
@@ -614,6 +624,8 @@ function runClaudeInteractive(args, initialContent, workspace) {
   let taskCardEmittedInTurn = false;
   let taskCardChunkType = 'plan';
   let taskCardDisplayMode = 'timeline';
+  let nonTodoTaskCardEmittedInTurn = false;
+  let currentTaskCardCategory = null;
   let turnStopReasonOverride = null;
   const pendingTaskCards = new Map();
   const inProgressTaskCards = new Map();
@@ -624,6 +636,9 @@ function runClaudeInteractive(args, initialContent, workspace) {
     taskCardEmittedInTurn = false;
     taskCardChunkType = 'plan';
     taskCardDisplayMode = 'timeline';
+    nonTodoTaskCardEmittedInTurn = false;
+    currentTaskCardCategory = null;
+    turnToolCount = 0;
     turnStopReasonOverride = null;
     pendingTaskCards.clear();
     inProgressTaskCards.clear();
@@ -749,12 +764,13 @@ function runClaudeInteractive(args, initialContent, workspace) {
         }
         if (block.type === 'tool_use') {
           totalToolCount++;
+          turnToolCount++;
           lastTool = block.name || null;
           const isTodoWriteSnapshot = block.name === 'TodoWrite' && Array.isArray(block.input?.todos);
           const emitsTaskCard = shouldEmitTaskCardForTool(block.name, block.input, block.id);
           if (emitsTaskCard && !taskCardEmittedInTurn) {
             taskCardChunkType = isTodoWriteSnapshot ? 'task' : 'plan';
-            taskCardDisplayMode = isTodoWriteSnapshot ? 'plan' : 'timeline';
+            taskCardDisplayMode = 'plan';
           }
           ipcSend({
             type: 'status_update',
@@ -778,6 +794,11 @@ function runClaudeInteractive(args, initialContent, workspace) {
           if (emitsTaskCard) {
             const title = truncate256(buildToolTitle(block.name, block.input));
             const details = truncate256(summarizeToolDetails(block.name, block.input));
+            const newCategory = categorizeTool(block.name);
+            if (newCategory !== currentTaskCardCategory) {
+              ipcSend({ type: 'plan_section', title: newCategory }).catch(() => {});
+              currentTaskCardCategory = newCategory;
+            }
             pendingTaskCards.set(block.id, { toolName: block.name });
             inProgressTaskCards.set(block.id, {
               taskId: block.id,
@@ -801,6 +822,7 @@ function runClaudeInteractive(args, initialContent, workspace) {
             }
             ipcSend(taskCardPayload).catch(() => {});
             taskCardEmittedInTurn = true;
+            nonTodoTaskCardEmittedInTurn = true;
           }
         }
       }
@@ -823,6 +845,18 @@ function runClaudeInteractive(args, initialContent, workspace) {
       lastStopReason = turnStopReasonOverride || msg.stop_reason || msg.subtype || null;
       const turnText = msg.result || turnBuffer.join('\n');
       if (turnOpen && onTurnEnd) {
+        if (nonTodoTaskCardEmittedInTurn) {
+          ipcSend({ type: 'plan_section', title: '信息整合' }).catch(() => {});
+          ipcSend({
+            type: 'tool_call',
+            task_id: 'turn-summary',
+            tool_name: 'summary',
+            title: `共调用 ${turnToolCount} 次工具`,
+            details: '',
+            status: 'complete',
+            chunk_type: taskCardChunkType,
+          }).catch(() => {});
+        }
         turnOpen = false;
         onTurnEnd();
       }
