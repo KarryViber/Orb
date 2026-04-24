@@ -154,53 +154,47 @@ Scheduler ↔ Worker communication via Node IPC (process.send/on('message')):
 |-----------|------|---------|-------|
 | Scheduler → Worker | `task` | `{ type: 'task', userText, fileContent, imagePaths, threadTs, channel, userId, platform, threadHistory, profile, model, effort, maxTurns?, mode?, priorConversation? }` | Initial task for a thread. `maxTurns` overrides Claude CLI `--max-turns` for that task only. `mode: 'skill-review'` requires `priorConversation`, which `context.js` injects as review context. |
 | Scheduler → Worker | `inject` | `{ type: 'inject', injectId?, userText, fileContent?, imagePaths? }` | Injects a follow-up user message into the active same-thread Claude CLI session without spawning a new worker. `injectId` lets the scheduler correlate acceptance/failure for fail-forward replay. When `imagePaths` is present the worker attaches them as image content blocks before sending the turn. |
-| Worker → Scheduler | `result` | `{ type: 'result', text, toolCount, lastTool?, stopReason? }` | Final payload emitted when the worker is about to exit. |
-| Worker → Scheduler | `error` | `{ type: 'error', error, errorContext? }` | Terminal failure payload. |
-| Worker → Scheduler | `turn_start` | `{ type: 'turn_start', injectId? }` | Phase ②: emitted immediately when the worker receives a `task` or accepted `inject`, making the scheduler the sole typing owner. On accepted injects the worker echoes `injectId` so the scheduler can clear the pending replay token. |
-| Worker → Scheduler | `turn_end` | `{ type: 'turn_end' }` | Phase ②: emitted when Claude CLI produces a `result` event for the current turn; scheduler stops typing immediately. |
-| Worker → Scheduler | `turn_complete` | `{ type: 'turn_complete', text, toolCount, lastTool, stopReason, deliveredTexts, undeliveredText? }` | Signals that one Claude turn finished; scheduler can deliver it while keeping the worker alive for future `inject` messages. When `intermediate_text` already emitted partial content, `undeliveredText` contains only the remaining text that still needs delivery. |
-| Worker → Scheduler | `progress_update` | `{ type: 'progress_update', text }` | Phase ①: emitted on every TodoWrite event. Scheduler posts on first occurrence (stores `ts`), then edits in-place on subsequent ones. In Wave 2 this is only used outside the task-card path and for non-stream/error fallback scenarios. |
-| Worker → Scheduler | `plan_title_update` | `{ type: 'plan_title_update', title }` | Task-card compatibility path: callers can still set a plan-mode card title without changing task rows. |
-| Worker → Scheduler | `plan_snapshot` | `{ type: 'plan_snapshot', title, chunk_type, display_mode, rows }` | TodoWrite task-card path: worker sends the full TodoWrite row set in one IPC so scheduler can rebuild a single Slack plan card. `rows` is an ordered array of `{ task_id, title, status }` and replaces the current TodoWrite plan snapshot for that turn. |
-| Worker → Scheduler | `tool_call` | `{ type: 'tool_call', task_id, tool_name, title, details, status?, chunk_type, display_mode? }` | Task-card path: emitted for selected `tool_use` blocks so the scheduler can render/update Slack task cards. `task_id` is normally the Claude `tool_use` block id. The first task-card event in a turn fixes `chunk_type: 'task' | 'plan'` for the whole turn and may carry an explicit `display_mode`. |
-| Worker → Scheduler | `tool_result` | `{ type: 'tool_result', task_id, status, output }` | Task-card path: emitted from `tool_result` blocks for tools that wait on a result. `status` is `complete` or `error`, and `output` is a truncated human-readable summary. |
-| Worker → Scheduler | `status_update` | `{ type: 'status_update', text }` | Short assistant thread status text. Emitted when a tool starts outside the task-card path so scheduler can call Slack assistant thread status APIs, and cleared with empty text at turn completion. |
+| Worker → Scheduler | `turn_start` | `{ type: 'turn_start', injectId? }` | Emitted immediately when the worker receives a `task` or accepted `inject`, making the scheduler the typing owner. On accepted injects the worker echoes `injectId` so the scheduler can clear the pending replay token. |
+| Worker → Scheduler | `turn_end` | `{ type: 'turn_end' }` | Emitted when Claude CLI produces a `result` event for the current turn; scheduler stops typing immediately. |
+| Worker → Scheduler | `turn_complete` | `{ type: 'turn_complete', text, toolCount, lastTool, stopReason, deliveredTexts, undeliveredText? }` | Signals that one Claude turn finished; scheduler can deliver final text while keeping the worker alive for future `inject` messages. |
+| Worker → Scheduler | `cc_event` | `{ type: 'cc_event', turnId, eventType, payload }` | Raw Claude Code event forwarded to scheduler subscribers. Slack Qi, plan, text, and status rendering is driven from this stream. |
 | Worker → Scheduler | `inject_failed` | `{ type: 'inject_failed', injectId?, userText, fileContent?, imagePaths? }` | Follow-up inject could not reach the live CLI session (for example the session already closed). Scheduler must fail forward by replaying that payload through a fresh worker on the same thread. |
-| Worker → Scheduler | `intermediate_text` | `{ type: 'intermediate_text', text }` | Phase ③: mid-turn assistant text block, debounced 2s. Scheduler delivers immediately; `turn_complete` deduplicates against `deliveredTexts` to avoid re-sending. |
+| Worker → Scheduler | `error` | `{ type: 'error', error, errorContext? }` | Terminal failure payload. |
+| Worker → Scheduler | `result` | `{ type: 'result', text, toolCount, lastTool?, stopReason? }` | Worker process-exit completion signal. It remains for lifecycle/auto-continue handling, not Slack UI rendering. |
 
 Adding or changing message types/payload fields requires updating `worker.js` header comment, `scheduler.js` handler, and this section together.
 
 ### Task Card Routing
 
-Non-TodoWrite 工具走 **Qi 实时卡**（独立 stream），TodoWrite 走既有 `plan_snapshot` 卡（独立第二条 stream）。两条路径并行不互相干扰。
+Worker no longer emits Slack UI primitives. It forwards Claude Code events as `cc_event`; scheduler publishes them to subscribers registered by the Slack adapter.
 
-**Qi 卡路径**（非 TodoWrite）：
-- Worker 见首个 task-card-qualifying tool_use 时发 `qi_start` IPC。
-- 每个 tool_use 发 `qi_append { category, line }`——category 由 `categorizeTool` 映射（Bash/Read/Edit/Write/Grep/Glob/NotebookEdit/WebFetch/WebSearch → `Probe`；Task/Agent/Skill/mcp__* → `Delegate`；summary 用 `Distill`）。
-- Worker 的 `result` 处理分支遇 `qiStreamOpened` 时发 `qi_finalize`——**该触发独立于 `turnOpen`**，以覆盖 Claude CLI 的 auto-continue 场景。
+**Qi card path**:
+- Slack subscriber listens to `cc_event tool_use/result`.
+- Non-TodoWrite tools are bucketed into `Probe` / `Delegate` / `Distill` by `categorizeTool`.
+- Subscriber owns stream start, append ordering, and result-time finalization.
 
-**TodoWrite 路径**：
-- 保持 `plan_snapshot` 单一 IPC，包含完整 `rows`。
-- Scheduler 走 task-card stream（区别于 Qi stream），display_mode 始终 'plan'。
+**TodoWrite path**:
+- Slack subscriber listens to `cc_event tool_use` where `name === 'TodoWrite'`.
+- It rebuilds the full plan rows from `input.todos` and updates its own plan stream.
 
 **status bubble**（stream 侧边细字）：
-- 与任一 stream 并行，90s refresh，避开 Slack 2 分钟自清。
+- Slack status subscriber derives active tool status from `cc_event tool_use` and clears on `cc_event result`.
 
 **无工具 turn**：
-- 走 `progress_update` / `intermediate_text` / 最终 reply 路径，不开 Qi stream。
+- Text subscriber debounces `cc_event text`; final delivery still goes through `turn_complete` / `result`.
 
 ### Task Card Lifecycle
 
-**Qi stream**：
-- Scheduler 用独立 `turn.qiStreamId` 管理，开/关操作走独立 `chainQiAppend` 串行链，与 TodoWrite task-card stream (`turn.taskCardState.streamId`) 不冲突。
-- `qi_start` → 用 `task_display_mode: 'plan'` 开 stream，initial_chunks = `plan_update { title: 'Orbiting...' }` + 3 条空 task_update 占位（id: `qi-exec` / `qi-other` / `qi-summary`，title: `Probe` / `Delegate` / `Distill`）。
-- `qi_append` → appendStream 一条 task_update，details = `\n<line>\n`。**利用 Slack 跨 appendStream 对同 id `task_update.details` 字段 concat 而非 replace 的特性累积 bullet**。依赖 `src/adapters/slack.js` 的 `preserveStreamTaskField`（只对 `details` 保留首尾空白，不 trim）。
-- `qi_finalize` → 补 `plan_update { title: 'Settled' }` + 3 条 task_update complete（summary 的 details 为 `Distilled from N probes`），stopStream。
+**Qi stream**:
+- Slack adapter subscriber owns per-turn Qi stream state.
+- It starts a `task_display_mode: 'plan'` stream with `Orbiting...` plus `Probe` / `Delegate` / `Distill` placeholders.
+- Per-tool appends use `task_update.details` deltas, relying on Slack's cross-append concat behavior for repeated `task_update.id`.
+- On `cc_event result`, it appends settled chunks and stops the stream.
 
-**TodoWrite task-card stream**（不变）：
-- 首个 task-card IPC 时 lazy 开 stream，用 in-flight promise 防重复。
-- 每次 TodoWrite `plan_snapshot` 重建完整 rows 并 append（scheduler 内部 reconcile by id）。
-- stopStream 前 in_progress 残留 task 统一转 error。
+**TodoWrite plan stream**:
+- Slack adapter subscriber owns per-turn plan stream state.
+- First TodoWrite starts a plan stream; later TodoWrite events append the rebuilt row snapshot.
+- On `cc_event result`, it stops the stream with the last known plan chunks.
 
 **共同约束**：
 - Slack stream per-turn per-message；`inject` 跨 turn 不复用 stream。

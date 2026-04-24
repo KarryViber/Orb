@@ -21,21 +21,15 @@ import { storeConversation } from './memory.js';
  *   { type: 'inject', injectId?, userText, fileContent?, imagePaths? }
  *
  * Worker -> Scheduler:
- *   { type: 'result', text, toolCount, lastTool?, stopReason? }
- *   { type: 'error', error, errorContext? }
- *   { type: 'turn_complete', text, toolCount, lastTool, stopReason, deliveredTexts, undeliveredText? }  — Phase ③: includes delivered set + remaining text
- *   { type: 'plan_title_update', title }  — task-card path:
- *     compatibility path for callers that want to label plan-mode cards.
- *   { type: 'plan_section', title }  — legacy task-card path:
- *     scheduler compatibility handler for non-TodoWrite plan-mode section headers.
- *   { type: 'tool_call', task_id, tool_name, title, details, status?, chunk_type, display_mode? }  — legacy task-card path:
- *     scheduler compatibility handler for incremental task-card tool updates.
- *   { type: 'tool_result', task_id, status, output }  — legacy task-card path:
- *     scheduler compatibility handler for tool_result completion updates.
  *   { type: 'turn_start', injectId? }  — explicit turn ownership start on task/inject receipt
  *   { type: 'turn_end' }  — explicit turn ownership end when Claude emits result
+ *   { type: 'turn_complete', text, toolCount, lastTool, stopReason, deliveredTexts, undeliveredText? }
+ *     - one Claude turn finished; scheduler may deliver text while keeping the worker alive for injects.
+ *   { type: 'cc_event', turnId, eventType, payload }  — raw Claude Code event forwarded to scheduler subscribers
  *   { type: 'inject_failed', injectId?, userText, fileContent?, imagePaths? }  — follow-up inject could not reach CLI;
  *     scheduler should respawn a fresh worker and replay the user payload.
+ *   { type: 'error', error, errorContext? }
+ *   { type: 'result', text, toolCount, lastTool?, stopReason? }  — process-exit completion signal, not a UI stream primitive
  */
 
 const CLAUDE_PATH = process.env.CLAUDE_PATH || 'claude';
