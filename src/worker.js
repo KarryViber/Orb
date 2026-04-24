@@ -406,6 +406,16 @@ function writeCcEvent({ event_type, payload }) {
   }
 }
 
+function sendCcEvent(eventType, payload) {
+  if (!_currentTurnId) return;
+  ipcSend({
+    type: 'cc_event',
+    turnId: _currentTurnId,
+    eventType,
+    payload,
+  }).catch(() => {});
+}
+
 function formatElapsedTime(startedAt, now = Date.now()) {
   const elapsedSeconds = Math.max(0, Math.floor((now - startedAt) / 1000));
   if (elapsedSeconds < 60) return `${elapsedSeconds}s`;
@@ -744,6 +754,7 @@ function runClaudeInteractive(args, initialContent, workspace) {
             event_type: 'text',
             payload: { text_summary: truncateText(block.text, 300) },
           });
+          sendCcEvent('text', block);
           queueIntermediate(block.text);
         }
         if (block.type === 'tool_use') {
@@ -757,6 +768,7 @@ function runClaudeInteractive(args, initialContent, workspace) {
               input_summary: truncateText(stringifyToolValue(block.input), 300),
             },
           });
+          sendCcEvent('tool_use', block);
           const isTodoWriteSnapshot = block.name === 'TodoWrite' && Array.isArray(block.input?.todos);
           const emitsTaskCard = shouldEmitTaskCardForTool(block.name, block.input, block.id);
           if (emitsTaskCard && !taskCardEmittedInTurn) {
@@ -820,6 +832,7 @@ function runClaudeInteractive(args, initialContent, workspace) {
               is_error: block.is_error === true,
             },
           });
+          sendCcEvent('tool_result', block);
         }
         if (!block?.tool_use_id || !pendingTaskCards.has(block.tool_use_id)) continue;
         pendingTaskCards.delete(block.tool_use_id);
@@ -838,6 +851,7 @@ function runClaudeInteractive(args, initialContent, workspace) {
           ...(msg.usage != null ? { usage: msg.usage } : {}),
         },
       });
+      sendCcEvent('result', msg);
       if (qiStreamOpened) {
         await ipcSend({
           type: 'qi_finalize',
