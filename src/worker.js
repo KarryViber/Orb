@@ -1031,19 +1031,27 @@ function collectWorkspaceMcpServers(workspace, extraEnv) {
   const dir = join(workspace, '.claude', 'mcp-servers');
   if (!existsSync(dir)) return {};
 
+  let fnames;
+  try {
+    fnames = readdirSync(dir);
+  } catch (err) {
+    console.warn(`[worker] failed to scan MCP registrations dir: ${err.message}`);
+    return {};
+  }
+
+  const looksRelativePath = (s) => (
+    typeof s === 'string' && (s.startsWith('./') || s.startsWith('../'))
+  );
+
   const result = {};
-  for (const fname of readdirSync(dir)) {
+  for (const fname of fnames) {
     if (!fname.endsWith('.json')) continue;
     try {
       const raw = JSON.parse(readFileSync(join(dir, fname), 'utf8'));
       for (const [name, def] of Object.entries(raw)) {
         if (!def || typeof def !== 'object' || !def.command) continue;
         const args = Array.isArray(def.args)
-          ? def.args.map((arg) => (
-              typeof arg === 'string' && !arg.startsWith('/') && !arg.startsWith('-')
-                ? join(workspace, arg)
-                : arg
-            ))
+          ? def.args.map((arg) => (looksRelativePath(arg) ? join(workspace, arg) : arg))
           : [];
         // Workspace MCP runs inside the worker child process and can access Orb env.
         result[name] = {
