@@ -299,7 +299,7 @@ function buildTaskCardFallbackMarkdown(taskCards) {
 export class Scheduler {
   constructor({ maxWorkers, timeoutMs, getProfile }) {
     this.maxWorkers = maxWorkers || 3;
-    this.timeoutMs = timeoutMs || 900_000;
+    this.timeoutMs = timeoutMs || parseInt(process.env.ORB_WORKER_TIMEOUT_MS, 10) || 1_800_000;
     this.getProfile = getProfile;
     this.adapters = new Map();     // platform → adapter
     this.activeWorkers = new Map();
@@ -1192,6 +1192,27 @@ export class Scheduler {
       return true;
     };
 
+    const finalizeTaskCardsOnAbnormalExit = async () => {
+      try {
+        if (turn.taskCardState.streamId && !turn.taskCardState.failed) {
+          finalizePendingTaskCards();
+          await stopTaskCardStream('⚠️ [worker 异常终止：timeout/crash/killed]');
+        }
+      } catch (err) {
+        warn(TAG, `failed to finalize task cards after worker exit: ${err.message}`);
+      }
+      try {
+        if (channel != null && effectiveThreadTs != null && !turnDelivered) {
+          await adapter.sendReply(channel, effectiveThreadTs, '⚠️ 本轮任务异常终止（worker timeout 或 crash），可发「继续」让我从失败点续做。');
+          turnDelivered = true;
+        }
+      } catch (err) {
+        warn(TAG, `failed to send worker abnormal-exit notice: ${err.message}`);
+      } finally {
+        resetTaskCardState();
+      }
+    };
+
     // Rerun via 🔥 reaction: first emitted payload edits targetMessageTs,
     // subsequent payloads append as normal replies.
     let pendingEdit = task.targetMessageTs || null;
@@ -1751,6 +1772,11 @@ export class Scheduler {
           }
 
           info(TAG, `worker exited: pid=${worker.pid} code=${code} signal=${signal} responded=${responded} thread=${threadTs}`);
+
+          const abnormalExit = signal !== null || (code !== 0 && code !== null) || !responded;
+          if (abnormalExit) {
+            await finalizeTaskCardsOnAbnormalExit();
+          }
 
           if (!responded) {
             logError(TAG, `worker exited without response: thread=${threadTs} code=${code} signal=${signal}`);

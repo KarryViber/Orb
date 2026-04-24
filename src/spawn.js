@@ -31,15 +31,25 @@ export function spawnWorker({ task, timeout = 600_000, label, onMessage, onExit 
   worker.stdout?.on('data', (d) => info(TAG, `[${label}] ${sanitizeErrorText(d.toString().trimEnd())}`));
   worker.stderr?.on('data', (d) => logError(TAG, `[${label}] ${sanitizeErrorText(d.toString().trimEnd())}`));
 
+  let toolCallCount = 0;
+  let lastToolCallAt = null;
+
   // kill timeout
   const timer = setTimeout(() => {
     logError(TAG, `[${label}] timeout after ${timeout}ms, killing`);
+    logError(TAG, `[${label}] tool progress before timeout: lastToolCallAt=${lastToolCallAt || 'none'} toolCallCount=${toolCallCount}`);
     worker.kill('SIGTERM');
     const killTimer = setTimeout(() => { try { worker.kill('SIGKILL'); } catch {} }, 5_000);
     killTimer.unref(); // #23: don't block process exit
   }, timeout);
 
-  worker.on('message', (msg) => onMessage(msg));
+  worker.on('message', (msg) => {
+    if (msg?.type === 'tool_call') {
+      toolCallCount += 1;
+      lastToolCallAt = new Date().toISOString();
+    }
+    onMessage(msg);
+  });
 
   worker.on('exit', (code, signal) => {
     clearTimeout(timer);
