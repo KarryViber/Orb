@@ -1552,16 +1552,6 @@ export class Scheduler {
             return;
           }
 
-          if (msg.type === 'qi_title_update') {
-            if (!turn.qiStreamId || turn.taskCardState.failed) return;
-            await chainQiAppend(async () => {
-              await adapter.appendStream(turn.qiStreamId, [
-                { type: 'plan_update', title: String(msg.title || '').slice(0, 256) },
-              ]);
-            });
-            return;
-          }
-
           if (msg.type === 'qi_append') {
             if (turn.qiStartPromise) await turn.qiStartPromise;
             const idMap = { '工具执行': 'qi-exec', '其他操作': 'qi-other' };
@@ -1588,6 +1578,7 @@ export class Scheduler {
             const streamId = turn.qiStreamId;
             try {
               await adapter.appendStream(streamId, [
+                { type: 'plan_update', title: '已完成思考' },
                 { type: 'task_update', id: 'qi-exec', title: '工具执行', status: 'complete' },
                 { type: 'task_update', id: 'qi-other', title: '其他操作', status: 'complete' },
                 { type: 'task_update', id: 'qi-summary', title: '信息整合', status: 'complete', details: `共调用 ${msg.tool_count} 次工具` },

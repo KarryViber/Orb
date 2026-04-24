@@ -38,8 +38,6 @@ import { storeConversation } from './memory.js';
  *     all initial chunks and immediately stops it.
  *   { type: 'qi_start' }  — realtime Qi task-card path:
  *     opens a plan-mode stream shell before non-TodoWrite tool rows append.
- *   { type: 'qi_title_update', title }  — realtime Qi task-card path:
- *     replaces the initial Qi plan title with the first assistant text block.
  *   { type: 'qi_append', category, line }  — realtime Qi task-card path:
  *     appends a single tool line into the category task_update.
  *   { type: 'qi_finalize', tool_count }  — realtime Qi task-card path:
@@ -582,7 +580,6 @@ function runClaudeInteractive(args, initialContent, workspace) {
   let taskCardDisplayMode = 'timeline';
   let turnCategoryBuffer = new Map();
   let qiStreamOpened = false;
-  let qi_title_set = false;
   let qiCategoryLines = new Map();
   let turnStopReasonOverride = null;
   const pendingTaskCards = new Map();
@@ -595,7 +592,6 @@ function runClaudeInteractive(args, initialContent, workspace) {
     taskCardDisplayMode = 'timeline';
     turnCategoryBuffer = new Map();
     qiStreamOpened = false;
-    qi_title_set = false;
     qiCategoryLines = new Map();
     turnToolCount = 0;
     turnStopReasonOverride = null;
@@ -692,14 +688,6 @@ function runClaudeInteractive(args, initialContent, workspace) {
         if (block.type === 'text') {
           turnBuffer.push(block.text);
           queueIntermediate(block.text);
-          if (qiStreamOpened && !qi_title_set) {
-            const title = String(block.text || '').trim().replace(/\s+/g, ' ');
-            if (title) {
-              const trimmed = title.slice(0, 40);
-              await ipcSend({ type: 'qi_title_update', title: trimmed });
-              qi_title_set = true;
-            }
-          }
         }
         if (block.type === 'tool_use') {
           totalToolCount++;
