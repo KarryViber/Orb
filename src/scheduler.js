@@ -1519,7 +1519,7 @@ export class Scheduler {
               return;
             }
             const initialChunks = [
-              { type: 'plan_update', title: '已完成思考' },
+              { type: 'plan_update', title: msg.title || '已完成思考' },
               { type: 'task_update', id: 'qi-exec', title: '工具执行', status: 'in_progress', details: '' },
               { type: 'task_update', id: 'qi-other', title: '其他操作', status: 'in_progress', details: '' },
               { type: 'task_update', id: 'qi-summary', title: '信息整合', status: 'in_progress', details: '' },
