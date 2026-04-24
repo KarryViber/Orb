@@ -34,6 +34,9 @@ const QI_TASK_IDS = {
   Distill: 'qi-summary',
 };
 
+const TEXT_DEBOUNCE_MS = 2000;
+const STATUS_HEARTBEAT_MS = 90_000;
+
 function truncateQiText(text, max = 256) {
   const normalized = String(text || '').replace(/\s+/g, ' ').trim();
   return normalized.length <= max ? normalized : `${normalized.slice(0, max - 1)}…`;
@@ -55,6 +58,22 @@ function buildQiToolLine(payload) {
   const name = payload?.name || 'Tool';
   const summary = summarizeQiInput(payload?.input);
   return truncateQiText(summary ? `${name}: ${summary}` : name);
+}
+
+function buildStatusText(payload) {
+  return truncateQiText(buildQiToolLine(payload), 80);
+}
+
+function formatElapsedTime(startedAt, now = Date.now()) {
+  const elapsedSeconds = Math.max(0, Math.floor((now - startedAt) / 1000));
+  if (elapsedSeconds < 60) return `${elapsedSeconds}s`;
+  const elapsedMinutes = Math.floor(elapsedSeconds / 60);
+  if (elapsedMinutes < 60) return `${elapsedMinutes}m ${elapsedSeconds % 60}s`;
+  return `${Math.floor(elapsedMinutes / 60)}h ${elapsedMinutes % 60}m`;
+}
+
+function getTurnKey(turnId) {
+  return turnId || 'default';
 }
 
 export function buildQiSettledChunks(toolCount = 0, reason = '') {
@@ -281,6 +300,145 @@ export function createSlackPlanSubscriber(adapter) {
         warn(TAG, `[plan_subscriber] stop failed: ${err.message}`);
       } finally {
         turns.delete(key);
+      }
+    },
+  };
+}
+
+export function createSlackTextSubscriber(adapter, { debounceMs = TEXT_DEBOUNCE_MS } = {}) {
+  const turns = new Map();
+
+  const clearState = (key) => {
+    const state = turns.get(key);
+    if (state?.timer) clearTimeout(state.timer);
+    turns.delete(key);
+  };
+
+  const deliver = async (key) => {
+    const state = turns.get(key);
+    if (!state) return;
+    if (state.timer) {
+      clearTimeout(state.timer);
+      state.timer = null;
+    }
+    const text = state.texts.join('\n').trim();
+    state.texts = [];
+    if (!text) return;
+
+    const { ctx } = state;
+    if (ctx?.deferDeliveryUntilResult) return;
+    const turn = ctx?.turn;
+    const taskCardState = turn?.taskCardState;
+    const streamId = taskCardState?.streamId;
+
+    if (streamId && !taskCardState?.failed && typeof adapter.appendStream === 'function') {
+      try {
+        await adapter.appendStream(streamId, [{ type: 'markdown_text', text }]);
+        if (turn) turn.intermediateDeliveredThisTurn = true;
+        if (turn?.egress) turn.egress.admit(text, 'intermediate');
+        return;
+      } catch (err) {
+        const code = err?.data?.error || err?.code || '';
+        if (code === 'message_not_in_streaming_state' || code === 'message_not_owned_by_app') {
+          if (taskCardState) taskCardState.failed = true;
+          warn(TAG, `[text_subscriber] stream ownership lost, degrading to sendReply: ${code}`);
+        } else {
+          warn(TAG, `[text_subscriber] append failed: ${err.message}`);
+          return;
+        }
+      }
+    }
+
+    if (turn?.egress && !turn.egress.admit(text, 'intermediate')) {
+      turn.intermediateDeliveredThisTurn = true;
+      return;
+    }
+    const channel = ctx?.channel || ctx?.task?.channel;
+    const threadTs = ctx?.effectiveThreadTs || ctx?.threadTs || ctx?.task?.threadTs;
+    if (!channel || !threadTs || typeof adapter.sendReply !== 'function') return;
+    try {
+      const payloads = typeof adapter.buildPayloads === 'function'
+        ? adapter.buildPayloads(text)
+        : [{ text }];
+      for (const payload of payloads) {
+        await adapter.sendReply(channel, threadTs, payload.text, payload.blocks ? { blocks: payload.blocks } : {});
+      }
+      if (turn) turn.intermediateDeliveredThisTurn = true;
+    } catch (err) {
+      warn(TAG, `[text_subscriber] sendReply failed: ${err.message}`);
+    }
+  };
+
+  return {
+    match: (msg) => msg?.type === 'cc_event' && (msg.eventType === 'text' || msg.eventType === 'result'),
+    async handle(msg, ctx = {}) {
+      const key = getTurnKey(msg.turnId);
+      if (msg.eventType === 'result') {
+        await deliver(key);
+        clearState(key);
+        return;
+      }
+
+      const text = String(msg.payload?.text || '').trim();
+      if (!text) return;
+      let state = turns.get(key);
+      if (!state) {
+        state = { texts: [], timer: null, ctx };
+        turns.set(key, state);
+      }
+      state.ctx = ctx;
+      state.texts.push(text);
+      if (state.timer) clearTimeout(state.timer);
+      state.timer = setTimeout(() => {
+        deliver(key).catch((err) => warn(TAG, `[text_subscriber] debounce deliver failed: ${err.message}`));
+      }, debounceMs);
+      if (typeof state.timer.unref === 'function') state.timer.unref();
+    },
+  };
+}
+
+export function createSlackStatusSubscriber(adapter, { heartbeatMs = STATUS_HEARTBEAT_MS } = {}) {
+  const turns = new Map();
+
+  const clearState = async (key, ctx) => {
+    const state = turns.get(key);
+    if (state?.timer) clearInterval(state.timer);
+    turns.delete(key);
+    if (typeof ctx?.applyThreadStatus === 'function') {
+      await ctx.applyThreadStatus('');
+    }
+  };
+
+  const refresh = async (state, { includeElapsed = true } = {}) => {
+    if (!state?.payload || typeof state.ctx?.applyThreadStatus !== 'function') return;
+    const base = buildStatusText(state.payload);
+    const status = includeElapsed && state.startedAt
+      ? truncateQiText(`${base} (${formatElapsedTime(state.startedAt)})`, 100)
+      : base;
+    await state.ctx.applyThreadStatus(status);
+  };
+
+  return {
+    match: (msg) => msg?.type === 'cc_event' && (msg.eventType === 'tool_use' || msg.eventType === 'result'),
+    async handle(msg, ctx = {}) {
+      const key = getTurnKey(msg.turnId);
+      if (msg.eventType === 'result') {
+        await clearState(key, ctx);
+        return;
+      }
+
+      if (ctx?.deferDeliveryUntilResult) return;
+      const state = turns.get(key) || { payload: null, startedAt: 0, timer: null, ctx };
+      state.payload = msg.payload || {};
+      state.startedAt = Date.now();
+      state.ctx = ctx;
+      turns.set(key, state);
+      await refresh(state, { includeElapsed: false });
+      if (!state.timer) {
+        state.timer = setInterval(() => {
+          refresh(state).catch((err) => warn(TAG, `[status_subscriber] heartbeat failed: ${err.message}`));
+        }, heartbeatMs);
+        if (typeof state.timer.unref === 'function') state.timer.unref();
       }
     },
   };
@@ -1517,6 +1675,14 @@ export class SlackAdapter extends PlatformAdapter {
 
   createPlanSubscriber() {
     return createSlackPlanSubscriber(this);
+  }
+
+  createTextSubscriber() {
+    return createSlackTextSubscriber(this);
+  }
+
+  createStatusSubscriber() {
+    return createSlackStatusSubscriber(this);
   }
 
   // --- Streaming helpers ---
