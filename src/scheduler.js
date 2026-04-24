@@ -283,11 +283,116 @@ function makeTurnState(log, taskCardConfig) {
     pendingStatusLoadingMessages: null,
     statusRefreshTimer: null,
     qiStreamId: null,
+    qiStreamTs: null,
     qiStartPromise: null,
     qiAppendPromise: null,
+    qiStreamFailed: false,
+    abandoned: false,
     egress: new EgressGate(log),
     taskCardState: makeTaskCardState(taskCardConfig),
   };
+}
+
+export function buildQiSettledChunks(toolCount = 0, reason = '') {
+  const details = reason
+    ? `Settled: ${reason}`
+    : `Distilled from ${Number.isFinite(Number(toolCount)) ? Number(toolCount) : 0} probes`;
+  return [
+    { type: 'plan_update', title: 'Settled' },
+    { type: 'task_update', id: 'qi-exec', title: 'Probe', status: 'complete' },
+    { type: 'task_update', id: 'qi-other', title: 'Delegate', status: 'complete' },
+    { type: 'task_update', id: 'qi-summary', title: 'Distill', status: 'complete', details },
+  ];
+}
+
+export async function closeQiStreamState({
+  turn,
+  adapter,
+  channel,
+  streamId = turn?.qiStreamId,
+  streamTs = turn?.qiStreamTs,
+  toolCount = 0,
+  reason = '',
+  emitFinalize = true,
+  warnFn = () => {},
+}) {
+  if (!turn || !streamId) return false;
+  const chunks = buildQiSettledChunks(toolCount, reason);
+  if (turn.qiAppendPromise) await turn.qiAppendPromise.catch(() => {});
+  if (emitFinalize && typeof adapter?.appendStream === 'function') {
+    try {
+      await adapter.appendStream(streamId, chunks);
+    } catch (err) {
+      warnFn(`[qi_finalize] append failed: ${err.message}`);
+    }
+  }
+  let closed = false;
+  if (typeof adapter?.stopStream === 'function') {
+    try {
+      await adapter.stopStream(streamId, { chunks });
+      closed = true;
+    } catch (err) {
+      warnFn(`[qi_finalize] stop failed: ${err.message}`);
+    }
+  }
+  if (!closed && streamTs && typeof adapter?.editMessage === 'function') {
+    try {
+      await adapter.editMessage(channel, streamTs, 'Settled');
+      closed = true;
+    } catch (err) {
+      warnFn(`[qi_finalize] edit fallback failed: ${err.message}`);
+    }
+  }
+  if (turn.qiStreamId === streamId) {
+    turn.qiStreamId = null;
+    turn.qiStreamTs = null;
+  }
+  turn.qiStreamFailed = false;
+  return closed;
+}
+
+export async function abandonTurnState({
+  turn,
+  adapter,
+  channel,
+  taskCardStopPayload = {},
+  warnFn = () => {},
+}) {
+  if (!turn || turn.abandoned) return false;
+  turn.abandoned = true;
+  if (turn.statusRefreshTimer) {
+    clearTimeout(turn.statusRefreshTimer);
+    turn.statusRefreshTimer = null;
+  }
+  if (turn.taskCardState?.keepaliveTimer) {
+    clearTimeout(turn.taskCardState.keepaliveTimer);
+    turn.taskCardState.keepaliveTimer = null;
+  }
+  turn.egress?.reset?.();
+  try {
+    if (turn.taskCardState?.streamId && !turn.taskCardState.failed) {
+      await adapter.stopStream(turn.taskCardState.streamId, {
+        chunks: buildTaskCardChunksFromState(turn.taskCardState),
+        ...taskCardStopPayload,
+      });
+    }
+  } catch (err) {
+    warnFn(`failed to stop abandoned task-card stream: ${err.message}`);
+  } finally {
+    if (turn.taskCardState) {
+      turn.taskCardState.streamId = null;
+      turn.taskCardState.streamTs = null;
+    }
+  }
+  await closeQiStreamState({
+    turn,
+    adapter,
+    channel,
+    reason: 'turn abandoned',
+    emitFinalize: true,
+    warnFn,
+  });
+  return true;
 }
 
 function buildTaskCardFallbackMarkdown(taskCards) {
@@ -584,6 +689,9 @@ export class Scheduler {
       logError(TAG, `submit failed: no adapter for platform=${platform} thread=${threadTs}`);
       return;
     }
+    if (threadTs && !task._autoContinue) {
+      this._autoContinueCount.delete(threadTs);
+    }
 
     // Rerun (🔥 reaction): bypass inject, spawn fresh worker. If a worker is
     // already active on this thread, queue the rerun so it runs after it exits.
@@ -806,21 +914,23 @@ export class Scheduler {
       task._completion?.[method]?.(payload);
     };
 
-    const clearStatusRefresh = () => {
-      if (turn.statusRefreshTimer) {
-        clearTimeout(turn.statusRefreshTimer);
-        turn.statusRefreshTimer = null;
+    const clearStatusRefresh = (targetTurn = turn) => {
+      if (targetTurn?.statusRefreshTimer) {
+        clearTimeout(targetTurn.statusRefreshTimer);
+        targetTurn.statusRefreshTimer = null;
       }
     };
     const armStatusRefresh = () => {
       clearStatusRefresh();
       if (!canManageThreadStatus || !effectiveThreadTs) return;
       if (!turn.pendingThreadStatus) return;
+      const capturedTurn = turn;
       turn.statusRefreshTimer = setTimeout(async () => {
-        turn.statusRefreshTimer = null;
-        if (!turn.pendingThreadStatus || !canManageThreadStatus || !effectiveThreadTs) return;
+        capturedTurn.statusRefreshTimer = null;
+        if (turn !== capturedTurn || capturedTurn.abandoned) return;
+        if (!capturedTurn.pendingThreadStatus || !canManageThreadStatus || !effectiveThreadTs) return;
         try {
-          await adapter.setThreadStatus(channel, effectiveThreadTs, turn.pendingThreadStatus, turn.pendingStatusLoadingMessages || undefined);
+          await adapter.setThreadStatus(channel, effectiveThreadTs, capturedTurn.pendingThreadStatus, capturedTurn.pendingStatusLoadingMessages || undefined);
           armStatusRefresh();
         } catch (err) {
           warn(TAG, `status refresh failed: ${err.message}`);
@@ -860,20 +970,23 @@ export class Scheduler {
       await applyThreadStatus('');
     };
 
-    const clearKeepalive = () => {
-      if (turn.taskCardState.keepaliveTimer) {
-        clearTimeout(turn.taskCardState.keepaliveTimer);
-        turn.taskCardState.keepaliveTimer = null;
+    const clearKeepalive = (targetTurn = turn) => {
+      if (targetTurn?.taskCardState?.keepaliveTimer) {
+        clearTimeout(targetTurn.taskCardState.keepaliveTimer);
+        targetTurn.taskCardState.keepaliveTimer = null;
       }
     };
     const armKeepalive = () => {
       clearKeepalive();
       if (!turn.taskCardState.streamId || turn.taskCardState.failed) return;
+      const capturedTurn = turn;
       turn.taskCardState.keepaliveTimer = setTimeout(async () => {
-        turn.taskCardState.keepaliveTimer = null;
-        if (!turn.taskCardState.streamId || turn.taskCardState.failed) return;
+        capturedTurn.taskCardState.keepaliveTimer = null;
+        if (turn !== capturedTurn || capturedTurn.abandoned) return;
+        if (!capturedTurn.taskCardState.streamId || capturedTurn.taskCardState.failed) return;
         try {
           await chainTaskCardAppend(async () => {
+            if (turn !== capturedTurn || capturedTurn.abandoned) return false;
             if (!turn.taskCardState.streamId || turn.taskCardState.failed) return false;
             const chunks = buildTaskCardChunks();
             if (!chunks.length) {
@@ -890,6 +1003,39 @@ export class Scheduler {
           await failTaskCardStream(err);
         }
       }, STREAM_KEEPALIVE_MS);
+    };
+
+    const closeQiStream = async (targetTurn = turn, { reason = '', emitFinalize = true, toolCount = 0 } = {}) => {
+      const streamId = targetTurn?.qiStreamId;
+      if (!streamId) return false;
+      return closeQiStreamState({
+        turn: targetTurn,
+        adapter,
+        channel,
+        streamId,
+        streamTs: targetTurn.qiStreamTs,
+        toolCount,
+        reason,
+        emitFinalize,
+        warnFn: (message) => warn(TAG, message),
+      });
+    };
+
+    const abandonTurn = async (prevTurn) => {
+      if (!prevTurn || prevTurn.abandoned) return;
+      clearStatusRefresh(prevTurn);
+      clearKeepalive(prevTurn);
+      prevTurn.egress?.reset?.();
+      for (const key of [...this._pendingPermissionRequests.keys()]) {
+        if (key.startsWith(`${threadTs}:`)) this._pendingPermissionRequests.delete(key);
+      }
+      await abandonTurnState({
+        turn: prevTurn,
+        adapter,
+        channel,
+        taskCardStopPayload: { markdown_text: '⚠️ [turn abandoned]' },
+        warnFn: (message) => warn(TAG, message),
+      });
     };
 
     const resetTaskCardState = () => {
@@ -1007,24 +1153,26 @@ export class Scheduler {
     };
 
     const chainTaskCardAppend = (operation) => {
-      const previous = turn.taskCardState.pendingAppendPromise || Promise.resolve();
+      const capturedTurn = turn;
+      const previous = capturedTurn.taskCardState.pendingAppendPromise || Promise.resolve();
       const current = previous.catch(() => {}).then(operation);
       const tracked = current.finally(() => {
-        if (turn.taskCardState.pendingAppendPromise === tracked) {
-          turn.taskCardState.pendingAppendPromise = null;
+        if (turn === capturedTurn && capturedTurn.taskCardState.pendingAppendPromise === tracked) {
+          capturedTurn.taskCardState.pendingAppendPromise = null;
         }
       });
-      turn.taskCardState.pendingAppendPromise = tracked;
+      capturedTurn.taskCardState.pendingAppendPromise = tracked;
       return tracked;
     };
 
     const chainQiAppend = (operation) => {
-      const previous = turn.qiAppendPromise || Promise.resolve();
+      const capturedTurn = turn;
+      const previous = capturedTurn.qiAppendPromise || Promise.resolve();
       const current = previous.catch(() => {}).then(operation);
       const tracked = current.finally(() => {
-        if (turn.qiAppendPromise === tracked) turn.qiAppendPromise = null;
+        if (turn === capturedTurn && capturedTurn.qiAppendPromise === tracked) capturedTurn.qiAppendPromise = null;
       });
-      turn.qiAppendPromise = tracked;
+      capturedTurn.qiAppendPromise = tracked;
       return tracked;
     };
 
@@ -1115,6 +1263,7 @@ export class Scheduler {
           turn.taskCardState.lastSentPlanTitle = String(turn.taskCardState.planTitle || '').trim() || null;
         }
         if (turn.taskCardState.streamId) armKeepalive();
+        if (turn.taskCardState.streamId) turn.egress.reset();
         info(TAG, `stream rotated: ${prevStreamId} -> ${turn.taskCardState.streamId} (cards=${turn.taskCardState.taskCards.size})`);
         return Boolean(turn.taskCardState.streamId);
       } catch (err) {
@@ -1261,7 +1410,7 @@ export class Scheduler {
       return true;
     };
 
-    const finalizeTaskCardsOnAbnormalExit = async () => {
+    const finalizeStreamsOnAbnormalExit = async () => {
       try {
         if (turn.taskCardState.streamId && !turn.taskCardState.failed) {
           finalizePendingTaskCards();
@@ -1269,6 +1418,13 @@ export class Scheduler {
         }
       } catch (err) {
         warn(TAG, `failed to finalize task cards after worker exit: ${err.message}`);
+      }
+      try {
+        if (turn.qiStreamId) {
+          await closeQiStream(turn, { reason: 'worker abnormal exit', emitFinalize: true });
+        }
+      } catch (err) {
+        warn(TAG, `failed to finalize Qi stream after worker exit: ${err.message}`);
       }
       try {
         if (channel != null && effectiveThreadTs != null && !turnDelivered) {
@@ -1461,7 +1617,9 @@ export class Scheduler {
             if (!turn.taskCardState.chunkType && typeof msg.chunk_type === 'string') {
               turn.taskCardState.chunkType = msg.chunk_type;
             }
-            if (!turn.taskCardState.displayMode && typeof msg.display_mode === 'string') {
+            if ((msg.override_display_mode || msg.display_mode === 'plan') && typeof msg.display_mode === 'string') {
+              turn.taskCardState.displayMode = msg.display_mode;
+            } else if (!turn.taskCardState.displayMode && typeof msg.display_mode === 'string') {
               turn.taskCardState.displayMode = msg.display_mode;
             }
             if (!turn.taskCardState.displayMode && turn.taskCardState.chunkType) {
@@ -1487,6 +1645,7 @@ export class Scheduler {
             if (turn.taskCardState.failed) return;
             if (!turn.taskCardState.enabled && !turn.taskCardState.deferred) return;
             if (turn.qiStreamId) return;
+            turn.qiStreamFailed = false;
             if (turn.qiStartPromise) {
               await turn.qiStartPromise;
               return;
@@ -1505,7 +1664,9 @@ export class Scheduler {
                   team_id: task.teamId || null,
                 });
                 turn.qiStreamId = result?.stream_id || (result?.ts ? `${channel}:${result.ts}` : null);
+                turn.qiStreamTs = result?.ts || null;
               } catch (err) {
+                turn.qiStreamFailed = true;
                 warn(TAG, `[qi_start] failed: ${err.message}`);
               } finally {
                 turn.qiStartPromise = null;
@@ -1519,6 +1680,10 @@ export class Scheduler {
             if (turn.qiStartPromise) await turn.qiStartPromise;
             const idMap = { Probe: 'qi-exec', Delegate: 'qi-other' };
             const taskId = idMap[msg.category];
+            if (turn.qiStreamFailed) {
+              warn(TAG, `[qi_append] skipped after qi_start failure: ${msg.category || 'unknown'}`);
+              return;
+            }
             if (!taskId || !turn.qiStreamId) return;
             const tracked = chainQiAppend(async () => {
               if (!turn.qiStreamId) return;
@@ -1539,19 +1704,8 @@ export class Scheduler {
             if (turn.qiAppendPromise) await turn.qiAppendPromise.catch(() => {});
             if (!turn.qiStreamId) return;
             const streamId = turn.qiStreamId;
-            try {
-              await adapter.appendStream(streamId, [
-                { type: 'plan_update', title: 'Settled' },
-                { type: 'task_update', id: 'qi-exec', title: 'Probe', status: 'complete' },
-                { type: 'task_update', id: 'qi-other', title: 'Delegate', status: 'complete' },
-                { type: 'task_update', id: 'qi-summary', title: 'Distill', status: 'complete', details: `Distilled from ${msg.tool_count} probes` },
-              ]);
-              await adapter.stopStream(streamId);
-            } catch (err) {
-              warn(TAG, `[qi_finalize] failed: ${err.message}`);
-            } finally {
-              if (turn.qiStreamId === streamId) turn.qiStreamId = null;
-            }
+            await closeQiStream(turn, { reason: '', emitFinalize: true, toolCount: msg.tool_count });
+            if (turn.qiStreamId === streamId) turn.qiStreamId = null;
             return;
           }
 
@@ -1645,6 +1799,8 @@ export class Scheduler {
             };
             if (!this.threadQueues.has(threadTs)) this.threadQueues.set(threadTs, []);
             this.threadQueues.get(threadTs).unshift(respawnTask);
+            await abandonTurn(turn);
+            turn = makeTurnState(turnLog, taskCardConfig);
             warn(TAG, `inject failed, respawning worker for thread=${threadTs}`);
             return;
           }
@@ -1654,10 +1810,7 @@ export class Scheduler {
               const activeEntry = this.activeWorkers.get(threadTs);
               activeEntry?.pendingInjects?.delete(msg.injectId);
             }
-            // Clear lingering per-turn timers from the previous turn
-            // (these close over `turn`, so run them before rebuilding state).
-            clearStatusRefresh();
-            clearKeepalive();
+            await abandonTurn(turn);
             turn = makeTurnState(turnLog, taskCardConfig);
             turnDelivered = false;
             turn.intermediateDeliveredThisTurn = false;
@@ -1847,6 +2000,7 @@ export class Scheduler {
                     maxTurns: task.maxTurns || null,
                     enableTaskCard: task.enableTaskCard,
                     deferDeliveryUntilResult,
+                    _autoContinue: true,
                     _completion: task._completion,
                   };
                   return;
@@ -1864,7 +2018,16 @@ export class Scheduler {
                 if (deferDeliveryUntilResult && text) {
                   turnDelivered = await deliverDeferredFinalResult(text);
                 } else if (turn.intermediateDeliveredThisTurn && text) {
-                  info(TAG, `result text already delivered via intermediate stream, skip sendReply`);
+                  const remainingText = subtractDeliveredText(text, turn.egress?.deliveredTexts || []);
+                  if (remainingText.trim()) {
+                    const payloads = adapter.buildPayloads(remainingText);
+                    info(TAG, `sending ${payloads.length} deduped result payload(s) to thread=${threadTs}`);
+                    for (const payload of payloads) {
+                      await emitPayload(payload);
+                    }
+                  } else {
+                    info(TAG, `result text already delivered via intermediate stream, skip sendReply`);
+                  }
                   turnDelivered = true;
                 } else {
                   const finalText = text || '⚠️ 多次续接仍未生成回复，任务可能需要拆分。请用更小的指令重试。';
@@ -1946,7 +2109,7 @@ export class Scheduler {
 
           const abnormalExit = !responded && (signal !== null || (code !== 0 && code !== null));
           if (abnormalExit) {
-            await finalizeTaskCardsOnAbnormalExit();
+            await finalizeStreamsOnAbnormalExit();
           }
 
           if (!responded) {

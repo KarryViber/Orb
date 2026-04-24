@@ -30,9 +30,10 @@ import { storeConversation } from './memory.js';
  *     compatibility path for callers that want to label plan-mode cards.
  *   { type: 'plan_section', title }  — legacy task-card path:
  *     scheduler compatibility handler for non-TodoWrite plan-mode section headers.
- *   { type: 'plan_snapshot', title, chunk_type, display_mode, rows }  — task-card path:
+ *   { type: 'plan_snapshot', title, chunk_type, display_mode, override_display_mode?, rows }  — task-card path:
  *     TodoWrite-only full snapshot for plan rendering; rows replace the current
- *     plan-card contents in one scheduler update.
+ *     plan-card contents in one scheduler update. override_display_mode lets
+ *     TodoWrite snapshots force plan mode after earlier non-TodoWrite cards.
  *   { type: 'qi_start' }  — realtime Qi task-card path:
  *     opens a plan-mode stream shell before non-TodoWrite tool rows append.
  *   { type: 'qi_append', category, line }  — realtime Qi task-card path:
@@ -708,6 +709,7 @@ function runClaudeInteractive(args, initialContent, workspace) {
                 title: buildPlanSnapshotTitle(block.input.todos),
                 chunk_type: taskCardChunkType,
                 display_mode: taskCardDisplayMode,
+                override_display_mode: true,
                 rows,
               }).catch(() => {});
               taskCardEmittedInTurn = true;
@@ -800,15 +802,20 @@ function runClaudeInteractive(args, initialContent, workspace) {
   }
 
   function inject(userText, fileContent, imagePaths) {
-    if (closed) return false;
-    resetTurnStreamingState();
-    const content = buildUserContent({ userText, fileContent, imagePaths, workspace });
-    const msg = JSON.stringify({ type: 'user', message: { role: 'user', content } });
-    child.stdin.write(msg + '\n');
-    turnOpen = true;
-    // Reset idle timer — new message means stay alive
-    resetIdleTimer();
-    return true;
+    try {
+      if (closed || !child?.stdin?.writable) return false;
+      resetTurnStreamingState();
+      const content = buildUserContent({ userText, fileContent, imagePaths, workspace });
+      const msg = JSON.stringify({ type: 'user', message: { role: 'user', content } });
+      child.stdin.write(msg + '\n');
+      turnOpen = true;
+      // Reset idle timer — new message means stay alive
+      resetIdleTimer();
+      return true;
+    } catch (err) {
+      console.warn(`[worker] inject write failed: ${err.message}`);
+      return false;
+    }
   }
 
   function close() {

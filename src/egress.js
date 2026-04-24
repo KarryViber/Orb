@@ -13,6 +13,7 @@ function fingerprint(text) {
 export class EgressGate {
   constructor(logger) {
     this._seen = new Set();
+    this.deliveredTexts = [];
     this._log = typeof logger === 'function' ? logger : () => {};
   }
 
@@ -28,10 +29,13 @@ export class EgressGate {
       this._seen.clear();
     }
     this._seen.add(fp);
+    this.deliveredTexts.push(String(text || ''));
+    if (this.deliveredTexts.length > MAX_ENTRIES) this.deliveredTexts.shift();
     return true;
   }
 
   reset() {
     this._seen.clear();
+    this.deliveredTexts = [];
   }
 }
