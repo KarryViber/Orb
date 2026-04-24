@@ -176,7 +176,7 @@ Adding or changing message types/payload fields requires updating `worker.js` he
 - TodoWrite now routes through `plan_snapshot` with `display_mode: 'plan'`; other task-card tools continue to use `tool_call` / `tool_result` and typically render in timeline mode.
 - `chunk_type` is still decided by the worker on the first task-card tool in a turn (`TodoWrite` uses `'task'`, other tools use `'plan'`); for TodoWrite the scheduler also prepends a `plan_update` chunk so Slack can keep one plan card title while reconciling rows by id.
 - `progress_update` remains the non-stream fallback/status surface for TodoWrite outside the task-card path and in failure/fallback scenarios.
-- `status_update` and task-card streaming are mutually exclusive within a turn: once the stream is active, scheduler ignores later `status_update` events for that turn.
+- `status_update` and task-card streaming can coexist: status bubble acts as a secondary heartbeat showing the currently running tool, while the task card shows structural progress. Worker re-emits `status_update` every 90s for long-running tools to avoid Slack's 2-minute auto-clear.
 - Pure text turns or turns without task-card-qualified tools continue through the normal `progress_update` / `intermediate_text` / final reply path.
 
 ### Task Card Lifecycle

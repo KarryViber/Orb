@@ -37,7 +37,7 @@ import { storeConversation } from './memory.js';
  *   { type: 'tool_result', task_id, status, output }  — task-card path:
  *     emitted from tool_result blocks for tools that wait on a result; status is 'complete' | 'error'.
  *   { type: 'status_update', text }  — short assistant thread status text;
- *     emitted when a tool starts outside the task-card path, and cleared with empty text on turn_complete.
+ *     emitted when a tool starts, refreshed during long task-card tools, and cleared with empty text on turn_complete.
  *   { type: 'turn_start', injectId? }  — explicit turn ownership start on task/inject receipt
  *   { type: 'turn_end' }  — explicit turn ownership end when Claude emits result
  *   { type: 'intermediate_text', text }  — Phase ③: mid-turn text block, debounced 2s
@@ -323,6 +323,8 @@ process.on('message', async (msg) => {
 });
 
 const IDLE_TIMEOUT = parseInt(process.env.WORKER_IDLE_TIMEOUT_MS, 10) || 60_000; // idle → close stdin → CLI exits
+const TASK_CARD_HEARTBEAT_MS = 30_000;
+const STATUS_HEARTBEAT_MS = 90_000;
 
 function renderTodos(todos) {
   const lines = [`📋 ${buildPlanSnapshotTitle(todos)}`];
@@ -337,6 +339,14 @@ function truncateText(text, maxChars) {
   const normalized = String(text || '').replace(/\s+\n/g, '\n').trim();
   if (normalized.length <= maxChars) return normalized;
   return `${normalized.slice(0, maxChars - 3)}...`;
+}
+
+function formatElapsedTime(startedAt, now = Date.now()) {
+  const elapsedSeconds = Math.max(0, Math.floor((now - startedAt) / 1000));
+  if (elapsedSeconds < 60) return `${elapsedSeconds}s`;
+  const elapsedMinutes = Math.floor(elapsedSeconds / 60);
+  if (elapsedMinutes < 60) return `${elapsedMinutes}m ${elapsedSeconds % 60}s`;
+  return `${Math.floor(elapsedMinutes / 60)}h ${elapsedMinutes % 60}m`;
 }
 
 function truncate256(text) {
@@ -606,12 +616,82 @@ function runClaudeInteractive(args, initialContent, workspace) {
   let taskCardDisplayMode = 'timeline';
   let turnStopReasonOverride = null;
   const pendingTaskCards = new Map();
+  const inProgressTaskCards = new Map();
+  let taskCardHeartbeatTimer = null;
+  let statusHeartbeatTimer = null;
 
   const resetTurnStreamingState = () => {
     taskCardEmittedInTurn = false;
     taskCardChunkType = 'plan';
     taskCardDisplayMode = 'timeline';
     turnStopReasonOverride = null;
+    pendingTaskCards.clear();
+    inProgressTaskCards.clear();
+    clearTurnHeartbeatTimers();
+  };
+
+  const clearTurnHeartbeatTimers = () => {
+    if (taskCardHeartbeatTimer) {
+      clearInterval(taskCardHeartbeatTimer);
+      taskCardHeartbeatTimer = null;
+    }
+    if (statusHeartbeatTimer) {
+      clearInterval(statusHeartbeatTimer);
+      statusHeartbeatTimer = null;
+    }
+  };
+
+  const getActiveTaskCard = () => {
+    let active = null;
+    for (const [taskId, card] of inProgressTaskCards.entries()) {
+      if (!pendingTaskCards.has(taskId)) {
+        inProgressTaskCards.delete(taskId);
+        continue;
+      }
+      if (!active || card.startedAt > active.card.startedAt) active = { taskId, card };
+    }
+    return active;
+  };
+
+  const appendElapsedToTitle = (title, startedAt) => {
+    const suffix = `（${formatElapsedTime(startedAt)}）`;
+    const maxBaseLength = Math.max(1, 256 - suffix.length);
+    return `${truncateText(title || 'Task', maxBaseLength)}${suffix}`;
+  };
+
+  const buildElapsedStatusText = (card) => (
+    truncateText(`${buildStatusText(card.toolName, card.input)} (${formatElapsedTime(card.startedAt)})`, 100)
+  );
+
+  const ensureTurnHeartbeatTimers = () => {
+    if (!taskCardHeartbeatTimer) {
+      taskCardHeartbeatTimer = setInterval(() => {
+        for (const [taskId, card] of inProgressTaskCards.entries()) {
+          if (!pendingTaskCards.has(taskId)) {
+            inProgressTaskCards.delete(taskId);
+            continue;
+          }
+          ipcSend({
+            type: 'tool_call',
+            task_id: taskId,
+            tool_name: card.toolName,
+            title: appendElapsedToTitle(card.title, card.startedAt),
+            details: card.details,
+            chunk_type: taskCardChunkType,
+          }).catch(() => {});
+        }
+      }, TASK_CARD_HEARTBEAT_MS);
+    }
+    if (!statusHeartbeatTimer) {
+      statusHeartbeatTimer = setInterval(() => {
+        const active = getActiveTaskCard();
+        if (!active) return;
+        ipcSend({
+          type: 'status_update',
+          text: buildElapsedStatusText(active.card),
+        }).catch(() => {});
+      }, STATUS_HEARTBEAT_MS);
+    }
   };
 
   const queueIntermediate = (text) => {
@@ -696,13 +776,24 @@ function runClaudeInteractive(args, initialContent, workspace) {
             continue;
           }
           if (emitsTaskCard) {
+            const title = truncate256(buildToolTitle(block.name, block.input));
+            const details = truncate256(summarizeToolDetails(block.name, block.input));
             pendingTaskCards.set(block.id, { toolName: block.name });
+            inProgressTaskCards.set(block.id, {
+              taskId: block.id,
+              toolName: block.name,
+              title,
+              input: block.input,
+              details,
+              startedAt: Date.now(),
+            });
+            ensureTurnHeartbeatTimers();
             const taskCardPayload = {
               type: 'tool_call',
               task_id: block.id,
               tool_name: block.name,
-              title: truncate256(buildToolTitle(block.name, block.input)),
-              details: truncate256(summarizeToolDetails(block.name, block.input)),
+              title,
+              details,
               chunk_type: taskCardChunkType,
             };
             if (!taskCardEmittedInTurn) {
@@ -724,6 +815,7 @@ function runClaudeInteractive(args, initialContent, workspace) {
           output: truncate256(extractToolResultText(block.content)),
         }).catch(() => {});
         pendingTaskCards.delete(block.tool_use_id);
+        inProgressTaskCards.delete(block.tool_use_id);
       }
     }
     if (msg.type === 'result') {
@@ -787,6 +879,7 @@ function runClaudeInteractive(args, initialContent, workspace) {
     if (closed) return;
     closed = true;
     if (idleTimer) clearTimeout(idleTimer);
+    clearTurnHeartbeatTimers();
     try { child.stdin.end(); } catch {}
   }
 
@@ -797,6 +890,7 @@ function runClaudeInteractive(args, initialContent, workspace) {
     child.on('close', (code) => {
       closed = true;
       if (idleTimer) clearTimeout(idleTimer);
+      clearTurnHeartbeatTimers();
       resolve({
         code,
         stderr: Buffer.concat(errChunks).toString(),
