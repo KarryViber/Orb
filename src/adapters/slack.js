@@ -1356,7 +1356,16 @@ export class SlackAdapter extends PlatformAdapter {
     }
 
     const streamId = `${channel}:${result.ts}`;
-    this._streams.set(streamId, { channel, ts: result.ts });
+    const initialLen = initialChunks.reduce((s, c) => s + (c?.text?.length || 0), 0);
+    info(TAG, `[slack:startStream] stream_id=${streamId} display_mode=${normalizedTaskDisplayMode} initial_chunks=${initialChunks.length} initial_len=${initialLen}`);
+    this._streams.set(streamId, {
+      channel,
+      ts: result.ts,
+      startedAt: Date.now(),
+      appendCount: 0,
+      totalAppendLen: 0,
+      lastAppendAt: null,
+    });
     return { stream_id: streamId, ts: result.ts };
   }
 
@@ -1364,6 +1373,7 @@ export class SlackAdapter extends PlatformAdapter {
     const stream = this._getStreamHandle(streamId);
     const normalizedChunks = this.normalizeStreamChunks(chunks);
     if (normalizedChunks.length === 0) return;
+    const appendLen = normalizedChunks.reduce((s, c) => s + (c?.text?.length || 0), 0);
 
     let result;
     try {
@@ -1376,14 +1386,23 @@ export class SlackAdapter extends PlatformAdapter {
       if (isStreamingStateError(err) || getSlackStreamErrorCode(err) === 'message_not_owned_by_app') {
         this._streams.delete(streamId);
       }
+      info(TAG, `[slack:appendStream:error] stream_id=${streamId} error=${err.data?.error || err.message} chunks=${normalizedChunks.length} len=${appendLen} n=${stream.appendCount || 0} total_len=${stream.totalAppendLen || 0}`);
       throw buildStreamAPIError('appendStream', err.data?.error || err.message, err);
     }
     if (!result?.ok) {
       if (isStreamingStateError(result) || getSlackStreamErrorCode(result) === 'message_not_owned_by_app') {
         this._streams.delete(streamId);
       }
+      info(TAG, `[slack:appendStream:error] stream_id=${streamId} error=${result?.error || 'unknown_error'} chunks=${normalizedChunks.length} len=${appendLen} n=${stream.appendCount || 0} total_len=${stream.totalAppendLen || 0}`);
       throw buildStreamAPIError('appendStream', result?.error || 'unknown_error');
     }
+    const now = Date.now();
+    const sinceLast = stream.lastAppendAt ? now - stream.lastAppendAt : null;
+    stream.appendCount = (stream.appendCount || 0) + 1;
+    stream.totalAppendLen = (stream.totalAppendLen || 0) + appendLen;
+    stream.lastAppendAt = now;
+    const lifeMs = stream.startedAt ? now - stream.startedAt : null;
+    info(TAG, `[slack:appendStream] stream_id=${streamId} chunks=${normalizedChunks.length} len=${appendLen} since_last_ms=${sinceLast ?? 'null'} n=${stream.appendCount} total_len=${stream.totalAppendLen} life_ms=${lifeMs}`);
   }
 
   async stopStream(streamId, { markdown_text, blocks, chunks, final_blocks } = {}) {
@@ -1408,6 +1427,8 @@ export class SlackAdapter extends PlatformAdapter {
 
     let result;
     try {
+      const lifeMs = stream.startedAt ? Date.now() - stream.startedAt : null;
+      info(TAG, `[slack:stopStream] summary stream_id=${streamId} life_ms=${lifeMs} total_appends=${stream.appendCount || 0} total_append_len=${stream.totalAppendLen || 0} final_len=${finalText.length} final_blocks=${finalBlocks ? finalBlocks.length : 0}`);
       result = await this._slack.apiCall('chat.stopStream', {
         channel: stream.channel,
         ts: stream.ts,
@@ -1416,11 +1437,13 @@ export class SlackAdapter extends PlatformAdapter {
         ...(finalBlocks ? { blocks: finalBlocks } : {}),
       });
     } catch (err) {
+      info(TAG, `[slack:stopStream:error] stream_id=${streamId} error=${err.data?.error || err.message} total_appends=${stream.appendCount || 0} total_append_len=${stream.totalAppendLen || 0}`);
       throw buildStreamAPIError('stopStream', err.data?.error || err.message, err);
     } finally {
       this._streams.delete(streamId);
     }
     if (!result?.ok) {
+      info(TAG, `[slack:stopStream:error] stream_id=${streamId} error=${result?.error || 'unknown_error'} total_appends=${stream.appendCount || 0} total_append_len=${stream.totalAppendLen || 0}`);
       throw buildStreamAPIError('stopStream', result?.error || 'unknown_error');
     }
   }
