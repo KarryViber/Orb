@@ -803,10 +803,6 @@ export class Scheduler {
       }
     };
     const armStatusRefresh = () => {
-      if (turn.taskCardState.keepaliveTimer) {
-        warn(TAG, '[invariant] armStatusRefresh called while keepaliveTimer active — clearing peer');
-        clearKeepalive();
-      }
       clearStatusRefresh();
       if (!canManageThreadStatus || !effectiveThreadTs) return;
       if (!turn.pendingThreadStatus) return;
@@ -861,9 +857,6 @@ export class Scheduler {
       }
     };
     const armKeepalive = () => {
-      if (turn.statusRefreshTimer) {
-        clearStatusRefresh();
-      }
       clearKeepalive();
       if (!turn.taskCardState.streamId || turn.taskCardState.failed) return;
       turn.taskCardState.keepaliveTimer = setTimeout(async () => {
@@ -1353,7 +1346,6 @@ export class Scheduler {
 
           if (msg.type === 'status_update') {
             if (deferDeliveryUntilResult) return;
-            if (turn.taskCardState.streamId && !turn.taskCardState.failed) return;
             await applyThreadStatus(msg.text || '');
             return;
           }
@@ -1378,10 +1370,6 @@ export class Scheduler {
             if (!turn.taskCardState.enabled) return;
             const hadStream = Boolean(turn.taskCardState.streamId);
             const streamReady = await ensureTaskCardStream();
-            if (streamReady && !turn.taskCardState.bubbleCleared) {
-              await applyThreadStatus('');
-              turn.taskCardState.bubbleCleared = true;
-            }
             if (streamReady && hadStream) {
               await appendTaskCardPlan(msg.task_id, true);
             }
@@ -1426,10 +1414,6 @@ export class Scheduler {
             if (!turn.taskCardState.enabled) return;
             const hadStream = Boolean(turn.taskCardState.streamId);
             const streamReady = await ensureTaskCardStream();
-            if (streamReady && !turn.taskCardState.bubbleCleared) {
-              await applyThreadStatus('');
-              turn.taskCardState.bubbleCleared = true;
-            }
             if (streamReady && hadStream) {
               await appendTaskCardSnapshot();
             }
