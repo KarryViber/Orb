@@ -1470,6 +1470,43 @@ export class Scheduler {
             return;
           }
 
+          if (msg.type === 'final_snapshot') {
+            if (turn.taskCardState.failed) return;
+            if (!turn.taskCardState.enabled && !turn.taskCardState.deferred) return;
+            const categories = Array.isArray(msg.categories) ? msg.categories : [];
+            const initialChunks = [
+              { type: 'plan_update', title: String(msg.plan_title || '').slice(0, 256) },
+              ...categories.map((cat, i) => ({
+                type: 'task_update',
+                id: `snapshot-${i}`,
+                title: String(cat?.title || '').slice(0, 256),
+                status: 'complete',
+                details: String(cat?.details || '').slice(0, 256),
+              })),
+            ];
+            try {
+              if (turn.taskCardState.streamId) {
+                await stopTaskCardStream('');
+              }
+              const result = await adapter.startStream(channel, effectiveThreadTs, {
+                task_display_mode: 'plan',
+                initial_chunks: initialChunks,
+                team_id: task.teamId || null,
+              });
+              const streamId = result?.stream_id || (result?.ts ? `${channel}:${result.ts}` : null);
+              if (streamId) {
+                turn.taskCardState.streamId = streamId;
+                turn.taskCardState.streamTs = result?.ts || null;
+                await adapter.stopStream(streamId);
+                turn.taskCardState.streamId = null;
+                turn.taskCardState.streamTs = null;
+              }
+            } catch (err) {
+              warn(TAG, `[final_snapshot] failed: ${err.message}`);
+            }
+            return;
+          }
+
           if (msg.type === 'plan_title_update') {
             if ((!turn.taskCardState.enabled && !turn.taskCardState.deferred) || turn.taskCardState.failed) return;
             const title = String(msg.title || '').trim();
