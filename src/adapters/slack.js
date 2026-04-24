@@ -14,6 +14,7 @@ import { downloadAndCacheImage, cleanImageCache, IMAGE_EXTENSIONS } from './imag
 const TAG = 'slack';
 const MAX_USERNAME_CACHE = 500;
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const streamTrace = () => process.env.ORB_STREAM_TRACE === '1';
 
 // --- Slack thread URL parsing ---
 
@@ -1402,7 +1403,9 @@ export class SlackAdapter extends PlatformAdapter {
     stream.totalAppendLen = (stream.totalAppendLen || 0) + appendLen;
     stream.lastAppendAt = now;
     const lifeMs = stream.startedAt ? now - stream.startedAt : null;
-    info(TAG, `[slack:appendStream] stream_id=${streamId} chunks=${normalizedChunks.length} len=${appendLen} since_last_ms=${sinceLast ?? 'null'} n=${stream.appendCount} total_len=${stream.totalAppendLen} life_ms=${lifeMs}`);
+    if (streamTrace()) {
+      info(TAG, `[slack:appendStream] stream_id=${streamId} chunks=${normalizedChunks.length} len=${appendLen} since_last_ms=${sinceLast ?? 'null'} n=${stream.appendCount} total_len=${stream.totalAppendLen} life_ms=${lifeMs}`);
+    }
   }
 
   async stopStream(streamId, { markdown_text, blocks, chunks, final_blocks } = {}) {
@@ -1414,7 +1417,7 @@ export class SlackAdapter extends PlatformAdapter {
         ? final_blocks
         : null;
     const finalText = typeof markdown_text === 'string' ? markdown_text.trim() : '';
-    if (finalText) {
+    if (finalText && streamTrace()) {
       info(TAG, `[slack:stopStream] emitting markdown_text as implicit post (len=${finalText.length}, channel=${stream.channel}, ts=${stream.ts})`);
     }
 
