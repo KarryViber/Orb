@@ -96,6 +96,10 @@ class ContextTokenStore {
     this._persist();
   }
 
+  delete(userId) {
+    if (this._cache.delete(userId)) this._persist();
+  }
+
   _persist() {
     try {
       const obj = Object.fromEntries(this._cache);
@@ -333,20 +337,40 @@ export class WeChatAdapter extends PlatformAdapter {
   async sendReply(channel, threadTs, text, extra = {}) {
     // channel = wechat userId (peer), threadTs = same or null
     const targetUser = channel;
-    const contextToken = this._tokenStore?.get(targetUser) || null;
+    let contextToken = this._tokenStore?.get(targetUser) || null;
     const clientId = `orb-wx-${randomUUID().replace(/-/g, '')}`;
 
-    const message = {
-      from_user_id: '',
-      to_user_id: targetUser,
-      client_id: clientId,
-      message_type: MSG_TYPE_BOT,
-      message_state: MSG_STATE_FINISH,
-      item_list: [{ type: ITEM_TEXT, text_item: { text } }],
+    const buildMessage = (token) => {
+      const message = {
+        from_user_id: '',
+        to_user_id: targetUser,
+        client_id: clientId,
+        message_type: MSG_TYPE_BOT,
+        message_state: MSG_STATE_FINISH,
+        item_list: [{ type: ITEM_TEXT, text_item: { text } }],
+      };
+      if (token) message.context_token = token;
+      return message;
     };
-    if (contextToken) message.context_token = contextToken;
 
-    await apiPost(this._baseUrl, EP_SEND_MESSAGE, { msg: message }, this._token, API_TIMEOUT_MS);
+    // iLink returns ret/errcode=-14 when the per-chat session expires
+    // (common after long idle, esp. for cron pushes). Retry once without
+    // context_token -- iLink accepts tokenless sends as a degraded fallback.
+    // Ported from Hermes weixin.py e105b7a.
+    let resp = await apiPost(this._baseUrl, EP_SEND_MESSAGE, { msg: buildMessage(contextToken) }, this._token, API_TIMEOUT_MS);
+    const ret = resp?.ret ?? 0;
+    const errcode = resp?.errcode ?? 0;
+    if ((ret === SESSION_EXPIRED_ERRCODE || errcode === SESSION_EXPIRED_ERRCODE) && contextToken) {
+      warn(TAG, `session expired for ${targetUser.slice(0, 8)}...; retrying without context_token`);
+      this._tokenStore?.delete?.(targetUser);
+      contextToken = null;
+      resp = await apiPost(this._baseUrl, EP_SEND_MESSAGE, { msg: buildMessage(null) }, this._token, API_TIMEOUT_MS);
+    }
+    const finalRet = resp?.ret ?? 0;
+    const finalErr = resp?.errcode ?? 0;
+    if (finalRet !== 0 || finalErr !== 0) {
+      throw new Error(`iLink sendmessage ret=${finalRet} errcode=${finalErr} errmsg=${resp?.errmsg || ''}`);
+    }
   }
 
   async editMessage() {
