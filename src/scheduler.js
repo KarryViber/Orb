@@ -178,10 +178,12 @@ export function makeTaskCardState({ enabled = false, deferred = false } = {}) {
     streamStartedAt: null,
     startStreamPromise: null,
     rotatePromise: null,
+    planSectionPromise: null,
     chunkType: null,
     displayMode: null,
     planTitle: '',
     lastSentPlanTitle: null,
+    pendingPlanSection: null,
     taskCards: new Map(),
     failed: false,
     failureNotified: false,
@@ -194,6 +196,8 @@ export function makeTaskCardState({ enabled = false, deferred = false } = {}) {
 export function buildTaskCardChunksFromState(taskCardState, { updateOnly = false, includePlanUpdate = true } = {}) {
   const chunks = [];
   if (includePlanUpdate && taskCardState?.displayMode === 'plan') {
+    const pendingPlanSection = String(taskCardState?.pendingPlanSection || '').trim();
+    if (pendingPlanSection) chunks.push({ type: 'plan_update', title: pendingPlanSection.slice(0, 256) });
     const planTitle = String(taskCardState?.planTitle || '').trim();
     if (planTitle) chunks.push({ type: 'plan_update', title: planTitle });
   }
@@ -887,10 +891,12 @@ export class Scheduler {
       turn.taskCardState.streamStartedAt = null;
       turn.taskCardState.startStreamPromise = null;
       turn.taskCardState.rotatePromise = null;
+      turn.taskCardState.planSectionPromise = null;
       turn.taskCardState.chunkType = null;
       turn.taskCardState.displayMode = null;
       turn.taskCardState.planTitle = '';
       turn.taskCardState.lastSentPlanTitle = null;
+      turn.taskCardState.pendingPlanSection = null;
       turn.taskCardState.taskCards.clear();
       turn.taskCardState.failed = false;
       turn.taskCardState.failureNotified = false;
@@ -917,11 +923,13 @@ export class Scheduler {
       turn.taskCardState.streamStartedAt = null;
       turn.taskCardState.startStreamPromise = null;
       turn.taskCardState.rotatePromise = null;
+      turn.taskCardState.planSectionPromise = null;
       clearKeepalive();
       turn.taskCardState.chunkType = null;
       turn.taskCardState.displayMode = null;
       turn.taskCardState.planTitle = '';
       turn.taskCardState.lastSentPlanTitle = null;
+      turn.taskCardState.pendingPlanSection = null;
       if (fallbackMarkdown) {
         let edited = false;
         if (editableTs && typeof adapter?.editMessage === 'function') {
@@ -961,17 +969,23 @@ export class Scheduler {
       turn.taskCardState.streamStartedAt = null;
       turn.taskCardState.startStreamPromise = null;
       turn.taskCardState.rotatePromise = null;
+      turn.taskCardState.planSectionPromise = null;
       turn.taskCardState.chunkType = null;
       turn.taskCardState.displayMode = null;
       turn.taskCardState.planTitle = '';
       turn.taskCardState.lastSentPlanTitle = null;
+      turn.taskCardState.pendingPlanSection = null;
       turn.taskCardState.taskCards.clear();
       clearKeepalive();
     };
 
-    const buildTaskCardChunks = ({ updateOnly = false, includePlanUpdate = true } = {}) => (
-      buildTaskCardChunksFromState(turn.taskCardState, { updateOnly, includePlanUpdate })
-    );
+    const buildTaskCardChunks = ({ updateOnly = false, includePlanUpdate = true, consumePendingPlanSection = false } = {}) => {
+      const chunks = buildTaskCardChunksFromState(turn.taskCardState, { updateOnly, includePlanUpdate });
+      if (consumePendingPlanSection && includePlanUpdate) {
+        turn.taskCardState.pendingPlanSection = null;
+      }
+      return chunks;
+    };
 
     const replaceTaskCardSnapshot = (rows) => {
       turn.taskCardState.taskCards = replaceTaskCardSnapshotRows(rows);
@@ -985,7 +999,7 @@ export class Scheduler {
       channel,
       effectiveThreadTs,
       teamId: task.teamId || null,
-      buildTaskCardChunks: () => buildTaskCardChunks(),
+      buildTaskCardChunks: () => buildTaskCardChunks({ consumePendingPlanSection: true }),
       armKeepalive,
       failTaskCardStream,
       onStreamStarted: (stream) => {
@@ -1046,7 +1060,7 @@ export class Scheduler {
       try {
         const stream = await adapter.startStream(channel, effectiveThreadTs, {
           task_display_mode: turn.taskCardState.displayMode || resolveTaskCardDisplayMode(turn.taskCardState.chunkType, 'timeline'),
-          initial_chunks: buildTaskCardChunks(),
+          initial_chunks: buildTaskCardChunks({ consumePendingPlanSection: true }),
           team_id: task.teamId || null,
         });
         turn.taskCardState.streamId = stream?.stream_id || null;
@@ -1265,7 +1279,7 @@ export class Scheduler {
             const primaryPayload = finalPayloads.shift() || null;
             const stream = await adapter.startStream(channel, effectiveThreadTs, {
               task_display_mode: turn.taskCardState.displayMode || resolveTaskCardDisplayMode(turn.taskCardState.chunkType, 'timeline'),
-              initial_chunks: buildTaskCardChunks(),
+              initial_chunks: buildTaskCardChunks({ consumePendingPlanSection: true }),
               team_id: task.teamId || null,
             });
             if (!effectiveThreadTs && stream?.ts) {
@@ -1365,6 +1379,36 @@ export class Scheduler {
             return;
           }
 
+          if (msg.type === 'plan_section') {
+            if ((!turn.taskCardState.enabled && !turn.taskCardState.deferred) || turn.taskCardState.failed) return;
+            const title = String(msg.title || '').trim().slice(0, 256);
+            if (!title) return;
+            turn.taskCardState.displayMode = 'plan';
+            if (!turn.taskCardState.enabled || !turn.taskCardState.streamId) {
+              turn.taskCardState.pendingPlanSection = title;
+              return;
+            }
+            const appendPlanSection = (async () => {
+              turn.taskCardState.pendingPlanSection = null;
+              if (!await rotateTaskCardStreamIfNeeded()) return;
+              await adapter.appendStream(turn.taskCardState.streamId, [{ type: 'plan_update', title }]);
+              armKeepalive();
+            })();
+            let trackedPlanSectionPromise;
+            trackedPlanSectionPromise = appendPlanSection.finally(() => {
+              if (turn.taskCardState.planSectionPromise === trackedPlanSectionPromise) {
+                turn.taskCardState.planSectionPromise = null;
+              }
+            });
+            turn.taskCardState.planSectionPromise = trackedPlanSectionPromise;
+            try {
+              await turn.taskCardState.planSectionPromise;
+            } catch (err) {
+              await failTaskCardStream(err);
+            }
+            return;
+          }
+
           if (msg.type === 'tool_call') {
             if ((!turn.taskCardState.enabled && !turn.taskCardState.deferred) || turn.taskCardState.failed) return;
             if (!turn.taskCardState.chunkType && typeof msg.chunk_type === 'string') {
@@ -1379,13 +1423,14 @@ export class Scheduler {
             turn.taskCardState.taskCards.set(msg.task_id, {
               title: msg.title || msg.tool_name || 'Task',
               details: msg.details || '',
-              status: 'in_progress',
+              status: normalizeTaskCardStatus(msg.status, 'in_progress'),
               output: '',
             });
             if (!turn.taskCardState.enabled) return;
             const hadStream = Boolean(turn.taskCardState.streamId);
             const streamReady = await ensureTaskCardStream();
             if (streamReady && hadStream) {
+              if (turn.taskCardState.planSectionPromise) await turn.taskCardState.planSectionPromise;
               await appendTaskCardPlan(msg.task_id, true);
             }
             return;
