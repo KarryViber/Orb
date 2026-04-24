@@ -1695,19 +1695,29 @@ export class SlackAdapter extends PlatformAdapter {
 
     const { rule, ctx } = matched;
 
-    try {
-      if (ctx.file) {
-        try {
-          ctx.localPath = await this._downloadDMFile(ctx.file, event, event.user);
-          info(TAG, `DM file downloaded: ${ctx.localPath}`);
-        } catch (err) {
-          warn(TAG, `DM file download failed for rule=${rule.name}: ${err.message}`);
-          ctx.localPath = null;
-        }
+    if (ctx.file) {
+      try {
+        ctx.localPath = await this._downloadDMFile(ctx.file, event, event.user);
+        info(TAG, `DM file downloaded: ${ctx.localPath}`);
+      } catch (err) {
+        warn(TAG, `DM file download failed for rule=${rule.name}: ${err.message}`);
+        ctx.localPath = null;
       }
+    }
+    ctx.date_mmdd = this._dateMMDD();
 
-      ctx.date_mmdd = this._dateMMDD();
+    const buildWorkerPrompt = () => {
+      const tpl = rule.target.workerPrompt || rule.target.threadBootstrap || '';
+      let workerPrompt = this._interpRuleTemplate(tpl, ctx);
+      if (ctx.file) {
+        workerPrompt += ctx.localPath
+          ? `\n\n[附件已下载到: ${ctx.localPath}]`
+          : `\n\n[附件下载失败，请手动从 Slack 获取：${ctx.file.name}]`;
+      }
+      return workerPrompt;
+    };
 
+    try {
       const mainText = this._interpRuleTemplate(rule.target.mainTemplate, ctx);
       const mainMsg = await this._slack.chat.postMessage({
         channel: rule.target.channel,
@@ -1718,13 +1728,7 @@ export class SlackAdapter extends PlatformAdapter {
       this._trackBotMessage(mainMsg.ts);
       this._trackThread(mainMsg.ts);
 
-      const tpl = rule.target.workerPrompt || rule.target.threadBootstrap || '';
-      let workerPrompt = this._interpRuleTemplate(tpl, ctx);
-      if (ctx.file) {
-        workerPrompt += ctx.localPath
-          ? `\n\n[附件已下载到: ${ctx.localPath}]`
-          : `\n\n[附件下载失败，请手动从 Slack 获取：${ctx.file.name}]`;
-      }
+      const workerPrompt = buildWorkerPrompt();
 
       if (this.onMessage) {
         const task = {
@@ -1745,7 +1749,25 @@ export class SlackAdapter extends PlatformAdapter {
       return { routed: true };
     } catch (err) {
       logError(TAG, `DM routing failed (rule=${rule.name}): ${err.message}`);
-      return { routed: false, fallback: cfg.dmFallback || 'worker' };
+      try {
+        const pendingText = [
+          this._interpRuleTemplate(rule.target.mainTemplate || '待补', ctx),
+          '',
+          '待补：DM 路由已命中，但自动建卡/启动 worker 时遇到 Slack API 故障；请稍后补处理。',
+        ].filter((line) => line !== null && line !== undefined).join('\n');
+        const pendingMsg = await this._slack.chat.postMessage({
+          channel: rule.target.channel,
+          text: pendingText,
+          unfurl_links: false,
+        });
+        if (pendingMsg.ts) {
+          this._trackBotMessage(pendingMsg.ts);
+          this._trackThread(pendingMsg.ts);
+        }
+      } catch (pendingErr) {
+        logError(TAG, `DM routing degraded card failed (rule=${rule.name}): ${pendingErr.message}`);
+      }
+      return { routed: true, degraded: true };
     }
   }
 
