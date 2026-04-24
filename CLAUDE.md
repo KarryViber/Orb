@@ -172,22 +172,40 @@ Adding or changing message types/payload fields requires updating `worker.js` he
 
 ### Task Card Routing
 
-- Task-card path is enabled only when a turn emits whitelisted `tool_use` blocks and the worker sends task-card IPC (`plan_snapshot`, `tool_call`, `tool_result`).
-- TodoWrite now routes through `plan_snapshot` with `display_mode: 'plan'`; other task-card tools continue to use `tool_call` / `tool_result` and typically render in timeline mode.
-- `chunk_type` is still decided by the worker on the first task-card tool in a turn (`TodoWrite` uses `'task'`, other tools use `'plan'`); for TodoWrite the scheduler also prepends a `plan_update` chunk so Slack can keep one plan card title while reconciling rows by id.
-- `progress_update` remains the non-stream fallback/status surface for TodoWrite outside the task-card path and in failure/fallback scenarios.
-- `status_update` and task-card streaming can coexist: status bubble acts as a secondary heartbeat showing the currently running tool, while the task card shows structural progress. Worker re-emits `status_update` every 90s for long-running tools to avoid Slack's 2-minute auto-clear.
-- Pure text turns or turns without task-card-qualified tools continue through the normal `progress_update` / `intermediate_text` / final reply path.
+Non-TodoWrite 工具走 **Qi 实时卡**（独立 stream），TodoWrite 走既有 `plan_snapshot` 卡（独立第二条 stream）。两条路径并行不互相干扰。
+
+**Qi 卡路径**（非 TodoWrite）：
+- Worker 见首个 task-card-qualifying tool_use 时发 `qi_start` IPC。
+- 每个 tool_use 发 `qi_append { category, line }`——category 由 `categorizeTool` 映射（Bash/Read/Edit/Write/Grep/Glob/NotebookEdit/WebFetch/WebSearch → `Probe`；Task/Agent/Skill/mcp__* → `Delegate`；summary 用 `Distill`）。
+- Worker 的 `result` 处理分支遇 `qiStreamOpened` 时发 `qi_finalize`——**该触发独立于 `turnOpen`**，以覆盖 Claude CLI 的 auto-continue 场景。
+
+**TodoWrite 路径**：
+- 保持 `plan_snapshot` 单一 IPC，包含完整 `rows`。
+- Scheduler 走 task-card stream（区别于 Qi stream），display_mode 始终 'plan'。
+
+**status bubble**（stream 侧边细字）：
+- 与任一 stream 并行，90s refresh，避开 Slack 2 分钟自清。
+
+**无工具 turn**：
+- 走 `progress_update` / `intermediate_text` / 最终 reply 路径，不开 Qi stream。
 
 ### Task Card Lifecycle
 
-- Slack task-card streams are per-turn, per-message. Orb must not reuse a prior stream across `inject` follow-up turns.
-- Scheduler opens a stream lazily on the first task-card IPC and gates `startStream` with an in-flight promise so concurrent IPC bursts cannot create duplicate streams.
-- In plan mode, scheduler prepends a `plan_update` chunk and appends the full current `taskCards` snapshot on each TodoWrite change so Slack can reconcile rows by id inside one plan card. TodoWrite does this through a single `plan_snapshot` IPC carrying all rows for that call.
-- Non-TodoWrite task-card tools continue to append per-tool `task_update` items and may carry `details` / `output`.
-- Before `stopStream`, any task card still left `in_progress` is converted to `error` with a timeout fallback output so cards do not remain running forever.
-- `stopStream` carries the final task-update chunks plus optional `markdown_text` and rich `blocks`; extra overflow payloads are sent as normal follow-up replies if needed.
-- If Slack returns ownership/stream-state errors such as `message_not_in_streaming_state` or `message_not_owned_by_app`, Orb degrades to normal message delivery for that turn instead of reusing the broken stream.
+**Qi stream**：
+- Scheduler 用独立 `turn.qiStreamId` 管理，开/关操作走独立 `chainQiAppend` 串行链，与 TodoWrite task-card stream (`turn.taskCardState.streamId`) 不冲突。
+- `qi_start` → 用 `task_display_mode: 'plan'` 开 stream，initial_chunks = `plan_update { title: 'Orbiting...' }` + 3 条空 task_update 占位（id: `qi-exec` / `qi-other` / `qi-summary`，title: `Probe` / `Delegate` / `Distill`）。
+- `qi_append` → appendStream 一条 task_update，details = `\n<line>\n`。**利用 Slack 跨 appendStream 对同 id `task_update.details` 字段 concat 而非 replace 的特性累积 bullet**。依赖 `src/adapters/slack.js` 的 `preserveStreamTaskField`（只对 `details` 保留首尾空白，不 trim）。
+- `qi_finalize` → 补 `plan_update { title: 'Settled' }` + 3 条 task_update complete（summary 的 details 为 `Distilled from N probes`），stopStream。
+
+**TodoWrite task-card stream**（不变）：
+- 首个 task-card IPC 时 lazy 开 stream，用 in-flight promise 防重复。
+- 每次 TodoWrite `plan_snapshot` 重建完整 rows 并 append（scheduler 内部 reconcile by id）。
+- stopStream 前 in_progress 残留 task 统一转 error。
+
+**共同约束**：
+- Slack stream per-turn per-message；`inject` 跨 turn 不复用 stream。
+- Slack 返回 `message_not_in_streaming_state` / `message_not_owned_by_app` 时降级为普通消息。
+- 跨 appendStream 对 `task_update.details` 的 concat 行为是 Slack 官方未明文说明但经实测稳定的路径——改动相关逻辑前先查 `profiles/karry/data/lessons/slack-stream-chunk-semantics.md`。
 
 ### Immutable Constraints
 
