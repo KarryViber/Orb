@@ -1018,6 +1018,16 @@ export class Scheduler {
       return tracked;
     };
 
+    const chainQiAppend = (operation) => {
+      const previous = turn.qiAppendPromise || Promise.resolve();
+      const current = previous.catch(() => {}).then(operation);
+      const tracked = current.finally(() => {
+        if (turn.qiAppendPromise === tracked) turn.qiAppendPromise = null;
+      });
+      turn.qiAppendPromise = tracked;
+      return tracked;
+    };
+
     const replaceTaskCardSnapshot = (rows) => {
       turn.taskCardState.taskCards = replaceTaskCardSnapshotRows(rows);
     };
@@ -1519,7 +1529,7 @@ export class Scheduler {
               return;
             }
             const initialChunks = [
-              { type: 'plan_update', title: msg.title || '已完成思考' },
+              { type: 'plan_update', title: '思考中...' },
               { type: 'task_update', id: 'qi-exec', title: '工具执行', status: 'in_progress', details: '' },
               { type: 'task_update', id: 'qi-other', title: '其他操作', status: 'in_progress', details: '' },
               { type: 'task_update', id: 'qi-summary', title: '信息整合', status: 'in_progress', details: '' },
@@ -1542,22 +1552,27 @@ export class Scheduler {
             return;
           }
 
+          if (msg.type === 'qi_title_update') {
+            if (!turn.qiStreamId || turn.taskCardState.failed) return;
+            await chainQiAppend(async () => {
+              await adapter.appendStream(turn.qiStreamId, [
+                { type: 'plan_update', title: String(msg.title || '').slice(0, 256) },
+              ]);
+            });
+            return;
+          }
+
           if (msg.type === 'qi_append') {
             if (turn.qiStartPromise) await turn.qiStartPromise;
             const idMap = { '工具执行': 'qi-exec', '其他操作': 'qi-other' };
             const taskId = idMap[msg.category];
             if (!taskId || !turn.qiStreamId) return;
-            const previous = turn.qiAppendPromise || Promise.resolve();
-            const current = previous.catch(() => {}).then(async () => {
+            const tracked = chainQiAppend(async () => {
               if (!turn.qiStreamId) return;
               await adapter.appendStream(turn.qiStreamId, [
                 { type: 'task_update', id: taskId, title: msg.category, details: `\n${msg.line}\n` },
               ]);
             });
-            const tracked = current.finally(() => {
-              if (turn.qiAppendPromise === tracked) turn.qiAppendPromise = null;
-            });
-            turn.qiAppendPromise = tracked;
             try {
               await tracked;
             } catch (err) {
