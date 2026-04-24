@@ -484,70 +484,82 @@ function summarizeTodos(todos) {
 function summarizeToolDetails(toolName, input) {
   const parsedInput = parseToolInput(input);
 
-  if (toolName === 'TodoWrite') {
-    return truncateText(summarizeTodos(parsedInput?.todos), 200);
-  }
-  if (toolName === 'Bash') {
-    const command = parsedInput?.command ?? parsedInput?.cmd ?? input;
-    return truncateText(String(command || '').trim(), 200);
-  }
-  if (toolName === 'Write' || toolName === 'NotebookEdit') {
-    return truncateText(summarizeWriteDetails(parsedInput), 200);
-  }
-  if (toolName === 'Edit') {
-    return truncateText(summarizeEditDetails(parsedInput), 200);
-  }
   if (toolName === 'Skill') {
     return truncateText(
       parsedInput?.skill_description
       || parsedInput?.description
-      || parsedInput?.prompt
-      || summarizePrimitiveParams(parsedInput),
-      200,
+      || '',
+      120,
     );
   }
-  if (toolName === 'WebFetch') {
-    return truncateText(String(parsedInput?.url || input || ''), 200);
+  if (toolName === 'Task' || toolName === 'Agent') {
+    const parts = [];
+    if (parsedInput?.subagent_type) parts.push(`type: ${parsedInput.subagent_type}`);
+    if (parsedInput?.description) parts.push(parsedInput.description);
+    return truncateText(parts.join(' · '), 120);
   }
 
-  return truncateText(summarizePrimitiveParams(parsedInput), 200);
+  return '';
 }
 
 function buildToolTitle(toolName, input) {
   const parsedInput = parseToolInput(input);
+  const title = (value) => truncate256(value);
+  const basename = (filePath) => {
+    const rawPath = filePath || 'unknown';
+    return String(rawPath).split('/').filter(Boolean).pop() || String(rawPath);
+  };
 
-  if (toolName === 'TodoWrite') return 'Plan update';
+  if (toolName === 'TodoWrite') return title('Plan update');
   if (toolName === 'Bash') {
     const description = parsedInput?.description;
     if (description && typeof description === 'string' && description.trim()) {
-      return `Bash: ${description.trim()}`;
+      return title(`执行: ${description.trim()}`);
     }
     const command = parsedInput?.command ?? parsedInput?.cmd ?? input;
-    return `Bash: ${firstNonFlagToken(command)}`;
+    return title(`执行: ${firstNonFlagToken(command)}`);
   }
-  if (toolName === 'Write' || toolName === 'Edit' || toolName === 'NotebookEdit') {
-    const filePath = parsedInput?.file_path || parsedInput?.notebook_path || 'unknown';
-    const baseName = String(filePath).split('/').filter(Boolean).pop() || filePath;
-    return `${toolName}: ${baseName}`;
+  if (toolName === 'Read') {
+    return title(`阅读 ${basename(parsedInput?.file_path)}`);
+  }
+  if (toolName === 'Edit') {
+    return title(`修改 ${basename(parsedInput?.file_path)}`);
+  }
+  if (toolName === 'Write') {
+    return title(`新建 ${basename(parsedInput?.file_path)}`);
+  }
+  if (toolName === 'Grep') {
+    return title(`搜索「${parsedInput?.pattern || 'unknown'}」`);
+  }
+  if (toolName === 'Glob') {
+    return title(`查找 ${parsedInput?.pattern || 'unknown'}`);
+  }
+  if (toolName === 'WebSearch') {
+    return title(`搜索「${parsedInput?.query || 'unknown'}」`);
+  }
+  if (toolName === 'NotebookEdit') {
+    return title(`编辑 notebook ${basename(parsedInput?.notebook_path)}`);
   }
   if (toolName === 'Skill') {
+    const description = parsedInput?.description || parsedInput?.skill_description;
     const skillName = parsedInput?.skill_name || parsedInput?.name || parsedInput?.skill || 'unknown';
-    return `Skill: ${skillName}`;
+    return title(`调用技能: ${description || skillName}`);
   }
-  if (toolName === 'Task') {
+  if (toolName === 'Task' || toolName === 'Agent') {
     const desc = parsedInput?.description || parsedInput?.subagent_type || 'sub-agent';
-    return `Agent: ${desc}`;
+    return title(`委派子任务: ${desc}`);
   }
   if (toolName === 'WebFetch') {
     const url = parsedInput?.url || '';
     try {
-      return `WebFetch: ${new URL(url).hostname || url}`;
+      return title(`访问 ${new URL(url).hostname || url}`);
     } catch {
-      return `WebFetch: ${truncateText(url, 80) || 'unknown'}`;
+      return title(`访问 ${truncateText(url, 80) || 'unknown'}`);
     }
   }
 
-  return String(toolName || 'unknown');
+  const summary = summarizePrimitiveParams(parsedInput);
+  return title(summary ? `${toolName}: ${summary}` : String(toolName || 'unknown'));
 }
 
 function buildStatusText(toolName, input) {
