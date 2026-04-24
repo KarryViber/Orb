@@ -1492,10 +1492,10 @@ export class Scheduler {
               return;
             }
             const initialChunks = [
-              { type: 'plan_update', title: '思考中...' },
-              { type: 'task_update', id: 'qi-exec', title: '工具执行', status: 'in_progress', details: '' },
-              { type: 'task_update', id: 'qi-other', title: '其他操作', status: 'in_progress', details: '' },
-              { type: 'task_update', id: 'qi-summary', title: '信息整合', status: 'in_progress', details: '' },
+              { type: 'plan_update', title: 'Orbiting...' },
+              { type: 'task_update', id: 'qi-exec', title: 'Probe', status: 'in_progress', details: '' },
+              { type: 'task_update', id: 'qi-other', title: 'Delegate', status: 'in_progress', details: '' },
+              { type: 'task_update', id: 'qi-summary', title: 'Distill', status: 'in_progress', details: '' },
             ];
             turn.qiStartPromise = (async () => {
               try {
@@ -1517,7 +1517,7 @@ export class Scheduler {
 
           if (msg.type === 'qi_append') {
             if (turn.qiStartPromise) await turn.qiStartPromise;
-            const idMap = { '工具执行': 'qi-exec', '其他操作': 'qi-other' };
+            const idMap = { Probe: 'qi-exec', Delegate: 'qi-other' };
             const taskId = idMap[msg.category];
             if (!taskId || !turn.qiStreamId) return;
             const tracked = chainQiAppend(async () => {
@@ -1541,10 +1541,10 @@ export class Scheduler {
             const streamId = turn.qiStreamId;
             try {
               await adapter.appendStream(streamId, [
-                { type: 'plan_update', title: '已完成思考' },
-                { type: 'task_update', id: 'qi-exec', title: '工具执行', status: 'complete' },
-                { type: 'task_update', id: 'qi-other', title: '其他操作', status: 'complete' },
-                { type: 'task_update', id: 'qi-summary', title: '信息整合', status: 'complete', details: `共调用 ${msg.tool_count} 次工具` },
+                { type: 'plan_update', title: 'Settled' },
+                { type: 'task_update', id: 'qi-exec', title: 'Probe', status: 'complete' },
+                { type: 'task_update', id: 'qi-other', title: 'Delegate', status: 'complete' },
+                { type: 'task_update', id: 'qi-summary', title: 'Distill', status: 'complete', details: `Distilled from ${msg.tool_count} probes` },
               ]);
               await adapter.stopStream(streamId);
             } catch (err) {
