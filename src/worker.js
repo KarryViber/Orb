@@ -71,6 +71,8 @@ const DEFAULT_WORKSPACE_ALLOW_RULES = [
 ];
 const TASK_CARD_TOOLS = new Set([
   'TodoWrite', 'Task', 'Agent', 'Skill',
+  'Bash', 'Read', 'Edit', 'Write', 'Grep', 'Glob',
+  'WebFetch', 'WebSearch', 'NotebookEdit',
 ]);
 
 let _activeCli = null;   // reference to active interactive CLI session
@@ -736,7 +738,7 @@ function runClaudeInteractive(args, initialContent, workspace) {
       if (!line.trim()) continue;
       try {
         const parsed = JSON.parse(line);
-        handleStreamMsg(parsed);
+        handleStreamMsg(parsed).catch(() => {});
       } catch {}
     }
   });
@@ -752,7 +754,7 @@ function runClaudeInteractive(args, initialContent, workspace) {
     return false;
   }
 
-  function handleStreamMsg(msg) {
+  async function handleStreamMsg(msg) {
     if (hasAttachmentType(msg, 'max_turns_reached')) {
       turnStopReasonOverride = 'max_turns_reached';
     }
@@ -846,8 +848,8 @@ function runClaudeInteractive(args, initialContent, workspace) {
       const turnText = msg.result || turnBuffer.join('\n');
       if (turnOpen && onTurnEnd) {
         if (nonTodoTaskCardEmittedInTurn) {
-          ipcSend({ type: 'plan_section', title: '信息整合' }).catch(() => {});
-          ipcSend({
+          await ipcSend({ type: 'plan_section', title: '信息整合' }).catch(() => {});
+          await ipcSend({
             type: 'tool_call',
             task_id: 'turn-summary',
             tool_name: 'summary',
@@ -858,7 +860,7 @@ function runClaudeInteractive(args, initialContent, workspace) {
           }).catch(() => {});
         }
         turnOpen = false;
-        onTurnEnd();
+        await onTurnEnd();
       }
 
       // Cancel pending intermediate flush — turn is done, onTurnComplete takes over
