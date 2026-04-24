@@ -7,7 +7,12 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { info, error as logError, warn } from '../log.js';
 import { isSafeUrl } from '../format-utils.js';
-import { buildSendPayloads, categorizeTool } from './slack-format.js';
+import {
+  buildPlanSnapshotRows,
+  buildPlanSnapshotTitle,
+  buildSendPayloads,
+  categorizeTool,
+} from './slack-format.js';
 import { PlatformAdapter } from './interface.js';
 import { downloadAndCacheImage, cleanImageCache, IMAGE_EXTENSIONS } from './image-cache.js';
 
@@ -72,6 +77,31 @@ function makeQiTurnState() {
     failed: false,
     toolCount: 0,
   };
+}
+
+function makePlanTurnState() {
+  return {
+    streamId: null,
+    streamTs: null,
+    startPromise: null,
+    appendPromise: null,
+    failed: false,
+    lastChunks: [],
+  };
+}
+
+function buildPlanSnapshotChunks(todos) {
+  const rows = buildPlanSnapshotRows(todos);
+  if (rows.length === 0) return [];
+  return [
+    { type: 'plan_update', title: buildPlanSnapshotTitle(todos) },
+    ...rows.map((row) => ({
+      type: 'task_update',
+      id: row.task_id,
+      title: row.title,
+      status: row.status,
+    })),
+  ];
 }
 
 export function createSlackQiSubscriber(adapter) {
@@ -164,6 +194,93 @@ export function createSlackQiSubscriber(adapter) {
         warn(TAG, `[qi_subscriber] stop failed: ${err.message}`);
       } finally {
         turns.delete(msg.turnId || 'default');
+      }
+    },
+  };
+}
+
+export function createSlackPlanSubscriber(adapter) {
+  const turns = new Map();
+  const getState = (turnId) => {
+    const key = turnId || 'default';
+    if (!turns.has(key)) turns.set(key, makePlanTurnState());
+    return turns.get(key);
+  };
+
+  const ensureStarted = async (state, ctx, initialChunks) => {
+    if (state.streamId || state.failed) return Boolean(state.streamId);
+    if (state.startPromise) {
+      await state.startPromise;
+      return Boolean(state.streamId);
+    }
+    const channel = ctx?.channel || ctx?.task?.channel;
+    const threadTs = ctx?.effectiveThreadTs || ctx?.threadTs || ctx?.task?.threadTs;
+    if (!channel || !threadTs) return false;
+    state.startPromise = (async () => {
+      try {
+        const stream = await adapter.startStream(channel, threadTs, {
+          task_display_mode: 'plan',
+          initial_chunks: initialChunks,
+          team_id: ctx?.task?.teamId || ctx?.teamId || null,
+        });
+        state.streamId = stream?.stream_id || (stream?.ts ? `${channel}:${stream.ts}` : null);
+        state.streamTs = stream?.ts || null;
+      } catch (err) {
+        state.failed = true;
+        warn(TAG, `[plan_subscriber] start failed: ${err.message}`);
+      } finally {
+        state.startPromise = null;
+      }
+    })();
+    await state.startPromise;
+    return Boolean(state.streamId);
+  };
+
+  const chainAppend = (state, operation) => {
+    const previous = state.appendPromise || Promise.resolve();
+    const next = previous.catch(() => {}).then(operation);
+    state.appendPromise = next.finally(() => {
+      if (state.appendPromise === next) state.appendPromise = null;
+    });
+    return state.appendPromise;
+  };
+
+  return {
+    match: (msg) => msg?.type === 'cc_event' && (msg.eventType === 'tool_use' || msg.eventType === 'result'),
+    async handle(msg, ctx = {}) {
+      const key = msg.turnId || 'default';
+      const state = getState(msg.turnId);
+
+      if (msg.eventType === 'tool_use') {
+        if (msg.payload?.name !== 'TodoWrite' || !Array.isArray(msg.payload?.input?.todos)) return;
+        const chunks = buildPlanSnapshotChunks(msg.payload.input.todos);
+        if (chunks.length === 0) return;
+        state.lastChunks = chunks;
+        const hadStream = Boolean(state.streamId);
+        if (!await ensureStarted(state, ctx, chunks)) return;
+        if (!hadStream) return;
+        await chainAppend(state, async () => {
+          if (!state.streamId) return;
+          await adapter.appendStream(state.streamId, chunks);
+        }).catch((err) => {
+          warn(TAG, `[plan_subscriber] append failed: ${err.message}`);
+        });
+        return;
+      }
+
+      if (state.startPromise) await state.startPromise;
+      if (state.appendPromise) await state.appendPromise.catch(() => {});
+      if (!state.streamId) {
+        turns.delete(key);
+        return;
+      }
+      const streamId = state.streamId;
+      try {
+        await adapter.stopStream(streamId, { chunks: state.lastChunks });
+      } catch (err) {
+        warn(TAG, `[plan_subscriber] stop failed: ${err.message}`);
+      } finally {
+        turns.delete(key);
       }
     },
   };
@@ -1396,6 +1513,10 @@ export class SlackAdapter extends PlatformAdapter {
 
   createQiSubscriber() {
     return createSlackQiSubscriber(this);
+  }
+
+  createPlanSubscriber() {
+    return createSlackPlanSubscriber(this);
   }
 
   // --- Streaming helpers ---

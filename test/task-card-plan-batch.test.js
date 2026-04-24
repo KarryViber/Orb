@@ -10,6 +10,8 @@ import {
 import {
   buildPlanSnapshotRows,
   buildPlanSnapshotTitle,
+} from '../src/adapters/slack-format.js';
+import {
   shouldEmitTaskCardForTool,
 } from '../src/worker.js';
 
