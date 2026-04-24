@@ -35,12 +35,6 @@ import { storeConversation } from './memory.js';
  *     TodoWrite-only full snapshot for plan rendering; rows replace the current
  *     plan-card contents in one scheduler update. override_display_mode lets
  *     TodoWrite snapshots force plan mode after earlier non-TodoWrite cards.
- *   { type: 'qi_start' }  — realtime Qi task-card path:
- *     opens a plan-mode stream shell before non-TodoWrite tool rows append.
- *   { type: 'qi_append', category, line }  — realtime Qi task-card path:
- *     appends a single tool line into the category task_update.
- *   { type: 'qi_finalize', tool_count }  — realtime Qi task-card path:
- *     completes the realtime Qi stream and summary.
  *   { type: 'tool_call', task_id, tool_name, title, details, status?, chunk_type, display_mode? }  — legacy task-card path:
  *     scheduler compatibility handler for incremental task-card tool updates.
  *     TodoWrite synthetic per-todo ids now live inside plan_snapshot.rows[].task_id.
@@ -467,12 +461,6 @@ export function shouldEmitTaskCardForTool(toolName, input, toolUseId = null) {
     : TASK_CARD_TOOLS.has(toolName) && Boolean(toolUseId);
 }
 
-function categorizeTool(toolName) {
-  if (/^(Bash|Read|Edit|Write|Grep|Glob|NotebookEdit|WebFetch|WebSearch|LSP)$/.test(toolName)) return 'Probe';
-  if (/^(Task|Agent|Skill|mcp__)/.test(toolName)) return 'Delegate';
-  return 'Probe';
-}
-
 function tokenizeShellCommand(command) {
   return String(command || '')
     .match(/'[^']*'|"[^"]*"|\S+/g)
@@ -641,9 +629,6 @@ function runClaudeInteractive(args, initialContent, workspace) {
   let taskCardEmittedInTurn = false;
   let taskCardChunkType = 'plan';
   let taskCardDisplayMode = 'timeline';
-  let turnCategoryBuffer = new Map();
-  let qiStreamOpened = false;
-  let qiCategoryLines = new Map();
   let turnStopReasonOverride = null;
   const pendingTaskCards = new Map();
   const inProgressTaskCards = new Map();
@@ -653,9 +638,6 @@ function runClaudeInteractive(args, initialContent, workspace) {
     taskCardEmittedInTurn = false;
     taskCardChunkType = 'plan';
     taskCardDisplayMode = 'timeline';
-    turnCategoryBuffer = new Map();
-    qiStreamOpened = false;
-    qiCategoryLines = new Map();
     turnToolCount = 0;
     turnStopReasonOverride = null;
     pendingTaskCards.clear();
@@ -797,16 +779,6 @@ function runClaudeInteractive(args, initialContent, workspace) {
           }
           if (emitsTaskCard) {
             const title = truncate256(buildToolTitle(block.name, block.input));
-            const category = categorizeTool(block.name);
-            if (!qiStreamOpened) {
-              await ipcSend({ type: 'qi_start' });
-              qiStreamOpened = true;
-            }
-            await ipcSend({ type: 'qi_append', category, line: title });
-            if (!qiCategoryLines.has(category)) qiCategoryLines.set(category, []);
-            qiCategoryLines.get(category).push(title);
-            if (!turnCategoryBuffer.has(category)) turnCategoryBuffer.set(category, []);
-            turnCategoryBuffer.get(category).push(title);
             pendingTaskCards.set(block.id, { toolName: block.name });
             inProgressTaskCards.set(block.id, {
               taskId: block.id,
@@ -852,12 +824,6 @@ function runClaudeInteractive(args, initialContent, workspace) {
         },
       });
       sendCcEvent('result', msg);
-      if (qiStreamOpened) {
-        await ipcSend({
-          type: 'qi_finalize',
-          tool_count: turnToolCount,
-        }).catch(() => {});
-      }
       if (turnOpen && onTurnEnd) {
         turnOpen = false;
         await onTurnEnd();
