@@ -198,15 +198,65 @@ export function buildQiSettledChunks(toolCount = 0, reason = '') {
 
 export async function abandonTurnState({
   turn,
+  adapter,
+  channel,
+  threadTs,
+  canManageThreadStatus = channel != null && threadTs != null && typeof adapter?.setThreadStatus === 'function',
 }) {
   if (!turn || turn.abandoned) return false;
+  const shouldClearThreadStatus = Boolean(turn.typingActive && canManageThreadStatus);
   turn.abandoned = true;
   if (turn.statusRefreshTimer) {
     clearTimeout(turn.statusRefreshTimer);
     turn.statusRefreshTimer = null;
   }
   turn.egress?.reset?.();
+  if (shouldClearThreadStatus) {
+    try {
+      await adapter.setThreadStatus(channel, threadTs, '', null);
+      turn.typingActive = false;
+      turn.pendingThreadStatus = '';
+      turn.pendingStatusLoadingMessages = null;
+    } catch (err) {
+      warn(TAG, `failed to clear abandoned thread status: ${err.message}`);
+    }
+  }
   return true;
+}
+
+export function buildRespawnTaskForInjectFailed({
+  msg,
+  failedTask,
+  task,
+  threadTs,
+  effectiveThreadTs,
+  channel,
+  userId,
+  platform,
+  profile,
+  deferDeliveryUntilResult,
+}) {
+  return {
+    ...(failedTask || {}),
+    userText: msg.userText ?? failedTask?.userText ?? '',
+    fileContent: msg.fileContent ?? failedTask?.fileContent ?? '',
+    imagePaths: Array.isArray(msg.imagePaths)
+      ? msg.imagePaths
+      : (failedTask?.imagePaths || []),
+    threadTs,
+    deliveryThreadTs: failedTask?.deliveryThreadTs === undefined
+      ? effectiveThreadTs
+      : failedTask.deliveryThreadTs,
+    channel,
+    userId,
+    platform,
+    teamId: failedTask?.teamId ?? task.teamId ?? null,
+    threadHistory: failedTask?.threadHistory ?? task.threadHistory,
+    profile: failedTask?.profile ?? profile,
+    maxTurns: failedTask?.maxTurns ?? task.maxTurns ?? null,
+    enableTaskCard: failedTask?.enableTaskCard ?? task.enableTaskCard,
+    deferDeliveryUntilResult: failedTask?.deferDeliveryUntilResult ?? deferDeliveryUntilResult,
+  };
 }
 
 export class EventBus {
@@ -395,7 +445,7 @@ export class Scheduler {
       }
     });
 
-    if (this._permissionApprovalMode !== 'slack') {
+    if (this._permissionApprovalMode === 'auto-allow') {
       info(TAG, `permission auto-allow: thread=${threadTs} tool=${toolName} request=${requestId}`);
       this._resolvePermissionRequest(key, { allow: true, reason: 'auto-allow stub' });
       return;
@@ -407,6 +457,27 @@ export class Scheduler {
         allow: false,
         reason: `permission approval unavailable for platform=${platform} channel=${channel == null ? 'null' : 'set'}`,
       });
+      return;
+    }
+
+    if (adapter?.supportsInteractiveApproval !== true) {
+      const reason = `permission approval unavailable: platform=${platform} does not support interactive approval; use ORB_PERMISSION_APPROVAL_MODE=auto-allow or approve from Slack`;
+      warn(TAG, `permission request denied: ${reason} thread=${threadTs} request=${requestId}`);
+      if (typeof adapter?.sendApproval === 'function') {
+        try {
+          await adapter.sendApproval(channel, threadTs, {
+            kind: 'permission',
+            toolName,
+            toolInput: msg.toolInput,
+            requestId,
+            toolUseId: msg.toolUseId,
+            timeoutMs: PERMISSION_APPROVAL_TIMEOUT_MS,
+          });
+        } catch (err) {
+          warn(TAG, `failed to notify unsupported approval route: ${err.message}`);
+        }
+      }
+      this._resolvePermissionRequest(key, { allow: false, reason });
       return;
     }
 
@@ -818,7 +889,13 @@ export class Scheduler {
       for (const key of [...this._pendingPermissionRequests.keys()]) {
         if (key.startsWith(`${threadTs}:`)) this._pendingPermissionRequests.delete(key);
       }
-      await abandonTurnState({ turn: prevTurn });
+      await abandonTurnState({
+        turn: prevTurn,
+        adapter,
+        channel,
+        threadTs: effectiveThreadTs,
+        canManageThreadStatus: canManageThreadStatus && effectiveThreadTs != null,
+      });
     };
 
     const resetTaskCardState = () => {
@@ -1088,27 +1165,18 @@ export class Scheduler {
             if (activeEntry?.pendingInjects && msg.injectId) {
               activeEntry.pendingInjects.delete(msg.injectId);
             }
-            const respawnTask = {
-              ...(failedTask || {}),
-              userText: msg.userText ?? failedTask?.userText ?? '',
-              fileContent: msg.fileContent ?? failedTask?.fileContent ?? '',
-              imagePaths: Array.isArray(msg.imagePaths)
-                ? msg.imagePaths
-                : (failedTask?.imagePaths || []),
+            const respawnTask = buildRespawnTaskForInjectFailed({
+              msg,
+              failedTask,
+              task,
               threadTs,
-              deliveryThreadTs: failedTask?.deliveryThreadTs === undefined
-                ? effectiveThreadTs
-                : failedTask.deliveryThreadTs,
+              effectiveThreadTs,
               channel,
               userId,
               platform,
-              teamId: failedTask?.teamId ?? task.teamId ?? null,
-              threadHistory: failedTask?.threadHistory ?? task.threadHistory,
-              profile: failedTask?.profile ?? profile,
-              maxTurns: failedTask?.maxTurns ?? task.maxTurns ?? null,
-              enableTaskCard: failedTask?.enableTaskCard ?? task.enableTaskCard,
-              deferDeliveryUntilResult: failedTask?.deferDeliveryUntilResult ?? deferDeliveryUntilResult,
-            };
+              profile,
+              deferDeliveryUntilResult,
+            });
             if (!this.threadQueues.has(threadTs)) this.threadQueues.set(threadTs, []);
             this.threadQueues.get(threadTs).unshift(respawnTask);
             await abandonTurn(turn);
