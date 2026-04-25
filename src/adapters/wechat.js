@@ -23,34 +23,34 @@ const TAG = 'wechat';
 
 // --- iLink API constants ---
 
-const ILINK_BASE_URL = 'https://ilinkai.weixin.qq.com';
-const WECHAT_CDN_BASE_URL = 'https://novac2c.cdn.weixin.qq.com/c2c';
+export const ILINK_BASE_URL = 'https://ilinkai.weixin.qq.com';
+export const WECHAT_CDN_BASE_URL = 'https://novac2c.cdn.weixin.qq.com/c2c';
 const ILINK_APP_ID = 'bot';
 const CHANNEL_VERSION = '2.2.0';
 const ILINK_APP_CLIENT_VERSION = String((2 << 16) | (2 << 8) | 0);
 
 const EP_GET_UPDATES = 'ilink/bot/getupdates';
-const EP_SEND_MESSAGE = 'ilink/bot/sendmessage';
+export const EP_SEND_MESSAGE = 'ilink/bot/sendmessage';
 const EP_SEND_TYPING = 'ilink/bot/sendtyping';
 const EP_GET_CONFIG = 'ilink/bot/getconfig';
-const EP_GET_UPLOAD_URL = 'ilink/bot/getuploadurl';
+export const EP_GET_UPLOAD_URL = 'ilink/bot/getuploadurl';
 
 const LONG_POLL_TIMEOUT_MS = 35_000;
-const API_TIMEOUT_MS = 15_000;
+export const API_TIMEOUT_MS = 15_000;
 const CONFIG_TIMEOUT_MS = 10_000;
-const CDN_UPLOAD_TIMEOUT_MS = 120_000;
-const MAX_UPLOAD_FILE_BYTES = 10 * 1024 * 1024;
+export const CDN_UPLOAD_TIMEOUT_MS = 120_000;
+export const MAX_UPLOAD_FILE_BYTES = 10 * 1024 * 1024;
 
 const MAX_CONSECUTIVE_FAILURES = 3;
 const RETRY_DELAY_MS = 2_000;
 const BACKOFF_DELAY_MS = 30_000;
-const SESSION_EXPIRED_ERRCODE = -14;
+export const SESSION_EXPIRED_ERRCODE = -14;
 
 const ITEM_TEXT = 1;
-const ITEM_IMAGE = 2;
-const MEDIA_IMAGE = 1;
-const MSG_TYPE_BOT = 2;
-const MSG_STATE_FINISH = 2;
+export const ITEM_IMAGE = 2;
+export const MEDIA_IMAGE = 1;
+export const MSG_TYPE_BOT = 2;
+export const MSG_STATE_FINISH = 2;
 
 function formatApprovalPrompt(prompt) {
   if (prompt && typeof prompt === 'object') {
@@ -86,7 +86,7 @@ function credentialDir() {
   return dir;
 }
 
-function loadCredentials(accountId) {
+export function loadCredentials(accountId) {
   const path = join(credentialDir(), `${accountId}.json`);
   if (!existsSync(path)) return null;
   try {
@@ -210,7 +210,7 @@ function buildHeaders(token, bodyStr) {
   return headers;
 }
 
-async function apiPost(baseUrl, endpoint, payload, token, timeoutMs) {
+export async function apiPost(baseUrl, endpoint, payload, token, timeoutMs) {
   const body = JSON.stringify({ ...payload, base_info: { channel_version: CHANNEL_VERSION } });
   const url = `${baseUrl.replace(/\/$/, '')}/${endpoint}`;
   const controller = new AbortController();
@@ -231,7 +231,7 @@ async function apiPost(baseUrl, endpoint, payload, token, timeoutMs) {
   }
 }
 
-async function cdnUpload(uploadUrl, ciphertext) {
+export async function cdnUpload(uploadUrl, ciphertext) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), CDN_UPLOAD_TIMEOUT_MS);
 
@@ -252,23 +252,23 @@ async function cdnUpload(uploadUrl, ciphertext) {
   }
 }
 
-function aesPaddedSize(size) {
+export function aesPaddedSize(size) {
   return Math.ceil((size + 1) / 16) * 16;
 }
 
-function encryptAes128Ecb(plaintext, key) {
+export function encryptAes128Ecb(plaintext, key) {
   const cipher = createCipheriv('aes-128-ecb', key, null);
   cipher.setAutoPadding(true);
   return Buffer.concat([cipher.update(plaintext), cipher.final()]);
 }
 
-function cdnUploadUrl(cdnBaseUrl, uploadParam, filekey) {
+export function cdnUploadUrl(cdnBaseUrl, uploadParam, filekey) {
   const encodedParam = encodeURIComponent(uploadParam);
   const encodedFilekey = encodeURIComponent(filekey);
   return `${cdnBaseUrl.replace(/\/$/, '')}/upload?encrypted_query_param=${encodedParam}&filekey=${encodedFilekey}`;
 }
 
-function detectImageMime(buffer) {
+export function detectImageMime(buffer) {
   if (buffer.length >= 8
     && buffer[0] === 0x89
     && buffer[1] === 0x50
@@ -289,7 +289,7 @@ function detectImageMime(buffer) {
   return '';
 }
 
-function assertOkIlinkResponse(resp, operation) {
+export function assertOkIlinkResponse(resp, operation) {
   const ret = resp?.ret ?? 0;
   const errcode = resp?.errcode ?? 0;
   if (ret !== 0 || errcode !== 0) {
