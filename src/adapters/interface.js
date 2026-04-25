@@ -5,6 +5,17 @@ export class PlatformAdapter {
   async editMessage(channel, ts, text, extra) { throw new Error('not implemented'); }
   async uploadFile(channel, threadTs, filePath, filename) { throw new Error('not implemented'); }
   async setTyping(channel, threadTs, status) { throw new Error('not implemented'); }
+  /**
+   * Set thread/conversation status indicator (typing, "agent is thinking", etc.).
+   * Optional capability — adapters that support presence/typing should override.
+   * @param {string} channel
+   * @param {string|null} threadTs
+   * @param {string} status — non-empty enables, empty/null clears
+   * @param {Array<string>} [loadingMessages] — optional rotating UX hints (Slack-style)
+   */
+  async setThreadStatus(_channel, _threadTs, _status, _loadingMessages) {
+    // Default: no-op for adapters without status support.
+  }
   async sendApproval(channel, threadTs, prompt) { throw new Error('not implemented'); }
   buildPayloads(text) { throw new Error('not implemented'); }
   async cleanupIndicator(channel, threadTs, typingSet, errorMsg) { throw new Error('not implemented'); }
