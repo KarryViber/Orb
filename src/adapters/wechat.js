@@ -46,6 +46,32 @@ const ITEM_TEXT = 1;
 const MSG_TYPE_BOT = 2;
 const MSG_STATE_FINISH = 2;
 
+function formatApprovalPrompt(prompt) {
+  if (prompt && typeof prompt === 'object') {
+    if (prompt.kind === 'permission') {
+      const lines = [
+        `工具: ${prompt.toolName || 'unknown'}`,
+      ];
+      if (prompt.requestId) lines.push(`请求: ${prompt.requestId}`);
+      if (prompt.toolUseId) lines.push(`调用: ${prompt.toolUseId}`);
+      if (prompt.toolInput !== undefined) {
+        try {
+          lines.push(`参数: ${JSON.stringify(prompt.toolInput, null, 2)}`);
+        } catch {
+          lines.push(`参数: ${String(prompt.toolInput)}`);
+        }
+      }
+      return lines.join('\n');
+    }
+    try {
+      return JSON.stringify(prompt, null, 2);
+    } catch {
+      return String(prompt);
+    }
+  }
+  return String(prompt || '');
+}
+
 // --- Credential storage ---
 
 function credentialDir() {
@@ -303,6 +329,10 @@ export class WeChatAdapter extends PlatformAdapter {
     return 'wechat';
   }
 
+  get supportsInteractiveApproval() {
+    return false;
+  }
+
   // --- PlatformAdapter interface ---
 
   async start(onMessage) {
@@ -420,9 +450,16 @@ export class WeChatAdapter extends PlatformAdapter {
   }
 
   async sendApproval(channel, threadTs, prompt) {
-    // WeChat has no interactive buttons — send as text and auto-approve
-    await this.sendReply(channel, threadTs, `[需要审批] ${prompt}\n（WeChat 不支持按钮，自动批准一次）`);
-    return { approved: true, scope: 'once', userId: channel };
+    const mode = process.env.ORB_PERMISSION_APPROVAL_MODE || 'auto-allow';
+    const renderedPrompt = formatApprovalPrompt(prompt);
+    if (mode === 'auto-allow') {
+      await this.sendReply(channel, threadTs, `[需要审批] ${renderedPrompt}\n（当前配置为 auto-allow，自动批准一次）`);
+      return { approved: true, scope: 'once', userId: channel };
+    }
+
+    const reason = 'WeChat 不支持交互式审批；请设置 ORB_PERMISSION_APPROVAL_MODE=auto-allow，或在 Slack 上批准该权限请求。';
+    await this.sendReply(channel, threadTs, `[需要审批] ${renderedPrompt}\n${reason}`);
+    return { approved: false, scope: 'once', userId: channel, reason };
   }
 
   buildPayloads(text) {

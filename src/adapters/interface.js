@@ -29,4 +29,5 @@ export class PlatformAdapter {
 
   get botUserId() { throw new Error('not implemented'); }
   get platform() { return 'unknown'; }
+  get supportsInteractiveApproval() { return false; }
 }

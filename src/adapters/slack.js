@@ -849,6 +849,10 @@ export class SlackAdapter extends PlatformAdapter {
     return 'slack';
   }
 
+  get supportsInteractiveApproval() {
+    return true;
+  }
+
   // --- Dedup ---
 
   _isDuplicate(eventTs) {
