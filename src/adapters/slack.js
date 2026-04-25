@@ -37,6 +37,10 @@ const QI_TASK_IDS = {
 const TEXT_DEBOUNCE_MS = 2000;
 const STATUS_HEARTBEAT_MS = 90_000;
 
+function isSlackSubscriberContext(ctx) {
+  return ctx?.platform == null || ctx.platform === 'slack';
+}
+
 function truncateQiText(text, max = 256) {
   const normalized = String(text || '').replace(/\s+/g, ' ').trim();
   return normalized.length <= max ? normalized : `${normalized.slice(0, max - 1)}…`;
@@ -176,7 +180,8 @@ function createCcSubscriber(adapter, {
   };
 
   return {
-    match: (msg) => msg?.type === 'cc_event' && (msg.eventType === 'tool_use' || msg.eventType === 'result'),
+    match: (msg, ctx) => isSlackSubscriberContext(ctx)
+      && msg?.type === 'cc_event' && (msg.eventType === 'tool_use' || msg.eventType === 'result'),
     async handle(msg, ctx = {}) {
       const key = getTurnKey(msg.turnId);
       const state = getState(msg.turnId);
@@ -320,7 +325,8 @@ export function createSlackTextSubscriber(adapter, { debounceMs = TEXT_DEBOUNCE_
   };
 
   return {
-    match: (msg) => msg?.type === 'cc_event' && (msg.eventType === 'text' || msg.eventType === 'result'),
+    match: (msg, ctx) => isSlackSubscriberContext(ctx)
+      && msg?.type === 'cc_event' && (msg.eventType === 'text' || msg.eventType === 'result'),
     async handle(msg, ctx = {}) {
       const key = getTurnKey(msg.turnId);
       if (msg.eventType === 'result') {
@@ -369,7 +375,8 @@ export function createSlackStatusSubscriber(adapter, { heartbeatMs = STATUS_HEAR
   };
 
   return {
-    match: (msg) => msg?.type === 'cc_event' && (msg.eventType === 'tool_use' || msg.eventType === 'result'),
+    match: (msg, ctx) => isSlackSubscriberContext(ctx)
+      && msg?.type === 'cc_event' && (msg.eventType === 'tool_use' || msg.eventType === 'result'),
     async handle(msg, ctx = {}) {
       const key = getTurnKey(msg.turnId);
       if (msg.eventType === 'result') {
