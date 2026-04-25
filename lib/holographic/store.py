@@ -3,8 +3,10 @@ SQLite-backed fact store with entity resolution and trust scoring.
 Single-user Hermes memory store plugin.
 """
 
+import logging
 import re
 import sqlite3
+import sys
 import threading
 from pathlib import Path
 
@@ -88,6 +90,23 @@ _CONFIDENCE_TRUST = {
     "speculative": 0.2,
 }
 
+logger = logging.getLogger(__name__)
+
+_POLARITY_PAIRS = [
+    ("喜欢", "不喜欢"), ("喜欢", "讨厌"),
+    ("偏好", "不偏好"),
+    ("习惯", "不习惯"),
+    ("用", "不用"), ("采用", "不采用"),
+    ("做", "不做"),
+    ("要", "不要"),
+    ("想", "不想"),
+    ("可以", "不可以"),
+    ("启用", "禁用"), ("开启", "关闭"),
+]
+_GENERIC_NEGATION = re.compile(r"(不|从不|再也不|别|永远不|绝不)")
+_COMMON_PUNCTUATION = re.compile(r"[\s,.;:!?，。；：！？、（）()\[\]{}<>《》\"'`~@#$%^&*_+=|\\/\\-]+")
+_TERM_PATTERN = re.compile(r"[a-z0-9]+|[\u4e00-\u9fff]{2,}")
+
 # Entity extraction patterns
 _RE_CAPITALIZED  = re.compile(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b')
 _RE_DOUBLE_QUOTE = re.compile(r'"([^"]+)"')
@@ -100,6 +119,52 @@ _RE_AKA          = re.compile(
 
 def _clamp_trust(value: float) -> float:
     return max(_TRUST_MIN, min(_TRUST_MAX, value))
+
+
+def _normalize_conflict_text(text: str) -> str:
+    return _COMMON_PUNCTUATION.sub(" ", text.lower()).strip()
+
+
+def _terms(text: str) -> set[str]:
+    return {token for token in _TERM_PATTERN.findall(text) if len(token) >= 2}
+
+
+def _term_overlap(left: str, right: str) -> float:
+    left_terms = _terms(left)
+    right_terms = _terms(right)
+    if not left_terms or not right_terms:
+        return 0.0
+    return len(left_terms & right_terms) / max(len(left_terms), len(right_terms))
+
+
+def _remove_once(text: str, term: str) -> str:
+    return text.replace(term, " ")
+
+
+def _detect_conflict(existing_content: str, incoming_content: str) -> bool:
+    """Detect conservative polarity conflicts between two fact strings."""
+    existing = _normalize_conflict_text(existing_content)
+    incoming = _normalize_conflict_text(incoming_content)
+
+    for positive, negative in _POLARITY_PAIRS:
+        existing_pos = positive in existing
+        existing_neg = negative in existing
+        incoming_pos = positive in incoming
+        incoming_neg = negative in incoming
+
+        if existing_pos and incoming_neg:
+            if _term_overlap(_remove_once(existing, positive), _remove_once(incoming, negative)) >= 0.5:
+                return True
+        if existing_neg and incoming_pos:
+            if _term_overlap(_remove_once(existing, negative), _remove_once(incoming, positive)) >= 0.5:
+                return True
+
+    existing_negated = _GENERIC_NEGATION.search(existing) is not None
+    incoming_negated = _GENERIC_NEGATION.search(incoming) is not None
+    if existing_negated != incoming_negated:
+        return _term_overlap(existing, incoming) >= 0.7
+
+    return False
 
 
 class MemoryStore:
@@ -184,6 +249,46 @@ class MemoryStore:
 
             trust_score = _CONFIDENCE_TRUST.get(confidence, self.default_trust)
 
+            duplicate = self._conn.execute(
+                "SELECT fact_id FROM facts WHERE content = ?", (content,)
+            ).fetchone()
+            if duplicate is not None:
+                return int(duplicate["fact_id"])
+
+            candidates = self._conn.execute(
+                """
+                SELECT fact_id, content, trust_score
+                FROM facts
+                WHERE category = ? AND invalid_at IS NULL
+                ORDER BY updated_at DESC
+                LIMIT 201
+                """,
+                (category,),
+            ).fetchall()
+            if len(candidates) > 200:
+                candidates = candidates[:200]
+
+            losing_conflicts: list[sqlite3.Row] = []
+            for candidate in candidates:
+                if not _detect_conflict(candidate["content"], content):
+                    continue
+                existing_trust = candidate["trust_score"]
+                if trust_score < existing_trust:
+                    return int(candidate["fact_id"])
+                losing_conflicts.append(candidate)
+
+            for loser in losing_conflicts:
+                self._conn.execute(
+                    """
+                    UPDATE facts
+                    SET invalid_at = CURRENT_TIMESTAMP,
+                        trust_score = 0.05,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE fact_id = ?
+                    """,
+                    (loser["fact_id"],),
+                )
+
             try:
                 cur = self._conn.execute(
                     """
@@ -209,6 +314,16 @@ class MemoryStore:
             # Compute HRR vector after entity linking
             self._compute_hrr_vector(fact_id, content)
             self._rebuild_bank(category)
+
+            for loser in losing_conflicts:
+                logger.info(
+                    {
+                        "event": "polarity_conflict",
+                        "winner": fact_id,
+                        "loser": int(loser["fact_id"]),
+                        "category": category,
+                    }
+                )
 
             return fact_id
 
@@ -695,3 +810,37 @@ class MemoryStore:
 
     def __exit__(self, *_: object) -> None:
         self.close()
+
+
+def _run_conflict_smoke_tests() -> int:
+    cases = [
+        ("我喜欢 dark mode", "我不喜欢 dark mode", True),
+        ("我喜欢咖啡", "我不喜欢茶", False),
+        ("以后都用 sonnet", "不用 sonnet", True),
+        ("Karry 偏好简体中文输出", "Karry 偏好简体中文输出", False),
+        ("Connect 接法用方案 1", "Connect 接法用方案 2", False),
+    ]
+    passed = 0
+    failures: list[str] = []
+    for index, (existing, incoming, expected) in enumerate(cases, start=1):
+        actual = _detect_conflict(existing, incoming)
+        if actual == expected:
+            passed += 1
+        else:
+            failures.append(
+                f"case {index} failed: expected {expected}, got {actual} "
+                f"for {existing!r} vs {incoming!r}"
+            )
+
+    if failures:
+        for failure in failures:
+            print(failure)
+        print(f"FAIL: {passed}/{len(cases)}")
+        return 1
+
+    print(f"OK: {passed}/{len(cases)}")
+    return 0
+
+
+if __name__ == "__main__" and len(sys.argv) >= 2 and sys.argv[1] == "test-conflict":
+    raise SystemExit(_run_conflict_smoke_tests())
