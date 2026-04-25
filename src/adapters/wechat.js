@@ -372,7 +372,6 @@ export class WeChatAdapter extends PlatformAdapter {
     if (finalRet !== 0 || finalErr !== 0) {
       throw new Error(`iLink sendmessage ret=${finalRet} errcode=${finalErr} errmsg=${resp?.errmsg || ''}`);
     }
-    info(TAG, `sendReply ok: to=${targetUser.slice(0, 8)} len=${text.length} hasToken=${!!contextToken} ret=${finalRet} errcode=${finalErr} raw=${JSON.stringify(resp).slice(0, 200)}`);
   }
 
   async editMessage() {
