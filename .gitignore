@@ -36,3 +36,6 @@ logs/handlers/
 
 # IDE
 .claude/
+
+# OSS research clones (cloned for adopt-from-external-repo workflows)
+research/
