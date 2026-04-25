@@ -846,6 +846,7 @@ export class Scheduler {
     };
 
     const emitPayload = async (payload) => {
+      info(TAG, `emitPayload: thread=${threadTs} platform=${platform} pendingEdit=${!!pendingEdit} text_preview="${(payload.text || '').slice(0, 60)}" textLen=${payload.text?.length || 0}`);
       const extra = payload.blocks ? { blocks: payload.blocks } : {};
       if (pendingEdit) {
         await adapter.editMessage(channel, pendingEdit, payload.text, extra);
@@ -1122,12 +1123,14 @@ export class Scheduler {
           responded = true;
 
           if (msg.type === 'turn_complete') {
+            info(TAG, `turn_complete trace: thread=${threadTs} msg.text.len=${msg.text?.length || 0} undeliveredText.type=${typeof msg.undeliveredText} undeliveredText.len=${(msg.undeliveredText || '').length} deliveredTexts.count=${(msg.deliveredTexts || []).length} intermediateDeliveredThisTurn=${turn.intermediateDeliveredThisTurn} deferDeliveryUntilResult=${deferDeliveryUntilResult}`);
             finalStopReason = msg.stopReason || finalStopReason;
             await stopTyping();
             let deliveryText = resolveTurnCompleteDeliveryText(msg);
             if (turn.intermediateDeliveredThisTurn && deliveryText) {
               deliveryText = subtractDeliveredText(deliveryText, turn.egress?.deliveredTexts || []);
             }
+            info(TAG, `turn_complete deliveryText: thread=${threadTs} len=${deliveryText.length} trim_empty=${!deliveryText.trim()} preview="${(deliveryText || '').slice(0, 60)}"`);
             const metadataText = typeof msg.text === 'string' ? msg.text : deliveryText;
             // 中间轮次完成 — 优先使用 worker 提供的 undeliveredText，
             // 否则按 deliveredTexts 从完整文本中扣掉已发部分。
@@ -1140,11 +1143,18 @@ export class Scheduler {
               }
               if (deliveryText.trim()) {
                 turnDelivered = true;
-                if (deferDeliveryUntilResult) await deliverDeferredFinalResult(deliveryText);
-                else if (turn.egress.admit(deliveryText, 'final')) {
-                  const payloads = adapter.buildPayloads(deliveryText);
-                  for (const payload of payloads) {
-                    await emitPayload(payload);
+                if (deferDeliveryUntilResult) {
+                  info(TAG, `turn_complete: deferred delivery thread=${threadTs}`);
+                  await deliverDeferredFinalResult(deliveryText);
+                } else {
+                  const admitted = turn.egress.admit(deliveryText, 'final');
+                  info(TAG, `turn_complete: admit=${admitted} thread=${threadTs}`);
+                  if (admitted) {
+                    const payloads = adapter.buildPayloads(deliveryText);
+                    info(TAG, `turn_complete: payloads.count=${payloads.length} thread=${threadTs}`);
+                    for (const payload of payloads) {
+                      await emitPayload(payload);
+                    }
                   }
                 }
               } else if (metadataText?.trim()) {
