@@ -1181,6 +1181,11 @@ export class Scheduler {
             this.threadQueues.get(threadTs).unshift(respawnTask);
             await abandonTurn(turn);
             turn = makeTurnState(turnLog, taskCardConfig);
+            try {
+              activeEntry?.worker?.kill?.('SIGTERM');
+            } catch (err) {
+              warn(TAG, `inject_failed kill worker failed: ${err.message}`);
+            }
             warn(TAG, `inject failed, respawning worker for thread=${threadTs}`);
             return;
           }
