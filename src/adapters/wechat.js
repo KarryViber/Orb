@@ -11,10 +11,10 @@
  * - Credentials persisted to ~/.orb/wechat/
  */
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
-import { randomUUID, randomBytes } from 'node:crypto';
+import { createCipheriv, createHash, randomUUID, randomBytes } from 'node:crypto';
 import { info, error as logError, warn } from '../log.js';
 import { buildSendPayloads } from './wechat-format.js';
 import { PlatformAdapter } from './interface.js';
@@ -24,6 +24,7 @@ const TAG = 'wechat';
 // --- iLink API constants ---
 
 const ILINK_BASE_URL = 'https://ilinkai.weixin.qq.com';
+const WECHAT_CDN_BASE_URL = 'https://novac2c.cdn.weixin.qq.com/c2c';
 const ILINK_APP_ID = 'bot';
 const CHANNEL_VERSION = '2.2.0';
 const ILINK_APP_CLIENT_VERSION = String((2 << 16) | (2 << 8) | 0);
@@ -32,10 +33,13 @@ const EP_GET_UPDATES = 'ilink/bot/getupdates';
 const EP_SEND_MESSAGE = 'ilink/bot/sendmessage';
 const EP_SEND_TYPING = 'ilink/bot/sendtyping';
 const EP_GET_CONFIG = 'ilink/bot/getconfig';
+const EP_GET_UPLOAD_URL = 'ilink/bot/getuploadurl';
 
 const LONG_POLL_TIMEOUT_MS = 35_000;
 const API_TIMEOUT_MS = 15_000;
 const CONFIG_TIMEOUT_MS = 10_000;
+const CDN_UPLOAD_TIMEOUT_MS = 120_000;
+const MAX_UPLOAD_FILE_BYTES = 10 * 1024 * 1024;
 
 const MAX_CONSECUTIVE_FAILURES = 3;
 const RETRY_DELAY_MS = 2_000;
@@ -43,6 +47,8 @@ const BACKOFF_DELAY_MS = 30_000;
 const SESSION_EXPIRED_ERRCODE = -14;
 
 const ITEM_TEXT = 1;
+const ITEM_IMAGE = 2;
+const MEDIA_IMAGE = 1;
 const MSG_TYPE_BOT = 2;
 const MSG_STATE_FINISH = 2;
 
@@ -222,6 +228,72 @@ async function apiPost(baseUrl, endpoint, payload, token, timeoutMs) {
     return JSON.parse(text);
   } finally {
     clearTimeout(timer);
+  }
+}
+
+async function cdnUpload(uploadUrl, ciphertext) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), CDN_UPLOAD_TIMEOUT_MS);
+
+  try {
+    const resp = await fetch(uploadUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: ciphertext,
+      signal: controller.signal,
+    });
+    const text = await resp.text();
+    if (!resp.ok) throw new Error(`CDN upload HTTP ${resp.status}: ${text.slice(0, 200)}`);
+    const encryptedParam = resp.headers.get('x-encrypted-param') || '';
+    if (!encryptedParam) throw new Error(`CDN upload missing x-encrypted-param header: ${text.slice(0, 200)}`);
+    return encryptedParam;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function aesPaddedSize(size) {
+  return Math.ceil((size + 1) / 16) * 16;
+}
+
+function encryptAes128Ecb(plaintext, key) {
+  const cipher = createCipheriv('aes-128-ecb', key, null);
+  cipher.setAutoPadding(true);
+  return Buffer.concat([cipher.update(plaintext), cipher.final()]);
+}
+
+function cdnUploadUrl(cdnBaseUrl, uploadParam, filekey) {
+  const encodedParam = encodeURIComponent(uploadParam);
+  const encodedFilekey = encodeURIComponent(filekey);
+  return `${cdnBaseUrl.replace(/\/$/, '')}/upload?encrypted_query_param=${encodedParam}&filekey=${encodedFilekey}`;
+}
+
+function detectImageMime(buffer) {
+  if (buffer.length >= 8
+    && buffer[0] === 0x89
+    && buffer[1] === 0x50
+    && buffer[2] === 0x4e
+    && buffer[3] === 0x47
+    && buffer[4] === 0x0d
+    && buffer[5] === 0x0a
+    && buffer[6] === 0x1a
+    && buffer[7] === 0x0a) {
+    return 'image/png';
+  }
+  if (buffer.length >= 3
+    && buffer[0] === 0xff
+    && buffer[1] === 0xd8
+    && buffer[2] === 0xff) {
+    return 'image/jpeg';
+  }
+  return '';
+}
+
+function assertOkIlinkResponse(resp, operation) {
+  const ret = resp?.ret ?? 0;
+  const errcode = resp?.errcode ?? 0;
+  if (ret !== 0 || errcode !== 0) {
+    throw new Error(`iLink ${operation} ret=${ret} errcode=${errcode} errmsg=${resp?.errmsg || ''}`);
   }
 }
 
@@ -408,9 +480,94 @@ export class WeChatAdapter extends PlatformAdapter {
     // WeChat doesn't support message editing
   }
 
-  async uploadFile() {
-    // TODO: implement media upload via CDN protocol
-    warn(TAG, 'file upload not yet implemented for WeChat');
+  async uploadFile(channel, threadTs, filePath, filename) {
+    const targetUser = channel || threadTs;
+    if (!targetUser) throw new Error('WeChat uploadFile: missing target user');
+    if (!filePath) throw new Error('WeChat uploadFile: missing file path');
+
+    let stat;
+    try {
+      stat = statSync(filePath);
+    } catch (err) {
+      throw new Error(`WeChat uploadFile: cannot read file ${filePath}: ${err.message}`);
+    }
+    if (!stat.isFile()) throw new Error(`WeChat uploadFile: path is not a file: ${filePath}`);
+    if (stat.size <= 0) throw new Error(`WeChat uploadFile: file is empty: ${filePath}`);
+    if (stat.size > MAX_UPLOAD_FILE_BYTES) {
+      throw new Error(`WeChat uploadFile: file exceeds ${MAX_UPLOAD_FILE_BYTES} bytes: ${filePath}`);
+    }
+
+    const plaintext = readFileSync(filePath);
+    const mime = detectImageMime(plaintext.subarray(0, 16));
+    if (!mime) {
+      throw new Error('WeChat uploadFile: only PNG/JPEG images are supported');
+    }
+
+    const filekey = randomBytes(16).toString('hex');
+    const aesKey = randomBytes(16);
+    const rawfilemd5 = createHash('md5').update(plaintext).digest('hex');
+    const ciphertext = encryptAes128Ecb(plaintext, aesKey);
+
+    const uploadResp = await apiPost(this._baseUrl, EP_GET_UPLOAD_URL, {
+      filekey,
+      media_type: MEDIA_IMAGE,
+      to_user_id: targetUser,
+      rawsize: plaintext.length,
+      rawfilemd5,
+      filesize: aesPaddedSize(plaintext.length),
+      no_need_thumb: true,
+      aeskey: aesKey.toString('hex'),
+    }, this._token, API_TIMEOUT_MS);
+    assertOkIlinkResponse(uploadResp, 'getuploadurl');
+
+    const uploadFullUrl = String(uploadResp.upload_full_url || '');
+    const uploadParam = String(uploadResp.upload_param || '');
+    const uploadUrl = uploadFullUrl || (uploadParam ? cdnUploadUrl(WECHAT_CDN_BASE_URL, uploadParam, filekey) : '');
+    if (!uploadUrl) {
+      throw new Error(`WeChat uploadFile: getuploadurl returned no upload URL: ${JSON.stringify(uploadResp).slice(0, 300)}`);
+    }
+
+    const encryptedQueryParam = await cdnUpload(uploadUrl, ciphertext);
+    const aesKeyForApi = Buffer.from(aesKey.toString('hex'), 'ascii').toString('base64');
+    const clientId = `orb-wx-${randomUUID().replace(/-/g, '')}`;
+    let contextToken = this._tokenStore?.get(targetUser) || null;
+
+    const buildMessage = (token) => {
+      const message = {
+        from_user_id: '',
+        to_user_id: targetUser,
+        client_id: clientId,
+        message_type: MSG_TYPE_BOT,
+        message_state: MSG_STATE_FINISH,
+        item_list: [{
+          type: ITEM_IMAGE,
+          image_item: {
+            media: {
+              encrypt_query_param: encryptedQueryParam,
+              aes_key: aesKeyForApi,
+              encrypt_type: 1,
+            },
+            mid_size: ciphertext.length,
+          },
+        }],
+      };
+      if (token) message.context_token = token;
+      return message;
+    };
+
+    let resp = await apiPost(this._baseUrl, EP_SEND_MESSAGE, { msg: buildMessage(contextToken) }, this._token, API_TIMEOUT_MS);
+    const ret = resp?.ret ?? 0;
+    const errcode = resp?.errcode ?? 0;
+    if ((ret === SESSION_EXPIRED_ERRCODE || errcode === SESSION_EXPIRED_ERRCODE) && contextToken) {
+      warn(TAG, `session expired for ${targetUser.slice(0, 8)}...; retrying image send without context_token`);
+      this._tokenStore?.delete?.(targetUser);
+      contextToken = null;
+      resp = await apiPost(this._baseUrl, EP_SEND_MESSAGE, { msg: buildMessage(null) }, this._token, API_TIMEOUT_MS);
+    }
+    assertOkIlinkResponse(resp, 'sendmessage');
+
+    info(TAG, `uploaded image: ${filename || filePath} (${mime}, ${plaintext.length} bytes)`);
+    return { ts: clientId, filekey };
   }
 
   async setTyping(channel, threadTs, status) {
