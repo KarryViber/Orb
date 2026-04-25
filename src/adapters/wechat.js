@@ -283,6 +283,7 @@ export class WeChatAdapter extends PlatformAdapter {
 
     this._tokenStore = null; // initialized in start()
     this._typingCache = new TypingTicketCache();
+    this._typingFetchInFlight = new Map();
     this._dedup = new MessageDedup();
     this._running = false;
     this._pollTimer = null;
@@ -386,7 +387,24 @@ export class WeChatAdapter extends PlatformAdapter {
   async setTyping(channel, threadTs, status) {
     if (!status) return;
     const userId = channel;
-    const ticket = this._typingCache.get(userId);
+    let ticket = this._typingCache.get(userId);
+    if (!ticket) {
+      const contextToken = this._tokenStore?.get(userId) || null;
+      let timeoutId = null;
+      try {
+        ticket = await Promise.race([
+          this._fetchTypingTicket(userId, contextToken),
+          new Promise((resolve) => {
+            timeoutId = setTimeout(() => resolve(''), 500);
+            if (typeof timeoutId.unref === 'function') timeoutId.unref();
+          }),
+        ]);
+      } catch {
+        ticket = '';
+      } finally {
+        if (timeoutId) clearTimeout(timeoutId);
+      }
+    }
     if (!ticket) return;
     try {
       await apiPost(this._baseUrl, EP_SEND_TYPING, {
@@ -559,15 +577,30 @@ export class WeChatAdapter extends PlatformAdapter {
   }
 
   async _fetchTypingTicket(userId, contextToken) {
-    if (this._typingCache.get(userId)) return;
-    try {
-      const payload = { ilink_user_id: userId };
-      if (contextToken) payload.context_token = contextToken;
-      const response = await apiPost(
-        this._baseUrl, EP_GET_CONFIG, payload, this._token, CONFIG_TIMEOUT_MS,
-      );
-      const ticket = response.typing_ticket || '';
-      if (ticket) this._typingCache.set(userId, ticket);
-    } catch (_) {}
+    const cached = this._typingCache.get(userId);
+    if (cached) return cached;
+    if (this._typingFetchInFlight.has(userId)) {
+      return this._typingFetchInFlight.get(userId);
+    }
+
+    const promise = (async () => {
+      try {
+        const payload = { ilink_user_id: userId };
+        if (contextToken) payload.context_token = contextToken;
+        const response = await apiPost(
+          this._baseUrl, EP_GET_CONFIG, payload, this._token, CONFIG_TIMEOUT_MS,
+        );
+        const ticket = response.typing_ticket || '';
+        if (ticket) this._typingCache.set(userId, ticket);
+        return ticket;
+      } catch (err) {
+        warn(TAG, `fetch typing ticket failed for ${userId.slice(0, 8)}: ${err.message}`);
+        return '';
+      } finally {
+        this._typingFetchInFlight.delete(userId);
+      }
+    })();
+    this._typingFetchInFlight.set(userId, promise);
+    return promise;
   }
 }

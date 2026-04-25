@@ -154,6 +154,23 @@ export function makeTaskCardState({ enabled = false, deferred = false } = {}) {
   };
 }
 
+export async function emitPayloadWithCapabilityFallback({
+  adapter,
+  channel,
+  effectiveThreadTs,
+  payload,
+  pendingEdit,
+  platform,
+}) {
+  const extra = payload.blocks ? { blocks: payload.blocks } : {};
+  if (pendingEdit && typeof adapter.editMessage === 'function' && platform === 'slack') {
+    await adapter.editMessage(channel, pendingEdit, payload.text, extra);
+    return null;
+  }
+  await adapter.sendReply(channel, effectiveThreadTs, payload.text, extra);
+  return null;
+}
+
 function makeTurnState(log, taskCardConfig) {
   return {
     intermediateDeliveredThisTurn: false,
@@ -846,13 +863,14 @@ export class Scheduler {
 
     const emitPayload = async (payload) => {
       info(TAG, `emitPayload: thread=${threadTs} platform=${platform} pendingEdit=${!!pendingEdit} text_preview="${(payload.text || '').slice(0, 60)}" textLen=${payload.text?.length || 0}`);
-      const extra = payload.blocks ? { blocks: payload.blocks } : {};
-      if (pendingEdit) {
-        await adapter.editMessage(channel, pendingEdit, payload.text, extra);
-        pendingEdit = null;
-      } else {
-        await adapter.sendReply(channel, effectiveThreadTs, payload.text, extra);
-      }
+      pendingEdit = await emitPayloadWithCapabilityFallback({
+        adapter,
+        channel,
+        effectiveThreadTs,
+        payload,
+        pendingEdit,
+        platform,
+      });
     };
 
     const deliverDeferredFinalResult = async (text) => {
