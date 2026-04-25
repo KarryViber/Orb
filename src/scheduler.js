@@ -714,7 +714,6 @@ export class Scheduler {
     let completionSettled = false;
     let worker;
     const canManageThreadStatus = !deferDeliveryUntilResult
-      && platform === 'slack'
       && channel != null
       && typeof adapter?.setThreadStatus === 'function';
     const taskCardConfig = {
