@@ -397,6 +397,11 @@ export class WeChatAdapter extends PlatformAdapter {
     } catch (_) {}
   }
 
+  async setThreadStatus(channel, threadTs, status, _loadingMessages) {
+    const enable = !!(status && String(status).trim());
+    await this.setTyping(channel, threadTs, enable);
+  }
+
   async sendApproval(channel, threadTs, prompt) {
     // WeChat has no interactive buttons — send as text and auto-approve
     await this.sendReply(channel, threadTs, `[需要审批] ${prompt}\n（WeChat 不支持按钮，自动批准一次）`);
