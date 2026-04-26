@@ -376,10 +376,11 @@ export function createSlackStatusSubscriber(adapter, { heartbeatMs = STATUS_HEAR
 
   return {
     match: (msg, ctx) => isSlackSubscriberContext(ctx)
-      && msg?.type === 'cc_event' && (msg.eventType === 'tool_use' || msg.eventType === 'result'),
+      && msg?.type === 'cc_event'
+      && (msg.eventType === 'tool_use' || msg.eventType === 'result' || msg.eventType === 'turn_abort'),
     async handle(msg, ctx = {}) {
       const key = getTurnKey(msg.turnId);
-      if (msg.eventType === 'result') {
+      if (msg.eventType === 'result' || msg.eventType === 'turn_abort') {
         await clearState(key, ctx);
         return;
       }

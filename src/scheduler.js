@@ -800,6 +800,7 @@ export class Scheduler {
     let finalStopReason = null;
     let workerFailure = null;
     let completionSettled = false;
+    let currentCcTurnId = null;
     let worker;
     const canManageThreadStatus = !deferDeliveryUntilResult
       && channel != null
@@ -1140,6 +1141,7 @@ export class Scheduler {
           info(TAG, `worker response: type=${msg.type} thread=${threadTs} textLen=${msg.text?.length || 0}`);
 
           if (msg.type === 'cc_event') {
+            currentCcTurnId = msg.turnId || currentCcTurnId;
             try {
               await this._publishWorkerCcEvent(msg, {
                 task,
@@ -1290,6 +1292,29 @@ export class Scheduler {
         onExit: async (code, signal) => {
           await stopTyping();
           await applyThreadStatus('');
+          if (currentCcTurnId) {
+            try {
+              await this._publishWorkerCcEvent({
+                type: 'cc_event',
+                eventType: 'turn_abort',
+                turnId: currentCcTurnId,
+                synthetic: true,
+              }, {
+                task,
+                turn,
+                worker,
+                adapter,
+                channel,
+                threadTs,
+                effectiveThreadTs,
+                platform,
+                deferDeliveryUntilResult,
+                applyThreadStatus,
+              });
+            } catch (err) {
+              warn(TAG, `eventBus turn_abort publish failed: ${err.message}`);
+            }
+          }
           this.activeWorkers.delete(threadTs);
 
           const next = taskQueue.dequeue();
