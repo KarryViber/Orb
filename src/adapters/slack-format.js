@@ -46,7 +46,7 @@ function protectStructuralHeadings(text, headingMarks) {
       continue;
     }
 
-    if ((m = line.match(/^\*(.{1,80})\*$/))) {
+    if ((m = line.match(/^\*([^*].{0,78}[^*])\*$/))) {
       pushHeading(`*${m[1]}*`);
       continue;
     }

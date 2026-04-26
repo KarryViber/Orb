@@ -46,6 +46,16 @@ test('standalone Slack mrkdwn bold remains idempotent', () => {
   assert.equal(markdownToMrkdwn('before\n*xxx*\nafter'), 'before\n*xxx*\nafter');
 });
 
+test('standalone **bold** line still converts to *bold*', () => {
+  assert.equal(markdownToMrkdwn('**要点：**'), '*要点：*');
+  assert.equal(markdownToMrkdwn('**已自动处理：**'), '*已自动处理：*');
+  assert.equal(markdownToMrkdwn('**2 — 建议改走 spec**'), '*2 — 建议改走 spec*');
+});
+
+test('single-char *italic* line is preserved as is', () => {
+  assert.equal(markdownToMrkdwn('*已转换的标题*'), '*已转换的标题*');
+});
+
 test('mixed headings, inline emphasis, code, and list bold convert correctly', () => {
   assert.equal(
     markdownToMrkdwn('## 标题\n正文 **重点** 见 `code`'),
