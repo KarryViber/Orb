@@ -706,13 +706,14 @@ function runClaudeInteractive(args, initialContent, workspace) {
       if (turnText && turnText !== lastTurnText) {
         lastTurnText = turnText;
         if (onTurnComplete) {
+          const undeliveredText = computeUndeliveredTurnText(turnText, accumulatedDelivered, deliveredTexts);
           onTurnComplete({
             text: turnText,
             toolCount: totalToolCount,
             lastTool,
             stopReason: lastStopReason,
             deliveredTexts: [...deliveredTexts],
-            undeliveredText: computeUndeliveredTurnText(turnText, accumulatedDelivered, deliveredTexts),
+            undeliveredText,
           });
         }
       } else if (!lastTurnText && turnText) {

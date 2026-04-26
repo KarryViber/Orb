@@ -308,7 +308,11 @@ export function createSlackTextSubscriber(adapter, { debounceMs = TEXT_DEBOUNCE_
       }
     }
 
-    if (turn?.egress && !turn.egress.admit(text, 'intermediate')) {
+    let admitted = false;
+    if (turn?.egress) {
+      admitted = turn.egress.admit(text, 'intermediate');
+    }
+    if (turn?.egress && !admitted) {
       turn.intermediateDeliveredThisTurn = true;
       return;
     }

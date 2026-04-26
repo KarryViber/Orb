@@ -10,6 +10,22 @@ import { sanitizeErrorText } from './format-utils.js';
 const TAG = 'spawn';
 const WORKER_PATH = join(import.meta.dirname, 'worker.js');
 
+export function createSerializedMessageHandler({ label, onMessage, onToolCall }) {
+  let messageQueue = Promise.resolve();
+
+  return (msg) => {
+    if (msg?.type === 'tool_call') {
+      onToolCall?.();
+    }
+
+    messageQueue = messageQueue
+      .then(() => onMessage(msg))
+      .catch((err) => {
+        logError(TAG, `[${label}] onMessage error type=${msg?.type}: ${err?.stack || err}`);
+      });
+  };
+}
+
 /**
  * Fork a worker process and wire up stdout/stderr logging.
  * Returns { worker, kill } where kill() cleans up the timeout.
@@ -43,13 +59,14 @@ export function spawnWorker({ task, timeout = 600_000, label, onMessage, onExit 
     killTimer.unref(); // #23: don't block process exit
   }, timeout);
 
-  worker.on('message', (msg) => {
-    if (msg?.type === 'tool_call') {
+  worker.on('message', createSerializedMessageHandler({
+    label,
+    onMessage,
+    onToolCall: () => {
       toolCallCount += 1;
       lastToolCallAt = new Date().toISOString();
-    }
-    onMessage(msg);
-  });
+    },
+  }));
 
   worker.on('exit', (code, signal) => {
     clearTimeout(timer);

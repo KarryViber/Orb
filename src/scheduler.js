@@ -1280,7 +1280,8 @@ export class Scheduler {
           if (msg.type === 'turn_complete') {
             finalStopReason = msg.stopReason || finalStopReason;
             await stopTyping();
-            let deliveryText = resolveTurnCompleteDeliveryText(msg);
+            const workerResolvedText = resolveTurnCompleteDeliveryText(msg);
+            let deliveryText = workerResolvedText;
             if (turn.intermediateDeliveredThisTurn && deliveryText) {
               deliveryText = subtractDeliveredText(deliveryText, turn.egress?.deliveredTexts || []);
             }
