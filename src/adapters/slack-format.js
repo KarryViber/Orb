@@ -9,6 +9,54 @@ const FALLBACK_MAX = 180;
  * Headers → 【text】, bold/italic → mrkdwn, links → <url|text>, etc.
  */
 import { splitText } from '../format-utils.js';
+
+function protectStructuralHeadings(text, headingMarks) {
+  const lines = text.split('\n');
+  const out = [];
+
+  const pushHeading = (rendered) => {
+    headingMarks.push(rendered);
+    out.push(`\x00HD${headingMarks.length - 1}\x00`);
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    let m;
+
+    if ((m = line.match(/^#\s+(.+)$/))) {
+      if (out.length > 0 && out[out.length - 1] !== '') out.push('');
+      pushHeading(`【${m[1]}】`);
+      if (i < lines.length - 1 && lines[i + 1] !== '') out.push('');
+      continue;
+    }
+
+    if ((m = line.match(/^##\s+(.+)$/))) {
+      if (out.length > 0 && out[out.length - 1] !== '') out.push('');
+      pushHeading(`*${m[1]}*`);
+      continue;
+    }
+
+    if ((m = line.match(/^###\s+(.+)$/))) {
+      pushHeading(`*${m[1]}*`);
+      continue;
+    }
+
+    if ((m = line.match(/^#{4,6}\s+(.+)$/))) {
+      pushHeading(`_${m[1]}_`);
+      continue;
+    }
+
+    if ((m = line.match(/^\*(.{1,80})\*$/))) {
+      pushHeading(`*${m[1]}*`);
+      continue;
+    }
+
+    out.push(line);
+  }
+
+  return out.join('\n');
+}
+
 export function markdownToMrkdwn(text) {
   if (!text) return '';
 
@@ -40,8 +88,10 @@ export function markdownToMrkdwn(text) {
 
   // ── Phase 1: Structural conversion ──
 
-  // Headers → 【text】 (more visually distinct in Slack than *bold*)
-  result = result.replace(/^#{1,6}\s+(.+)$/gm, '【$1】');
+  // Headers map to distinct Slack visual tiers. Protect generated mrkdwn
+  // markers so the later inline italic pass does not reinterpret them.
+  const headingMarks = [];
+  result = protectStructuralHeadings(result, headingMarks);
 
   // Blockquotes: > text → (indented, Slack supports > natively in mrkdwn)
   // Just ensure single > at line start is preserved (Slack mrkdwn blockquote)
@@ -97,6 +147,9 @@ export function markdownToMrkdwn(text) {
 
   // Strikethrough: ~~text~~ → ~text~
   result = result.replace(/~~(.+?)~~/g, '~$1~');
+
+  // Restore structural headings before protected code/entities are restored.
+  result = result.replace(/\x00HD(\d+)\x00/g, (_, i) => headingMarks[i]);
 
   // ── Phase 3: Links ──
 
