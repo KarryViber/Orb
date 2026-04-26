@@ -14,7 +14,10 @@ import { storeConversation } from './memory.js';
  * Scheduler -> Worker:
  *   { type: 'task', userText, fileContent, imagePaths, threadTs, channel,
  *                   userId, platform, threadHistory, profile, model, effort,
- *                   mode?, priorConversation?, disablePermissionPrompt?, maxTurns? }
+ *                   channelSemantics?, mode?, priorConversation?, disablePermissionPrompt?, maxTurns? }
+ *     - channelSemantics: 'reply' (default) delivers turn text to the thread;
+ *       'silent' suppresses successful worker text delivery in the scheduler;
+ *       'broadcast' is reserved for top-level channel delivery.
  *     - mode: 'skill-review' enters a dedicated branch that requires
  *       priorConversation; context.js injects it as "## 待审查会话".
  *     - priorConversation: [{role: 'user'|'assistant', content: string}, ...]
@@ -23,13 +26,13 @@ import { storeConversation } from './memory.js';
  * Worker -> Scheduler:
  *   { type: 'turn_start', injectId? }  — explicit turn ownership start on task/inject receipt
  *   { type: 'turn_end' }  — explicit turn ownership end when Claude emits result
- *   { type: 'turn_complete', text, toolCount, lastTool, stopReason, deliveredTexts, undeliveredText? }
+ *   { type: 'turn_complete', text, toolCount, lastTool, stopReason, channelSemantics, deliveredTexts, undeliveredText? }
  *     - one Claude turn finished; scheduler may deliver text while keeping the worker alive for injects.
  *   { type: 'cc_event', turnId, eventType, payload }  — raw Claude Code event forwarded to scheduler subscribers
  *   { type: 'inject_failed', injectId?, userText, fileContent?, imagePaths? }  — follow-up inject could not reach CLI;
  *     scheduler should respawn a fresh worker and replay the user payload.
  *   { type: 'error', error, errorContext? }
- *   { type: 'result', text, stopReason?, exitOnly: true, toolCount?, lastTool? }
+ *   { type: 'result', text, stopReason?, channelSemantics, exitOnly: true, toolCount?, lastTool? }
  *     - process-exit completion signal, not a UI stream primitive.
  */
 
@@ -66,6 +69,7 @@ let _currentJobId = null;
 let _currentThreadTs = null;
 let _currentProfileName = null;
 let _currentDataDir = null;
+let _currentChannelSemantics = 'reply';
 // Last full turn text emitted via turn_complete IPC. Exit path compares against
 // exitResult.lastTurnText and suppresses duplicate result text when the
 // scheduler has already handled that turn through turn_complete delivery.
@@ -108,6 +112,7 @@ process.on('message', async (msg) => {
   if (msg.type !== 'task') return;
 
   let { userText, fileContent, imagePaths, threadTs, channel, userId, platform, profile, threadHistory, model, effort, mode, priorConversation, disablePermissionPrompt, maxTurns } = msg;
+  _currentChannelSemantics = normalizeChannelSemantics(msg.channelSemantics);
   _lastEmittedTurnText = null;
   beginCcTurn({
     threadTs,
@@ -122,7 +127,15 @@ process.on('message', async (msg) => {
     const hasCtx = Array.isArray(priorConversation) && priorConversation.length > 0;
     if (!hasCtx) {
       console.error('[worker] skill-review invoked without priorConversation, skipping');
-      try { process.send({ type: 'result', text: '[skipped: no context]', toolCount: 0, exitOnly: true }); } catch {}
+      try {
+        process.send({
+          type: 'result',
+          text: '[skipped: no context]',
+          toolCount: 0,
+          channelSemantics: _currentChannelSemantics,
+          exitOnly: true,
+        });
+      } catch {}
       setImmediate(() => process.exit(0));
       return;
     }
@@ -230,6 +243,7 @@ process.on('message', async (msg) => {
             toolCount: turn.toolCount,
             lastTool: turn.lastTool,
             stopReason: turn.stopReason,
+            channelSemantics: _currentChannelSemantics,
             deliveredTexts: turn.deliveredTexts || [],
             undeliveredText: turn.undeliveredText,
           });
@@ -298,6 +312,7 @@ process.on('message', async (msg) => {
       toolCount: exitResult.toolCount,
       lastTool: exitResult.lastTool,
       stopReason: exitResult.stopReason,
+      channelSemantics: _currentChannelSemantics,
       exitOnly: true,
     });
 
@@ -325,6 +340,10 @@ function truncateText(text, maxChars) {
   const normalized = String(text || '').replace(/\s+\n/g, '\n').trim();
   if (normalized.length <= maxChars) return normalized;
   return `${normalized.slice(0, maxChars - 3)}...`;
+}
+
+function normalizeChannelSemantics(value) {
+  return value === 'silent' || value === 'broadcast' ? value : 'reply';
 }
 
 function beginCcTurn({ threadTs, profileName, dataDir } = {}) {

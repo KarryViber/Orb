@@ -184,6 +184,10 @@ function createCcSubscriber(adapter, {
       && msg?.type === 'cc_event' && (msg.eventType === 'tool_use' || msg.eventType === 'result'),
     async handle(msg, ctx = {}) {
       const key = getTurnKey(msg.turnId);
+      if (ctx?.channelSemantics === 'silent') {
+        turns.delete(key);
+        return;
+      }
       const state = getState(msg.turnId);
       if (msg.eventType === 'tool_use') {
         if (!matchTool(msg, ctx, state)) return;
@@ -281,7 +285,7 @@ export function createSlackTextSubscriber(adapter, { debounceMs = TEXT_DEBOUNCE_
     if (!text) return;
 
     const { ctx } = state;
-    if (ctx?.deferDeliveryUntilResult) return;
+    if (ctx?.deferDeliveryUntilResult || ctx?.channelSemantics === 'silent') return;
     const turn = ctx?.turn;
     const taskCardState = turn?.taskCardState;
     const streamId = taskCardState?.streamId;
@@ -385,7 +389,7 @@ export function createSlackStatusSubscriber(adapter, { heartbeatMs = STATUS_HEAR
         return;
       }
 
-      if (ctx?.deferDeliveryUntilResult) return;
+      if (ctx?.deferDeliveryUntilResult || ctx?.channelSemantics === 'silent') return;
       const state = turns.get(key) || { payload: null, startedAt: 0, timer: null, ctx };
       state.payload = msg.payload || {};
       state.startedAt = Date.now();
@@ -2146,6 +2150,7 @@ export class SlackAdapter extends PlatformAdapter {
           userId: event.user,
           platform: 'slack',
           teamId: event.team || event.team_id || null,
+          channelSemantics: 'silent',
           threadHistory: null,
         };
         this.onMessage(task);

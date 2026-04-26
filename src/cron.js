@@ -359,6 +359,7 @@ export class CronScheduler {
           channel: deliver.channel,
           userId: null,
           platform: deliver.platform,
+          channelSemantics: 'silent',
           threadHistory: null,
           model: job.model || null,
           effort: job.effort || null,
@@ -376,7 +377,12 @@ export class CronScheduler {
         stopReason = result?.stopReason || null;
         deliveredByScheduler = true;
       } else {
-        const result = await this._spawnCronWorker({ ...job, enableTaskCard: nativeTaskCardEnabled, maxTurns: job.maxTurns || null }, paths);
+        const result = await this._spawnCronWorker({
+          ...job,
+          enableTaskCard: nativeTaskCardEnabled,
+          maxTurns: job.maxTurns || null,
+          channelSemantics: 'silent',
+        }, paths);
         responseText = result?.text || '';
         stopReason = result?.stopReason || null;
       }

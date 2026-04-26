@@ -1,6 +1,6 @@
 import { join } from 'node:path';
 import net from 'node:net';
-import { readdirSync, readFileSync, existsSync, statSync, unlinkSync, writeFileSync, mkdirSync } from 'node:fs';
+import { appendFileSync, readdirSync, readFileSync, existsSync, statSync, unlinkSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { info, error as logError, warn } from './log.js';
 import { taskQueue } from './queue.js';
@@ -50,6 +50,7 @@ const PERSISTED_TASK_FIELDS = [
   'priorConversation',
   'deferDeliveryUntilResult',
   'enableTaskCard',
+  'channelSemantics',
 ];
 
 // --- Effort escalation keywords ---
@@ -100,6 +101,32 @@ function sanitizeTaskForPersistence(task) {
 
 function isSilentResultText(text) {
   return typeof text === 'string' && text.startsWith(SILENT_PREFIX);
+}
+
+function normalizeChannelSemantics(value) {
+  return value === 'silent' || value === 'broadcast' ? value : 'reply';
+}
+
+function isSuccessfulStopReason(stopReason) {
+  return !stopReason || stopReason === 'success' || stopReason === 'stop' || stopReason === 'end_turn';
+}
+
+function shouldSuppressForChannelSemantics(channelSemantics, stopReason) {
+  return channelSemantics === 'silent' && isSuccessfulStopReason(stopReason);
+}
+
+function writeSilentReceipt(profile, payload) {
+  try {
+    const dir = join(profile.dataDir, 'silent-suppressed');
+    mkdirSync(dir, { recursive: true });
+    const date = new Date().toISOString().slice(0, 10);
+    appendFileSync(join(dir, `${date}.jsonl`), `${JSON.stringify({
+      ts: new Date().toISOString(),
+      ...payload,
+    })}\n`);
+  } catch (err) {
+    warn(TAG, `failed to write silent receipt: ${err.message}`);
+  }
 }
 
 function getTaskCardStreamErrorCode(err) {
@@ -235,6 +262,7 @@ export function buildRespawnTaskForInjectFailed({
   platform,
   profile,
   deferDeliveryUntilResult,
+  channelSemantics,
 }) {
   return {
     ...(failedTask || {}),
@@ -256,6 +284,7 @@ export function buildRespawnTaskForInjectFailed({
     maxTurns: failedTask?.maxTurns ?? task.maxTurns ?? null,
     enableTaskCard: failedTask?.enableTaskCard ?? task.enableTaskCard,
     deferDeliveryUntilResult: failedTask?.deferDeliveryUntilResult ?? deferDeliveryUntilResult,
+    channelSemantics: normalizeChannelSemantics(failedTask?.channelSemantics ?? task.channelSemantics ?? channelSemantics),
   };
 }
 
@@ -628,6 +657,9 @@ export class Scheduler {
         deliveryThreadTs: task.deliveryThreadTs === undefined
           ? (entry?.deliveryThreadTs ?? threadTs ?? null)
           : task.deliveryThreadTs,
+        channelSemantics: task.channelSemantics === undefined
+          ? normalizeChannelSemantics(entry?.channelSemantics ?? entry?.task?.channelSemantics)
+          : normalizeChannelSemantics(task.channelSemantics),
       };
       if (!entry.pendingInjects) entry.pendingInjects = new Map();
       entry.pendingInjects.set(injectId, injectTask);
@@ -745,6 +777,8 @@ export class Scheduler {
   async _spawnWorker(task) {
     const { userText, fileContent, imagePaths, threadTs, channel, userId, platform } = task;
     const deferDeliveryUntilResult = task.deferDeliveryUntilResult === true;
+    const channelSemantics = normalizeChannelSemantics(task.channelSemantics);
+    task.channelSemantics = channelSemantics;
     const adapter = this._getAdapter(platform);
     if (!adapter && platform !== 'system') {
       logError(TAG, `spawn failed: no adapter for platform=${platform} thread=${threadTs}`);
@@ -825,6 +859,24 @@ export class Scheduler {
       if (completionSettled) return;
       completionSettled = true;
       task._completion?.[method]?.(payload);
+    };
+
+    const suppressSuccessfulText = (phase, text, stopReason, messageChannelSemantics = channelSemantics) => {
+      const effectiveChannelSemantics = normalizeChannelSemantics(messageChannelSemantics);
+      if (!shouldSuppressForChannelSemantics(effectiveChannelSemantics, stopReason)) return false;
+      const textLength = String(text || '').length;
+      writeSilentReceipt(profile, {
+        phase,
+        threadTs,
+        channel,
+        deliveryThreadTs: effectiveThreadTs,
+        platform,
+        channelSemantics: effectiveChannelSemantics,
+        stopReason: stopReason || null,
+        textLength,
+      });
+      info(TAG, `silent ${phase} suppressed: thread=${threadTs} textLen=${textLength}`);
+      return true;
     };
 
     const clearStatusRefresh = (targetTurn = turn) => {
@@ -967,6 +1019,14 @@ export class Scheduler {
       finalStopReason = msg.stopReason || finalStopReason;
 
       try {
+        if (text && suppressSuccessfulText('result', text, msg.stopReason, msg.channelSemantics)) {
+          finalResultText = '';
+          turnDelivered = true;
+          resetTaskCardState();
+          this._autoContinueCount.delete(threadTs);
+          return;
+        }
+
         // Exit signal: empty text after turn_complete delivery is expected and
         // should not enter auto-continue or fallback delivery.
         if (!text && turnDelivered) {
@@ -1019,6 +1079,7 @@ export class Scheduler {
               maxTurns: task.maxTurns || null,
               enableTaskCard: task.enableTaskCard,
               deferDeliveryUntilResult,
+              channelSemantics,
               _autoContinue: true,
               _completion: task._completion,
             };
@@ -1116,6 +1177,7 @@ export class Scheduler {
           userId,
           platform,
           teamId: task.teamId || null,
+          channelSemantics,
           threadHistory: task.threadHistory,
           model: effectiveModel,
           effort: effectiveEffort,
@@ -1153,6 +1215,7 @@ export class Scheduler {
                 effectiveThreadTs,
                 platform,
                 deferDeliveryUntilResult,
+                channelSemantics,
                 applyThreadStatus,
               });
             } catch (err) {
@@ -1178,6 +1241,7 @@ export class Scheduler {
               platform,
               profile,
               deferDeliveryUntilResult,
+              channelSemantics,
             });
             if (!this.threadQueues.has(threadTs)) this.threadQueues.set(threadTs, []);
             this.threadQueues.get(threadTs).unshift(respawnTask);
@@ -1224,6 +1288,11 @@ export class Scheduler {
             // 中间轮次完成 — 优先使用 worker 提供的 undeliveredText，
             // 否则按 deliveredTexts 从完整文本中扣掉已发部分。
             try {
+              if (deliveryText.trim() && suppressSuccessfulText('turn_complete', deliveryText, msg.stopReason, msg.channelSemantics)) {
+                turnDelivered = true;
+                resetTaskCardState();
+                return;
+              }
               if (deferDeliveryUntilResult && isSilentResultText(deliveryText)) {
                 info(TAG, `silent deferred turn suppressed: thread=${threadTs}`);
                 turnDelivered = true;
@@ -1309,6 +1378,7 @@ export class Scheduler {
                 effectiveThreadTs,
                 platform,
                 deferDeliveryUntilResult,
+                channelSemantics,
                 applyThreadStatus,
               });
             } catch (err) {
@@ -1370,6 +1440,7 @@ export class Scheduler {
       channel,
       userId,
       deliveryThreadTs: effectiveThreadTs,
+      channelSemantics,
       pendingInjects: new Map(),
       task: sanitizeTaskForPersistence(task),
     });

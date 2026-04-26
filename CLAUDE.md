@@ -102,6 +102,8 @@ Optional fields:
 - `"effort"`: `"low"` | `"medium"` | `"high"` | `"xhigh"` | `"max"` (Opus defaults xhigh)
 - `"maxTurns"`: positive integer override for Claude CLI `--max-turns`, e.g. `"maxTurns": 60`
 
+Cron workers are dispatched with IPC `channelSemantics: "silent"`, so successful worker text is suppressed by scheduler contract after any target-channel delivery. Worker `error` messages and non-success `result.stopReason` remain deliverable as failure receipts.
+
 Token tier guidelines:
 | Task type | model | effort |
 |-----------|-------|--------|
@@ -152,15 +154,15 @@ Scheduler ↔ Worker communication via Node IPC (process.send/on('message')):
 
 | Direction | Type | Payload | Notes |
 |-----------|------|---------|-------|
-| Scheduler → Worker | `task` | `{ type: 'task', userText, fileContent, imagePaths, threadTs, channel, userId, platform, threadHistory, profile, model, effort, maxTurns?, mode?, priorConversation? }` | Initial task for a thread. `maxTurns` overrides Claude CLI `--max-turns` for that task only. `mode: 'skill-review'` requires `priorConversation`, which `context.js` injects as review context. |
+| Scheduler → Worker | `task` | `{ type: 'task', userText, fileContent, imagePaths, threadTs, channel, userId, platform, threadHistory, profile, model, effort, channelSemantics?, maxTurns?, mode?, priorConversation? }` | Initial task for a thread. `channelSemantics` is `'reply'` (default), `'silent'` (suppress successful worker text delivery), or reserved `'broadcast'`. `maxTurns` overrides Claude CLI `--max-turns` for that task only. `mode: 'skill-review'` requires `priorConversation`, which `context.js` injects as review context. |
 | Scheduler → Worker | `inject` | `{ type: 'inject', injectId?, userText, fileContent?, imagePaths? }` | Injects a follow-up user message into the active same-thread Claude CLI session without spawning a new worker. `injectId` lets the scheduler correlate acceptance/failure for fail-forward replay. When `imagePaths` is present the worker attaches them as image content blocks before sending the turn. |
 | Worker → Scheduler | `turn_start` | `{ type: 'turn_start', injectId? }` | Emitted immediately when the worker receives a `task` or accepted `inject`, making the scheduler the typing owner. On accepted injects the worker echoes `injectId` so the scheduler can clear the pending replay token. |
 | Worker → Scheduler | `turn_end` | `{ type: 'turn_end' }` | Emitted when Claude CLI produces a `result` event for the current turn; scheduler stops typing immediately. |
-| Worker → Scheduler | `turn_complete` | `{ type: 'turn_complete', text, toolCount, lastTool, stopReason, deliveredTexts, undeliveredText? }` | Signals that one Claude turn finished; scheduler can deliver final text while keeping the worker alive for future `inject` messages. |
+| Worker → Scheduler | `turn_complete` | `{ type: 'turn_complete', text, toolCount, lastTool, stopReason, channelSemantics, deliveredTexts, undeliveredText? }` | Signals that one Claude turn finished; scheduler can deliver final text while keeping the worker alive for future `inject` messages. Scheduler drops successful text when `channelSemantics === 'silent'` and records a receipt. |
 | Worker → Scheduler | `cc_event` | `{ type: 'cc_event', turnId, eventType, payload }` | Raw Claude Code event forwarded to scheduler subscribers. Slack Qi, plan, text, and status rendering is driven from this stream. |
 | Worker → Scheduler | `inject_failed` | `{ type: 'inject_failed', injectId?, userText, fileContent?, imagePaths? }` | Follow-up inject could not reach the live CLI session (for example the session already closed). Scheduler must fail forward by replaying that payload through a fresh worker on the same thread. |
 | Worker → Scheduler | `error` | `{ type: 'error', error, errorContext? }` | Terminal failure payload. |
-| Worker → Scheduler | `result` | `{ type: 'result', text, toolCount, lastTool?, stopReason? }` | Worker process-exit completion signal. It remains for lifecycle/auto-continue handling, not Slack UI rendering. |
+| Worker → Scheduler | `result` | `{ type: 'result', text, toolCount, lastTool?, stopReason?, channelSemantics }` | Worker process-exit completion signal. It remains for lifecycle/auto-continue handling, not Slack UI rendering. Scheduler drops successful text when `channelSemantics === 'silent'`; worker `error` and non-success `stopReason` still surface. |
 
 Adding or changing message types/payload fields requires updating `worker.js` header comment, `scheduler.js` handler, and this section together.
 
