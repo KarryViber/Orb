@@ -3,7 +3,7 @@ import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { mkdirSync, copyFileSync, readFileSync, existsSync, rmSync, writeFileSync, readdirSync, appendFileSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
-import { join, dirname, resolve } from 'node:path';
+import { join, dirname, resolve, relative, isAbsolute, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildPrompt } from './context.js';
 import { getSessionId, updateSession } from './session.js';
@@ -67,6 +67,7 @@ const TASK_CARD_TOOLS = new Set([
 ]);
 const GIT_DIFF_TIMEOUT_MS = 2_000;
 const GIT_DIFF_MAX_FILES = 20;
+const FILE_MODIFYING_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
 
 let _activeCli = null;   // reference to active interactive CLI session
 let _currentTurnId = null;
@@ -75,6 +76,7 @@ let _currentThreadTs = null;
 let _currentProfileName = null;
 let _currentDataDir = null;
 let _currentChannelSemantics = 'reply';
+let _currentTurnModifiedPaths = new Set();
 // Last full turn text emitted via turn_complete IPC. Exit path compares against
 // exitResult.lastTurnText and suppresses duplicate result text when the
 // scheduler has already handled that turn through turn_complete delivery.
@@ -257,7 +259,7 @@ process.on('message', async (msg) => {
           finalText: turn.text || turn.undeliveredText || '',
         }).catch((err) => console.warn(`[worker] memory usage record failed: ${err.message}`));
         if (turn.text?.trim()) {
-          const gitDiffSummary = await collectGitDiffSummary(WORKSPACE);
+          const gitDiffSummary = await collectGitDiffSummary(WORKSPACE, _currentTurnModifiedPaths);
           _lastEmittedTurnText = turn.text || turn.undeliveredText || '';
           await ipcSend({
             type: 'turn_complete',
@@ -444,16 +446,57 @@ function parseGitStat(output) {
   return { stats, totals };
 }
 
-async function collectGitDiffSummary(cwd) {
+function normalizeGitRelativePath(filePath) {
+  const normalized = normalize(String(filePath || '').trim()).replace(/\\/g, '/');
+  return normalized === '.' ? '' : normalized.replace(/^\.\//, '');
+}
+
+function normalizeModifiedPath(cwd, filePath) {
+  if (!filePath || typeof filePath !== 'string') return null;
+  const absolutePath = isAbsolute(filePath) ? normalize(filePath) : resolve(cwd, filePath);
+  const relativePath = relative(cwd, absolutePath);
+  if (!relativePath || relativePath.startsWith('..') || isAbsolute(relativePath)) return null;
+  return normalizeGitRelativePath(relativePath);
+}
+
+function normalizeModifiedPathSet(cwd, modifiedPaths) {
+  const normalized = new Set();
+  for (const filePath of modifiedPaths || []) {
+    const relativePath = normalizeModifiedPath(cwd, filePath);
+    if (relativePath) normalized.add(relativePath);
+  }
+  return normalized;
+}
+
+export function recordModifiedPathFromToolUse(toolUse, modifiedPaths = _currentTurnModifiedPaths) {
+  const toolName = toolUse?.name;
+  if (!FILE_MODIFYING_TOOLS.has(toolName)) return false;
+  const input = parseToolInput(toolUse?.input);
+  const filePath = toolName === 'NotebookEdit' ? input?.notebook_path : input?.file_path;
+  if (!filePath || typeof filePath !== 'string') return false;
+  modifiedPaths.add(filePath);
+  return true;
+}
+
+export async function collectGitDiffSummary(cwd, modifiedPaths = new Set()) {
   try {
     if (!cwd || !existsSync(cwd)) return null;
     await runGit(['rev-parse', '--is-inside-work-tree'], cwd);
-    const [statusOutput, statOutput, _cachedStatOutput] = await Promise.all([
-      runGit(['status', '--porcelain'], cwd),
-      runGit(['diff', '--stat', 'HEAD'], cwd),
-      runGit(['diff', '--stat', '--cached', 'HEAD'], cwd),
-    ]);
-    const files = parseGitStatusPorcelain(statusOutput);
+    const normalizedModifiedPaths = normalizeModifiedPathSet(cwd, modifiedPaths);
+    if (normalizedModifiedPaths.size === 0) {
+      return {
+        cwd,
+        hasChanges: false,
+        files: [],
+        totals: { filesChanged: 0, insertions: 0, deletions: 0 },
+        truncated: false,
+      };
+    }
+
+    const statusOutput = await runGit(['status', '--porcelain'], cwd);
+    const files = parseGitStatusPorcelain(statusOutput)
+      .map((file) => ({ ...file, path: normalizeGitRelativePath(file.path) }))
+      .filter((file) => normalizedModifiedPaths.has(file.path));
     const hasChanges = files.length > 0;
     if (!hasChanges) {
       return {
@@ -465,7 +508,17 @@ async function collectGitDiffSummary(cwd) {
       };
     }
 
-    const { stats: statsByPath, totals } = parseGitStat(statOutput);
+    const statOutputs = await Promise.all(files.map((file) => runGit(['diff', '--stat', 'HEAD', '--', file.path], cwd)));
+    const statsByPath = new Map();
+    const totals = { insertions: 0, deletions: 0 };
+    for (const statOutput of statOutputs) {
+      const parsed = parseGitStat(statOutput);
+      totals.insertions += parsed.totals.insertions;
+      totals.deletions += parsed.totals.deletions;
+      for (const [path, stat] of parsed.stats) {
+        statsByPath.set(normalizeGitRelativePath(path), stat);
+      }
+    }
     for (const file of files) {
       const stat = statsByPath.get(file.path);
       if (stat && file.status !== '??') {
@@ -497,6 +550,7 @@ function beginCcTurn({ threadTs, profileName, dataDir } = {}) {
   }
   if (profileName !== undefined) _currentProfileName = profileName || 'default';
   if (dataDir !== undefined) _currentDataDir = dataDir;
+  _currentTurnModifiedPaths.clear();
   _currentTurnId = randomUUID();
 }
 
@@ -850,6 +904,7 @@ function runClaudeInteractive(args, initialContent, workspace) {
           totalToolInputs.push(block.input || {});
           turnToolInputs.push(block.input || {});
           lastTool = block.name || null;
+          recordModifiedPathFromToolUse(block);
           writeCcEvent({
             event_type: 'tool_use',
             payload: {
