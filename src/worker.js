@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { mkdirSync, copyFileSync, readFileSync, existsSync, rmSync, writeFileSync, readdirSync, appendFileSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
@@ -37,6 +38,8 @@ import { storeConversation } from './memory.js';
  */
 
 const CLAUDE_PATH = process.env.CLAUDE_PATH || 'claude';
+const PYTHON = process.env.PYTHON_PATH || 'python3';
+const MEMORY_USAGE_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'lib', 'memory-usage');
 const MAX_TURNS = parseInt(process.env.MAX_TURNS, 10) || 50;
 const DEFAULT_PERMISSION_TIMEOUT_MS = parseInt(process.env.ORB_PERMISSION_TIMEOUT_MS, 10) || 300_000;
 const MCP_PERMISSION_TOOL_NOT_FOUND_RE = /MCP tool mcp__orb_permission__orb_request_permission[\s\S]*not found[\s\S]*Available MCP tools: none/i;
@@ -74,6 +77,7 @@ let _currentChannelSemantics = 'reply';
 // exitResult.lastTurnText and suppresses duplicate result text when the
 // scheduler has already handled that turn through turn_complete delivery.
 let _lastEmittedTurnText = null;
+let _currentMemoryManifest = [];
 
 process.on('message', async (msg) => {
   if (msg.type === 'inject') {
@@ -178,6 +182,13 @@ process.on('message', async (msg) => {
       mode,
       priorConversation,
     });
+    _currentMemoryManifest = Array.isArray(prompt.memoryManifest) ? prompt.memoryManifest : [];
+    recordMemoryInjection({
+      dataDir,
+      threadId: threadTs,
+      turnId: _currentTurnId,
+      items: _currentMemoryManifest,
+    }).catch((err) => console.warn(`[worker] memory injection record failed: ${err.message}`));
     const promptLen = (prompt.systemPrompt?.length || 0) + (prompt.userPrompt?.length || prompt.length || 0);
     console.log(`[worker] prompt built (${promptLen} chars), session=${sessionId || 'new'}`);
     ensureWorkspaceClaudeSettings(WORKSPACE);
@@ -235,6 +246,14 @@ process.on('message', async (msg) => {
 
       // Each turn completed → send to scheduler for delivery
       cli.setOnTurnComplete(async (turn) => {
+        recordMemoryUsage({
+          dataDir,
+          threadId: threadTs,
+          turnId: _currentTurnId,
+          manifest: _currentMemoryManifest,
+          toolInputs: turn.toolInputs || [],
+          finalText: turn.text || turn.undeliveredText || '',
+        }).catch((err) => console.warn(`[worker] memory usage record failed: ${err.message}`));
         if (turn.text?.trim()) {
           _lastEmittedTurnText = turn.text || turn.undeliveredText || '';
           await ipcSend({
@@ -315,6 +334,16 @@ process.on('message', async (msg) => {
       channelSemantics: _currentChannelSemantics,
       exitOnly: true,
     });
+    if (exitText && exitText.trim() !== (_lastEmittedTurnText || '').trim()) {
+      recordMemoryUsage({
+        dataDir,
+        threadId: threadTs,
+        turnId: _currentTurnId,
+        manifest: _currentMemoryManifest,
+        toolInputs: exitResult.toolInputs || [],
+        finalText: exitText,
+      }).catch((err) => console.warn(`[worker] memory usage record failed: ${err.message}`));
+    }
 
     const memDbPath = join(dataDir, 'memory.db');
     storeConversation({ userText, responseText: exitResult.lastTurnText || '', threadTs, userId, dbPath: memDbPath }).catch(() => {});
@@ -358,6 +387,76 @@ function beginCcTurn({ threadTs, profileName, dataDir } = {}) {
 
 function clearCcTurn() {
   _currentTurnId = null;
+}
+
+function runMemoryUsageScript(scriptName, payload) {
+  return new Promise((resolve, reject) => {
+    const child = execFile(
+      PYTHON,
+      [join(MEMORY_USAGE_DIR, scriptName)],
+      { timeout: 10_000, maxBuffer: 256 * 1024 },
+      (err) => {
+        if (err) reject(err);
+        else resolve();
+      },
+    );
+    child.stdin.on('error', reject);
+    child.stdin.end(JSON.stringify(payload));
+  });
+}
+
+async function recordMemoryInjection({ dataDir, threadId, turnId, items }) {
+  if (!dataDir || !Array.isArray(items) || items.length === 0) return;
+  await runMemoryUsageScript('record_injection.py', {
+    db_path: join(dataDir, 'memory-usage.db'),
+    thread_id: threadId || null,
+    turn_id: turnId || null,
+    items,
+  });
+}
+
+function extractUsageEvidence(manifest, toolInputs, finalText) {
+  const items = [];
+  const seen = new Set();
+  const add = (item, evidence) => {
+    const key = `${item.item_kind}:${item.item_id}:${evidence}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    items.push({ ...item, evidence });
+  };
+  const toolText = (toolInputs || []).map((input) => stringifyToolValue(input)).join('\n');
+  const response = String(finalText || '');
+  for (const item of manifest || []) {
+    if (!item?.item_kind || !item?.item_id) continue;
+    const id = String(item.item_id);
+    if (id && toolText.includes(id)) add(item, 'tool_arg');
+    const content = String(item.content || '').replace(/\s+/g, ' ').trim();
+    if (content.length >= 30) {
+      for (let idx = 0; idx + 30 <= content.length; idx += 30) {
+        const slice = content.slice(idx, idx + 30);
+        if (response.includes(slice)) {
+          add(item, 'text_quote');
+          break;
+        }
+      }
+    }
+    const label = id.split('/').filter(Boolean).pop()?.replace(/SKILL\.md$/i, '').replace(/\.md$/i, '') || id;
+    const explicit = new RegExp(`(?:lesson|skill)\\s+${label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}|(?:按|according to).{0,20}${label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'i');
+    if (explicit.test(response)) add(item, 'explicit_ref');
+  }
+  return items;
+}
+
+async function recordMemoryUsage({ dataDir, threadId, turnId, manifest, toolInputs, finalText }) {
+  if (!dataDir || !Array.isArray(manifest) || manifest.length === 0) return;
+  const items = extractUsageEvidence(manifest, toolInputs, finalText);
+  if (items.length === 0) return;
+  await runMemoryUsageScript('record_usage.py', {
+    db_path: join(dataDir, 'memory-usage.db'),
+    thread_id: threadId || null,
+    turn_id: turnId || null,
+    items,
+  });
 }
 
 function todayJstDate() {
@@ -559,6 +658,8 @@ function runClaudeInteractive(args, initialContent, workspace) {
   let turnBuffer = [];
   let totalToolCount = 0;
   let turnToolCount = 0;
+  let totalToolInputs = [];
+  let turnToolInputs = [];
   let lastTool = null;
   let lastStopReason = null;
   let lastSessionId = null;
@@ -581,6 +682,7 @@ function runClaudeInteractive(args, initialContent, workspace) {
     taskCardChunkType = 'plan';
     taskCardDisplayMode = 'timeline';
     turnToolCount = 0;
+    turnToolInputs = [];
     turnStopReasonOverride = null;
     pendingTaskCards.clear();
     inProgressTaskCards.clear();
@@ -630,6 +732,8 @@ function runClaudeInteractive(args, initialContent, workspace) {
         if (block.type === 'tool_use') {
           totalToolCount++;
           turnToolCount++;
+          totalToolInputs.push(block.input || {});
+          turnToolInputs.push(block.input || {});
           lastTool = block.name || null;
           writeCcEvent({
             event_type: 'tool_use',
@@ -714,6 +818,7 @@ function runClaudeInteractive(args, initialContent, workspace) {
             stopReason: lastStopReason,
             deliveredTexts: [...deliveredTexts],
             undeliveredText,
+            toolInputs: [...turnToolInputs],
           });
         }
       } else if (!lastTurnText && turnText) {
@@ -771,6 +876,7 @@ function runClaudeInteractive(args, initialContent, workspace) {
         stderr: Buffer.concat(errChunks).toString(),
         sessionId: lastSessionId,
         toolCount: totalToolCount,
+        toolInputs: [...totalToolInputs],
         lastTool,
         stopReason: turnStopReasonOverride || lastStopReason,
         lastTurnText,

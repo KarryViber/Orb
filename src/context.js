@@ -1,4 +1,5 @@
-import { readFileSync, existsSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { readFileSync, existsSync, readdirSync } from 'node:fs';
 import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { recallMemory, searchDocs } from './memory.js';
@@ -6,6 +7,38 @@ import { warn } from './log.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const TAG = 'context';
+
+function sha16(value) {
+  return createHash('sha256').update(String(value || '')).digest('hex').slice(0, 16);
+}
+
+function snippet(value, max = 1200) {
+  return String(value || '').replace(/\s+/g, ' ').trim().slice(0, max);
+}
+
+function memoryManifestItem(kind, itemId, content) {
+  return {
+    item_kind: kind,
+    item_id: String(itemId || ''),
+    content: snippet(content),
+    content_hash: sha16(content || itemId),
+  };
+}
+
+function walkSkillDirs(skillsDir) {
+  if (!existsSync(skillsDir)) return [];
+  const out = [];
+  for (const entry of readdirSync(skillsDir, { withFileTypes: true })) {
+    if (!entry.isDirectory() || entry.name.startsWith('_archive')) continue;
+    const skillPath = join(skillsDir, entry.name, 'SKILL.md');
+    if (!existsSync(skillPath)) continue;
+    try {
+      const body = readFileSync(skillPath, 'utf-8');
+      out.push(memoryManifestItem('skill', skillPath, body));
+    } catch {}
+  }
+  return out;
+}
 
 export function encodeCwd(cwd) {
   if (typeof cwd !== 'string' || cwd.length === 0) {
@@ -133,6 +166,7 @@ function inferSlugFromThread(threadHistory) {
 export async function buildPrompt({ userText, fileContent, threadTs, userId, channel, scriptsDir, threadHistory, dataDir, mode, priorConversation }) {
   const systemParts = [];
   const userParts = [];
+  const memoryManifest = [];
 
   if (!dataDir) throw new Error('context.js: profile.dataDir missing — upstream bug');
 
@@ -181,6 +215,11 @@ export async function buildPrompt({ userText, fileContent, threadTs, userId, cha
       })
       .join('\n');
     userParts.push(`## 相关上下文\n${memoryBlock}`);
+    for (const m of memories) {
+      const itemKind = m.category === 'lesson' ? 'lesson' : 'fact';
+      const itemId = m.path || m.file || m.fact_id || m.id || sha16(m.content);
+      memoryManifest.push(memoryManifestItem(itemKind, itemId, m.content));
+    }
   }
 
   if (docs.length > 0) {
@@ -188,6 +227,15 @@ export async function buildPrompt({ userText, fileContent, threadTs, userId, cha
       .map((d) => `- [${d.slug}/${d.doc_type}] ${d.title} §${d.section}\n  ${d.snippet || d.content || ''}`)
       .join('\n');
     userParts.push(`## 相关文档\n${docBlock}`);
+    for (const d of docs) {
+      const itemId = [d.slug, d.doc_type, d.path || d.title, d.section].filter(Boolean).join('#');
+      memoryManifest.push(memoryManifestItem('doc', itemId, d.snippet || d.content || d.title));
+    }
+  }
+
+  const workspaceDir = scriptsDir ? dirname(scriptsDir) : null;
+  if (workspaceDir) {
+    memoryManifest.push(...walkSkillDirs(join(workspaceDir, '.claude', 'skills')));
   }
 
   // Skill-review mode: inject the just-completed turn as explicit context,
@@ -218,5 +266,6 @@ export async function buildPrompt({ userText, fileContent, threadTs, userId, cha
   return {
     systemPrompt: systemParts.join('\n\n---\n\n'),
     userPrompt: userParts.join('\n\n---\n\n'),
+    memoryManifest,
   };
 }
