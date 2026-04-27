@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   createSlackQiSubscriber,
   createSlackStatusSubscriber,
+  SlackAdapter,
 } from '../src/adapters/slack.js';
 import {
   EventBus,
@@ -120,4 +121,35 @@ test('new turns allocate distinct Slack streams', async () => {
 
   assert.deepEqual(streamIds, ['stream-1', 'stream-2']);
   assert.deepEqual(stopped, ['stream-1', 'stream-2']);
+});
+
+test('thread history keeps emoji-prefixed bot messages when blocks contain content', async () => {
+  const adapter = new SlackAdapter({ botToken: 'xoxb-test', appToken: 'xapp-test' });
+  adapter._slack = {
+    conversations: {
+      async replies() {
+        return {
+          messages: [
+            {
+              bot_id: 'B1',
+              text: ':bar_chart: 持仓日检',
+              blocks: [
+                { type: 'header', text: { type: 'plain_text', text: ':bar_chart: 持仓日检' } },
+                { type: 'section', text: { type: 'mrkdwn', text: '*建议*\n执行减仓并记录原因' } },
+              ],
+            },
+            { bot_id: 'B1', text: ':white_check_mark:' },
+            { user: 'U1', text: '执行下建议的操作' },
+          ],
+        };
+      },
+    },
+  };
+  adapter._resolveUserName = async () => 'Karry';
+
+  const history = await adapter.fetchThreadHistory('111.222', 'C1', { bypassCache: true });
+
+  assert.match(history, /Orb: :bar_chart: 持仓日检\n\*建议\*\n执行减仓并记录原因/);
+  assert.doesNotMatch(history, /white_check_mark/);
+  assert.doesNotMatch(history, /执行下建议的操作/);
 });

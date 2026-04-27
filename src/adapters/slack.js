@@ -1046,8 +1046,6 @@ export class SlackAdapter extends PlatformAdapter {
     let totalChars = 0;
 
     for (const msg of messages) {
-      if (msg.bot_id && /^:[a-z_]+:/.test(msg.text || '')) continue;
-
       let role;
       if (msg.bot_id) {
         role = 'Orb';
@@ -1063,6 +1061,12 @@ export class SlackAdapter extends PlatformAdapter {
         const blockText = extractBlockKitText(msg.blocks);
         if (blockText.length > text.length) text = blockText;
       }
+
+      if (msg.bot_id) {
+        const stripped = text.replace(/:[a-z0-9_+-]+:/gi, '').trim();
+        if (!stripped) continue;
+      }
+
       text = text.slice(0, 2000);
       const line = `${role}: ${text}`;
 
