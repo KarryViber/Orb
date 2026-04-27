@@ -1338,7 +1338,7 @@ export class Scheduler {
                 turnDelivered = true;
                 if (deferDeliveryUntilResult) await deliverDeferredFinalResult(deliveryText);
                 else if (turn.egress.admit(deliveryText, 'final')) {
-                  const payloads = adapter.buildPayloads(deliveryText);
+                  const payloads = adapter.buildPayloads(deliveryText, { gitDiffSummary: msg.gitDiffSummary });
                   for (const payload of payloads) {
                     await emitPayload(payload);
                   }
@@ -1346,6 +1346,13 @@ export class Scheduler {
               } else if (metadataText?.trim()) {
                 turnDelivered = true;
                 info(TAG, `turn_complete diff empty after dedupe, skip sendReply`);
+                // Even when text was streamed, still surface git diff summary as a tail block.
+                if (msg.gitDiffSummary?.hasChanges) {
+                  const diffPayloads = adapter.buildPayloads('', { gitDiffSummary: msg.gitDiffSummary });
+                  for (const payload of diffPayloads) {
+                    await emitPayload(payload);
+                  }
+                }
               }
               await updateThreadMetadata(metadataText);
               resetTaskCardState();
@@ -1360,7 +1367,7 @@ export class Scheduler {
                 turnDelivered = true;
                 if (deferDeliveryUntilResult) await deliverDeferredFinalResult(fallbackText);
                 else if (turn.egress.admit(fallbackText, 'fallback')) {
-                  const payloads = adapter.buildPayloads(fallbackText);
+                  const payloads = adapter.buildPayloads(fallbackText, { gitDiffSummary: msg.gitDiffSummary });
                   for (const payload of payloads) {
                     await emitPayload(payload);
                   }
@@ -1368,6 +1375,13 @@ export class Scheduler {
               } else if (metadataText?.trim()) {
                 turnDelivered = true;
                 info(TAG, `turn_complete fallback diff empty after dedupe, skip sendReply`);
+                // Even when text was streamed, still surface git diff summary as a tail block.
+                if (msg.gitDiffSummary?.hasChanges) {
+                  const diffPayloads = adapter.buildPayloads('', { gitDiffSummary: msg.gitDiffSummary });
+                  for (const payload of diffPayloads) {
+                    await emitPayload(payload);
+                  }
+                }
               }
               if (!silentDeferredFallback) await updateThreadMetadata(metadataText);
               resetTaskCardState();

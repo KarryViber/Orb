@@ -534,6 +534,49 @@ function buildBlockGroups(blocks) {
   return groups;
 }
 
+function formatDiffCount(value, prefix) {
+  const n = Number(value) || 0;
+  return `${prefix}${n}`;
+}
+
+function formatGitDiffFileLine(file) {
+  const status = String(file?.status || '').trim() || '?';
+  const path = String(file?.path || '').trim();
+  if (!path) return null;
+  const added = Number(file?.linesAdded) || 0;
+  const deleted = Number(file?.linesDeleted) || 0;
+  const lineStats = added || deleted ? ` (${formatDiffCount(added, '+')} ${formatDiffCount(deleted, '-')})` : '';
+  return `• \`${status}\` ${path}${lineStats}`;
+}
+
+export function formatGitDiffSummary(summary) {
+  if (!summary?.hasChanges) return '';
+  const totals = summary.totals || {};
+  const filesChanged = Number(totals.filesChanged) || (Array.isArray(summary.files) ? summary.files.length : 0);
+  const insertions = Number(totals.insertions) || 0;
+  const deletions = Number(totals.deletions) || 0;
+  const lines = [
+    `📝 *改动* ${filesChanged} files (${formatDiffCount(insertions, '+')} ${formatDiffCount(deletions, '-')})`,
+  ];
+  for (const file of Array.isArray(summary.files) ? summary.files : []) {
+    const line = formatGitDiffFileLine(file);
+    if (line) lines.push(line);
+  }
+  if (summary.truncated) {
+    const remaining = Math.max(0, filesChanged - (Array.isArray(summary.files) ? summary.files.length : 0));
+    lines.push(remaining > 0
+      ? `_…还有 ${remaining} 个文件，详见 VS Code Source Control_`
+      : `_…还有更多文件，详见 VS Code Source Control_`);
+  }
+  return lines.join('\n');
+}
+
+function appendGitDiffSummary(text, summary) {
+  const diffText = formatGitDiffSummary(summary);
+  if (!diffText) return text;
+  return `${text || ''}\n\n${diffText}`;
+}
+
 // --- Public API ---
 
 /**
@@ -543,17 +586,33 @@ function buildBlockGroups(blocks) {
  * Always returns an array. Each element is one Slack message.
  * If blocks present: send as Block Kit. Otherwise: plain text.
  */
-export function buildSendPayloads(text) {
-  if (!text) return [{ text: '(无回复)' }];
+export function buildSendPayloads(text, options = {}) {
+  const gitDiffSummary = options?.gitDiffSummary;
+  const diffOnly = !text && gitDiffSummary?.hasChanges;
+  if (!text && !diffOnly) return [{ text: '(无回复)' }];
+  if (diffOnly) {
+    const diffText = formatGitDiffSummary(gitDiffSummary);
+    return [{ text: markdownToMrkdwn(diffText) }];
+  }
+  const textWithDiff = appendGitDiffSummary(text, gitDiffSummary);
 
   // Agent explicitly output Block Kit JSON
   const explicit = parseBlockKit(text);
-  if (explicit) return [{ blocks: explicit.blocks, text: explicit.text }];
+  if (explicit) {
+    const diffText = formatGitDiffSummary(gitDiffSummary);
+    if (diffText) {
+      explicit.blocks.push({
+        type: 'section',
+        text: { type: 'mrkdwn', text: markdownToMrkdwn(diffText) },
+      });
+    }
+    return [{ blocks: explicit.blocks, text: explicit.text }];
+  }
 
   // Extract markdown tables BEFORE mrkdwn conversion (preserves raw markdown)
   const tableBlocks = [];
   const TABLE_RE = /^(\|.+\|)\n\|[-| :]+\|\n((?:\|.+\|\n?)*)/gm;
-  const withPlaceholders = text.replace(TABLE_RE, (match) => {
+  const withPlaceholders = textWithDiff.replace(TABLE_RE, (match) => {
     const block = markdownTableToBlock(match);
     if (block) {
       tableBlocks.push(block);

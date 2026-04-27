@@ -1954,8 +1954,8 @@ export class SlackAdapter extends PlatformAdapter {
     await this.setThreadStatus(channel, threadTs, status);
   }
 
-  buildPayloads(text) {
-    return buildSendPayloads(text);
+  buildPayloads(text, options = {}) {
+    return buildSendPayloads(text, options);
   }
 
   async cleanupIndicator(channel, threadTs, typingSet, errorMsg) {

@@ -27,7 +27,7 @@ import { storeConversation } from './memory.js';
  * Worker -> Scheduler:
  *   { type: 'turn_start', injectId? }  — explicit turn ownership start on task/inject receipt
  *   { type: 'turn_end' }  — explicit turn ownership end when Claude emits result
- *   { type: 'turn_complete', text, toolCount, lastTool, stopReason, channelSemantics, deliveredTexts, undeliveredText? }
+ *   { type: 'turn_complete', text, toolCount, lastTool, stopReason, channelSemantics, deliveredTexts, undeliveredText?, gitDiffSummary? }
  *     - one Claude turn finished; scheduler may deliver text while keeping the worker alive for injects.
  *   { type: 'cc_event', turnId, eventType, payload }  — raw Claude Code event forwarded to scheduler subscribers
  *   { type: 'inject_failed', injectId?, userText, fileContent?, imagePaths? }  — follow-up inject could not reach CLI;
@@ -65,6 +65,8 @@ const TASK_CARD_TOOLS = new Set([
   'Bash', 'Read', 'Edit', 'Write', 'Grep', 'Glob',
   'WebFetch', 'WebSearch', 'NotebookEdit',
 ]);
+const GIT_DIFF_TIMEOUT_MS = 2_000;
+const GIT_DIFF_MAX_FILES = 20;
 
 let _activeCli = null;   // reference to active interactive CLI session
 let _currentTurnId = null;
@@ -255,6 +257,7 @@ process.on('message', async (msg) => {
           finalText: turn.text || turn.undeliveredText || '',
         }).catch((err) => console.warn(`[worker] memory usage record failed: ${err.message}`));
         if (turn.text?.trim()) {
+          const gitDiffSummary = await collectGitDiffSummary(WORKSPACE);
           _lastEmittedTurnText = turn.text || turn.undeliveredText || '';
           await ipcSend({
             type: 'turn_complete',
@@ -265,6 +268,7 @@ process.on('message', async (msg) => {
             channelSemantics: _currentChannelSemantics,
             deliveredTexts: turn.deliveredTexts || [],
             undeliveredText: turn.undeliveredText,
+            gitDiffSummary,
           });
         }
       });
@@ -373,6 +377,117 @@ function truncateText(text, maxChars) {
 
 function normalizeChannelSemantics(value) {
   return value === 'silent' || value === 'broadcast' ? value : 'reply';
+}
+
+function runGit(args, cwd) {
+  return new Promise((resolve, reject) => {
+    execFile(
+      'git',
+      args,
+      { cwd, timeout: GIT_DIFF_TIMEOUT_MS, maxBuffer: 256 * 1024 },
+      (err, stdout) => {
+        if (err) reject(err);
+        else resolve(String(stdout || ''));
+      },
+    );
+  });
+}
+
+function parseGitStatusPorcelain(output) {
+  const files = [];
+  for (const line of String(output || '').split('\n')) {
+    if (!line) continue;
+    const status = line.slice(0, 2);
+    const rawPath = line.slice(3);
+    const renameIndex = rawPath.indexOf(' -> ');
+    files.push({
+      path: renameIndex >= 0 ? rawPath.slice(renameIndex + 4) : rawPath,
+      status: status.trim() || status,
+      linesAdded: 0,
+      linesDeleted: 0,
+    });
+  }
+  return files;
+}
+
+function normalizeStatPath(rawPath) {
+  const path = String(rawPath || '').trim();
+  if (!path.includes(' => ')) return path;
+  const collapsed = path.replace(/[{}]/g, '');
+  const parts = collapsed.split(' => ');
+  return parts[parts.length - 1].trim();
+}
+
+function parseGitStat(output) {
+  const stats = new Map();
+  const totals = { insertions: 0, deletions: 0 };
+  for (const line of String(output || '').split('\n')) {
+    if (!line) continue;
+    const totalMatch = line.match(/(\d+)\s+insertion(?:s)?\(\+\)/);
+    const deleteMatch = line.match(/(\d+)\s+deletion(?:s)?\(-\)/);
+    if (totalMatch || deleteMatch) {
+      totals.insertions = totalMatch ? Number.parseInt(totalMatch[1], 10) : 0;
+      totals.deletions = deleteMatch ? Number.parseInt(deleteMatch[1], 10) : 0;
+      continue;
+    }
+    const pipeIndex = line.indexOf('|');
+    if (pipeIndex < 0) continue;
+    const path = normalizeStatPath(line.slice(0, pipeIndex));
+    const graph = line.slice(pipeIndex + 1);
+    const added = (graph.match(/\+/g) || []).length;
+    const deleted = (graph.match(/-/g) || []).length;
+    stats.set(path, {
+      linesAdded: added,
+      linesDeleted: deleted,
+    });
+  }
+  return { stats, totals };
+}
+
+async function collectGitDiffSummary(cwd) {
+  try {
+    if (!cwd || !existsSync(cwd)) return null;
+    await runGit(['rev-parse', '--is-inside-work-tree'], cwd);
+    const [statusOutput, statOutput, _cachedStatOutput] = await Promise.all([
+      runGit(['status', '--porcelain'], cwd),
+      runGit(['diff', '--stat', 'HEAD'], cwd),
+      runGit(['diff', '--stat', '--cached', 'HEAD'], cwd),
+    ]);
+    const files = parseGitStatusPorcelain(statusOutput);
+    const hasChanges = files.length > 0;
+    if (!hasChanges) {
+      return {
+        cwd,
+        hasChanges: false,
+        files: [],
+        totals: { filesChanged: 0, insertions: 0, deletions: 0 },
+        truncated: false,
+      };
+    }
+
+    const { stats: statsByPath, totals } = parseGitStat(statOutput);
+    for (const file of files) {
+      const stat = statsByPath.get(file.path);
+      if (stat && file.status !== '??') {
+        file.linesAdded = stat.linesAdded;
+        file.linesDeleted = stat.linesDeleted;
+      }
+    }
+
+    return {
+      cwd,
+      hasChanges,
+      files: files.slice(0, GIT_DIFF_MAX_FILES),
+      totals: {
+        filesChanged: files.length,
+        insertions: totals.insertions,
+        deletions: totals.deletions,
+      },
+      truncated: files.length > GIT_DIFF_MAX_FILES,
+    };
+  } catch (_) {
+    return null;
+  }
 }
 
 function beginCcTurn({ threadTs, profileName, dataDir } = {}) {
