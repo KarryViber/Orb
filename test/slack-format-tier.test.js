@@ -52,6 +52,17 @@ test('standalone **bold** line still converts to *bold*', () => {
   assert.equal(markdownToMrkdwn('**2 — 建议改走 spec**'), '*2 — 建议改走 spec*');
 });
 
+test('input ZWSP from prior round-trip is stripped before conversion', () => {
+  assert.equal(markdownToMrkdwn('**Phase 2*\u200b*'), '*Phase 2*');
+  assert.equal(markdownToMrkdwn('*\u200b*Phase 2*\u200b*'), '*Phase 2*');
+  assert.equal(markdownToMrkdwn('正文 \u200b*重点*\u200b 见'), '正文 *重点* 见');
+});
+
+test('idempotency: re-converting Slack mrkdwn output stays stable', () => {
+  const once = markdownToMrkdwn('**清理范围**');
+  assert.equal(markdownToMrkdwn(once), once);
+});
+
 test('single-char *italic* line is preserved as is', () => {
   assert.equal(markdownToMrkdwn('*已转换的标题*'), '*已转换的标题*');
 });

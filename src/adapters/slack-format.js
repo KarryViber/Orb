@@ -61,6 +61,7 @@ export function markdownToMrkdwn(text) {
   if (!text) return '';
 
   let result = text;
+  result = result.replace(/\u200b/g, '');
 
   // ── Phase 0: Protect non-convertible tokens ──
 
