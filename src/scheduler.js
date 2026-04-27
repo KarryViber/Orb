@@ -10,6 +10,8 @@ import { spawnWorker } from './spawn.js';
 import { getDefaults } from './config.js';
 import { EgressGate } from './egress.js';
 import { extractSuggestedPrompts } from './adapters/slack-format.js';
+import { writeLessonCandidate, isUserCorrectionText } from './lesson-candidates.js';
+import { assessSkillReviewTrigger } from './skill-review-trigger.js';
 const TAG = 'scheduler';
 const DRAIN_TIMEOUT = 30_000;
 const SKILL_REVIEW_THRESHOLD = 10;   // cumulative tool uses before triggering review
@@ -835,6 +837,8 @@ export class Scheduler {
     let workerFailure = null;
     let completionSettled = false;
     let currentCcTurnId = null;
+    const toolHistory = [];
+    const toolResults = [];
     let worker;
     const canManageThreadStatus = !deferDeliveryUntilResult
       && channel != null
@@ -1152,6 +1156,17 @@ export class Scheduler {
             userId,
             dbPath: join(profile.dataDir, 'memory.db'),
           }).catch(() => {});
+          try {
+            writeLessonCandidate(profile.dataDir, {
+              source: 'user-correction',
+              stopReason: 'user correction keyword',
+              errorContext: String(task.userText || '').slice(0, 500),
+              threadId: threadTs,
+              kind: 'user',
+            });
+          } catch (candidateErr) {
+            warn(TAG, `failed to write user-correction lesson candidate: ${candidateErr.message}`);
+          }
         }
       } catch (err) {
         const errCode = typeof getTaskCardStreamErrorCode === 'function' ? getTaskCardStreamErrorCode(err) : null;
@@ -1160,7 +1175,7 @@ export class Scheduler {
       }
 
       if (msg.toolCount > 0) {
-        try { this._checkSkillReview(profile.name, msg.toolCount, task, text); } catch (_) {}
+        try { this._checkSkillReview(profile.name, msg.toolCount, task, text, toolHistory, toolResults); } catch (_) {}
         try { this._checkMemorySync(profile.name, msg.toolCount, task); } catch (_) {}
       }
     };
@@ -1204,6 +1219,14 @@ export class Scheduler {
 
           if (msg.type === 'cc_event') {
             currentCcTurnId = msg.turnId || currentCcTurnId;
+            if (msg.eventType === 'tool_use') {
+              toolHistory.push({
+                name: msg.payload?.name || null,
+                input: msg.payload?.input || msg.payload || {},
+              });
+            } else if (msg.eventType === 'tool_result') {
+              toolResults.push(msg.payload || {});
+            }
             try {
               await this._publishWorkerCcEvent(msg, {
                 task,
@@ -1225,6 +1248,17 @@ export class Scheduler {
           }
           if (msg.type === 'inject_failed') {
             responded = true;
+            try {
+              writeLessonCandidate(profile.dataDir, {
+                source: 'inject-failed',
+                stopReason: 'inject_failed',
+                errorContext: JSON.stringify({ userText: msg.userText || '', injectId: msg.injectId || null }).slice(0, 500),
+                threadId: threadTs,
+                kind: 'inject',
+              });
+            } catch (err) {
+              warn(TAG, `failed to write inject_failed lesson candidate: ${err.message}`);
+            }
             const activeEntry = this.activeWorkers.get(threadTs);
             const failedTask = activeEntry?.pendingInjects?.get(msg.injectId) || null;
             if (activeEntry?.pendingInjects && msg.injectId) {
@@ -1347,6 +1381,17 @@ export class Scheduler {
             const safeError = sanitizeErrorText(msg.error || '未知错误');
             workerFailure = new Error(safeError);
             logError(TAG, `worker error for thread=${threadTs}: ${safeError}`);
+            try {
+              writeLessonCandidate(profile.dataDir, {
+                source: 'worker-error',
+                stopReason: safeError,
+                errorContext: JSON.stringify(msg.errorContext || {}).slice(0, 500),
+                threadId: threadTs,
+                kind: 'worker',
+              });
+            } catch (err) {
+              warn(TAG, `failed to write worker-error lesson candidate: ${err.message}`);
+            }
             await stopTyping();
             await adapter.sendReply(channel, effectiveThreadTs, `:warning: 出错了: ${safeError}`).catch(() => {});
             storeLesson({
@@ -1453,21 +1498,37 @@ export class Scheduler {
 
   // --- Skill auto-extraction ---
 
-  _checkSkillReview(profileName, toolCount, task, resultText) {
+  _checkSkillReview(profileName, toolCount, task, resultText, toolHistory = [], toolResults = []) {
     if (!toolCount || toolCount === 0) return;
 
     const prev = this._skillToolCounts.get(profileName) || 0;
     const next = prev + toolCount;
     this._skillToolCounts.set(profileName, next);
 
-    if (next >= SKILL_REVIEW_THRESHOLD) {
-      info(TAG, `skill review threshold reached: profile=${profileName} tools=${next}`);
+    const profile = task?.profile || this.getProfile(task?.userId);
+    const agentsDir = join(profile.workspaceDir, '.claude', 'skills');
+    const existingSkillText = this._scanExistingSkills(agentsDir)
+      .map((skill) => `${skill.file}\n${skill.summary}`)
+      .join('\n');
+    const assessment = assessSkillReviewTrigger(toolHistory, {
+      userText: task?.userText || '',
+      resultText: resultText || '',
+      threadText: [task?.threadHistory || '', task?.userText || '', resultText || ''].join('\n'),
+      existingSkillText,
+      toolResults,
+    });
+
+    if (assessment.should || next >= SKILL_REVIEW_THRESHOLD) {
+      info(TAG, `skill review triggered: profile=${profileName} tools=${next} pattern=${assessment.pattern} reason=${assessment.reason}`);
       this._skillToolCounts.set(profileName, 0);
       // Package the just-completed turn as priorConversation so the review
       // worker has actual context to extract skills from.
       const priorMessages = [];
       if (task?.userText) priorMessages.push({ role: 'user', content: String(task.userText) });
       if (resultText) priorMessages.push({ role: 'assistant', content: String(resultText) });
+      if (toolHistory.length > 0) {
+        priorMessages.push({ role: 'assistant', content: `Skill trigger: ${assessment.pattern} — ${assessment.reason}\nTools: ${toolHistory.map((item) => item.name).filter(Boolean).join(' -> ')}` });
+      }
       this._spawnSkillReview(task, priorMessages);
     }
   }
@@ -1475,15 +1536,15 @@ export class Scheduler {
   _scanExistingSkills(agentsDir) {
     if (!existsSync(agentsDir)) return [];
     try {
-      return readdirSync(agentsDir)
-        .filter(f => f.endsWith('.md'))
-        .map(f => {
+      return readdirSync(agentsDir, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory() && !entry.name.startsWith('_'))
+        .map((entry) => {
           try {
-            const content = readFileSync(join(agentsDir, f), 'utf8');
+            const content = readFileSync(join(agentsDir, entry.name, 'SKILL.md'), 'utf8');
             // Extract first 5 lines as summary
             const summary = content.split('\n').slice(0, 5).join('\n');
-            return { file: f, summary };
-          } catch { return { file: f, summary: '(read error)' }; }
+            return { file: `${entry.name}/SKILL.md`, summary };
+          } catch { return { file: `${entry.name}/SKILL.md`, summary: '(read error)' }; }
         });
     } catch { return []; }
   }
@@ -1492,6 +1553,7 @@ export class Scheduler {
     const { userId, platform } = task;
     const profile = this.getProfile(userId);
     const agentsDir = join(profile.workspaceDir, '.claude', 'skills');
+    const draftsDir = join(agentsDir, '_drafts');
 
     // Pre-scan existing skills for iteration context
     const existing = this._scanExistingSkills(agentsDir);
@@ -1523,13 +1585,16 @@ export class Scheduler {
       '',
       existingSection,
       '',
-      `## Output Location: ${agentsDir}/`,
+      `## Output Location: ${draftsDir}/{kebab-case-name}/SKILL.md`,
       '',
       '## Skill File Format (Claude Code agent .md):',
       '```',
       '---',
       'name: skill-name',
       'description: One-line description of when/why to use this',
+      'stage: draft',
+      `created_at: ${new Date().toISOString()}`,
+      `source_thread_id: ${task.threadTs || 'unknown'}`,
       '---',
       '# Skill Title',
       '',
@@ -1545,7 +1610,7 @@ export class Scheduler {
       '```',
       '',
       'When UPDATING: preserve existing content that\'s still valid, add new learnings, bump any version notes.',
-      'Be concise. One skill per file. Filename = kebab-case of skill name.',
+      'Be concise. One skill per directory. Directory name = kebab-case skill name; file name must be SKILL.md.',
     ].join('\n');
 
     if (this._backgroundWorkers.size >= this._maxBackgroundWorkers) {

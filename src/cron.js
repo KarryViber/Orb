@@ -11,6 +11,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { info, error as logError, warn } from './log.js';
+import { writeLessonCandidate } from './lesson-candidates.js';
 
 const TAG = 'cron';
 const TICK_INTERVAL = 60_000; // 60 seconds
@@ -358,6 +359,18 @@ export class CronScheduler {
       if (failureDelivered) return;
       failureDelivered = true;
       await this._deliverCronFailureDM(job, reason, errorContext);
+      try {
+        writeLessonCandidate(paths.dataDir, {
+          source: 'cron-failure',
+          stopReason: reason,
+          errorContext,
+          threadId: `cron:${job.id}`,
+          cronName: job.name || job.id,
+          kind: 'cron',
+        });
+      } catch (err) {
+        warn(TAG, `failed to write cron failure lesson candidate: ${err.message}`);
+      }
     };
 
     try {
