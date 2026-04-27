@@ -1475,7 +1475,7 @@ export class SlackAdapter extends PlatformAdapter {
     const messageTs = body.container?.message_ts || body.message?.ts;
     const threadTs = body.message?.thread_ts || messageTs || null;
     const userId = body.user?.id || '';
-    const rawActionId = String(actionId || '');
+    const rawActionId = String(actionId || '').replace(/-/g, '_');
     const originalBlocks = Array.isArray(body.message?.blocks) ? body.message.blocks : null;
 
     if (!channel || !messageTs) {
