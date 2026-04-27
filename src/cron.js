@@ -14,6 +14,9 @@ import { info, error as logError, warn } from './log.js';
 
 const TAG = 'cron';
 const TICK_INTERVAL = 60_000; // 60 seconds
+const PROFILE_DM_CHANNELS = {
+  karry: 'D0ANGB3M1CZ',
+};
 
 // ── Minimal 5-field cron parser ──
 
@@ -206,6 +209,21 @@ function graceMs(schedule) {
   return 7_200_000;
 }
 
+function isSuccessfulStopReason(stopReason) {
+  return !stopReason || stopReason === 'success' || stopReason === 'stop' || stopReason === 'end_turn';
+}
+
+function failureReasonFromResult(responseText, stopReason) {
+  const text = String(responseText || '').trim();
+  if (text.toLowerCase().startsWith('failed:')) return text.slice('failed:'.length).trim() || 'failed';
+  if (!isSuccessfulStopReason(stopReason)) return `stopReason=${stopReason}`;
+  return null;
+}
+
+function truncateErrorContext(value, limit = 500) {
+  return String(value || '').replace(/\s+$/g, '').slice(0, limit);
+}
+
 // ── CronScheduler ──
 
 export class CronScheduler {
@@ -335,6 +353,12 @@ export class CronScheduler {
 
     this._inflightJobs.add(inflightKey);
     info(TAG, `executing job ${job.id} "${job.name}" (profile=${job.profileName})`);
+    let failureDelivered = false;
+    const deliverFailure = async (reason, errorContext = '') => {
+      if (failureDelivered) return;
+      failureDelivered = true;
+      await this._deliverCronFailureDM(job, reason, errorContext);
+    };
 
     try {
       const deliver = job.deliver || null;
@@ -388,32 +412,47 @@ export class CronScheduler {
       }
 
       const silent = responseText?.startsWith('[SILENT]');
+      const failureReason = failureReasonFromResult(responseText, stopReason);
 
       job.lastRunAt = now.toISOString();
-      if (stopReason === 'max_turns_reached') {
-        job.lastStatus = 'error';
-        job.lastError = 'max_turns_reached';
+      if (failureReason) {
+        job.lastStatus = 'failed';
+        job.lastError = truncateErrorContext(failureReason);
+        try {
+          await deliverFailure(failureReason, responseText || stopReason || '');
+          job.lastDeliveryError = null;
+        } catch (deliveryErr) {
+          job.lastDeliveryError = deliveryErr.message;
+          logError(TAG, `cron failure DM failed for job ${job.id}: ${deliveryErr.message}`);
+        }
       } else {
         job.lastStatus = 'ok';
         job.lastError = null;
-      }
 
-      if (deliveredByScheduler) {
-        job.lastDeliveryError = null;
-      } else if (!silent && responseText && job.deliver) {
-        try {
-          await this._deliverResult(job, responseText);
+        if (deliveredByScheduler) {
           job.lastDeliveryError = null;
-        } catch (err) {
-          job.lastDeliveryError = err.message;
-          logError(TAG, `delivery failed for job ${job.id}: ${err.message}`);
+        } else if (!silent && responseText && job.deliver) {
+          try {
+            await this._deliverResult(job, responseText);
+            job.lastDeliveryError = null;
+          } catch (err) {
+            job.lastDeliveryError = err.message;
+            logError(TAG, `delivery failed for job ${job.id}: ${err.message}`);
+          }
         }
       }
     } catch (err) {
       job.lastRunAt = now.toISOString();
-      job.lastStatus = 'error';
-      job.lastError = err.message;
+      job.lastStatus = 'failed';
+      job.lastError = truncateErrorContext(err.message);
       logError(TAG, `job ${job.id} failed: ${err.message}`);
+      try {
+        await deliverFailure(err.message || 'worker_error', err.stack || err.message);
+        job.lastDeliveryError = null;
+      } catch (deliveryErr) {
+        job.lastDeliveryError = deliveryErr.message;
+        logError(TAG, `cron failure DM failed for job ${job.id}: ${deliveryErr.message}`);
+      }
     }
 
     // Repeat tracking
@@ -493,6 +532,21 @@ export class CronScheduler {
 
       return true;
     });
+  }
+
+  async _deliverCronFailureDM(job, reason, errorContext = '') {
+    const channel = PROFILE_DM_CHANNELS[job.profileName] || PROFILE_DM_CHANNELS.karry;
+    if (!channel) throw new Error(`no failure DM channel for profile: ${job.profileName || 'unknown'}`);
+    const timestamp = new Date().toISOString();
+    const text = `:warning: cron 失败 — ${job.name || job.id} ${timestamp}\nreason: ${reason}\nerror: ${truncateErrorContext(errorContext)}`;
+    await this._deliverResult({
+      ...job,
+      deliver: {
+        platform: 'slack',
+        channel,
+        threadTs: null,
+      },
+    }, text);
   }
 
   /**

@@ -45,11 +45,11 @@ function createJob(id, overrides = {}) {
   };
 }
 
-function createScheduler(dataDir, spawnCronWorker) {
+function createScheduler(dataDir, spawnCronWorker, deliverResult = async () => {}) {
   const scheduler = new CronScheduler({
     getProfilePaths: () => ({ dataDir, workspaceDir: dataDir, scriptsDir: dataDir }),
     spawnCronWorker,
-    deliverResult: async () => {},
+    deliverResult,
   });
   scheduler.setProfileNames(['karry']);
   return scheduler;
@@ -172,4 +172,60 @@ test('fire-and-forget execution still persists job state', async () => {
   assert.equal(job.lastStatus, 'ok');
   assert.equal(job.lastError, null);
   assert.match(job.lastRunAt, /\d{4}-\d{2}-\d{2}T/);
+});
+
+test('cron worker failure sends one DM and persists failed status', async () => {
+  const dataDir = createTempDataDir();
+  const deliveries = [];
+  const scheduler = createScheduler(
+    dataDir,
+    async () => {
+      throw new Error('script exited 1');
+    },
+    async (job, text) => {
+      deliveries.push({ deliver: job.deliver, text });
+    },
+  );
+
+  writeJobs(dataDir, [createJob('job-fail', { name: 'Failing Cron' })]);
+
+  await scheduler.tick();
+  await delay(20);
+  await scheduler._awaitJobWrites(dataDir);
+
+  const [job] = readJobs(dataDir);
+  assert.equal(job.lastStatus, 'failed');
+  assert.equal(job.lastError, 'script exited 1');
+  assert.equal(job.lastDeliveryError, null);
+  assert.equal(deliveries.length, 1);
+  assert.deepEqual(deliveries[0].deliver, { platform: 'slack', channel: 'D0ANGB3M1CZ', threadTs: null });
+  assert.match(deliveries[0].text, /^:warning: cron 失败 — Failing Cron /);
+  assert.match(deliveries[0].text, /reason: script exited 1/);
+});
+
+test('cron failed result text is treated as failure without normal delivery', async () => {
+  const dataDir = createTempDataDir();
+  const deliveries = [];
+  const scheduler = createScheduler(
+    dataDir,
+    async () => ({ text: 'failed: boom', stopReason: 'success' }),
+    async (job, text) => {
+      deliveries.push({ deliver: job.deliver, text });
+    },
+  );
+
+  writeJobs(dataDir, [createJob('job-failed-text', {
+    deliver: { platform: 'slack', channel: 'C1', threadTs: null },
+  })]);
+
+  await scheduler.tick();
+  await delay(20);
+  await scheduler._awaitJobWrites(dataDir);
+
+  const [job] = readJobs(dataDir);
+  assert.equal(job.lastStatus, 'failed');
+  assert.equal(job.lastError, 'boom');
+  assert.equal(deliveries.length, 1);
+  assert.equal(deliveries[0].deliver.channel, 'D0ANGB3M1CZ');
+  assert.match(deliveries[0].text, /reason: boom/);
 });
