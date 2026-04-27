@@ -295,6 +295,7 @@ export function createSlackTextSubscriber(adapter, { debounceMs = TEXT_DEBOUNCE_
         await adapter.appendStream(streamId, [{ type: 'markdown_text', text }]);
         if (turn) turn.intermediateDeliveredThisTurn = true;
         if (turn?.egress) turn.egress.admit(text, 'intermediate');
+        ctx?.markStreamDelivered?.();
         return;
       } catch (err) {
         const code = err?.data?.error || err?.code || '';
@@ -327,6 +328,7 @@ export function createSlackTextSubscriber(adapter, { debounceMs = TEXT_DEBOUNCE_
         await adapter.sendReply(channel, threadTs, payload.text, payload.blocks ? { blocks: payload.blocks } : {});
       }
       if (turn) turn.intermediateDeliveredThisTurn = true;
+      ctx?.markStreamDelivered?.();
     } catch (err) {
       warn(TAG, `[text_subscriber] sendReply failed: ${err.message}`);
     }

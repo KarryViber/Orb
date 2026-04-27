@@ -316,7 +316,7 @@ export class EventBus {
 }
 
 export class Scheduler {
-  constructor({ maxWorkers, timeoutMs, getProfile, startPermissionServer = true }) {
+  constructor({ maxWorkers, timeoutMs, getProfile, startPermissionServer = true, spawnWorkerFn = spawnWorker }) {
     this.maxWorkers = maxWorkers || 3;
     this.timeoutMs = timeoutMs || parseInt(process.env.ORB_WORKER_TIMEOUT_MS, 10) || 1_800_000;
     this.getProfile = getProfile;
@@ -331,6 +331,7 @@ export class Scheduler {
     this._backgroundWorkers = new Set(); // skill-review + memory-sync workers
     this._maxBackgroundWorkers = 2;
     this._nextInjectId = 1;
+    this._spawnWorkerFn = spawnWorkerFn;
     this._pendingPermissionRequests = new Map();
     this._permissionApprovalMode = process.env.ORB_PERMISSION_APPROVAL_MODE || 'auto-allow';
     this._permissionSocketPath = join(tmpdir(), `orb-permission-scheduler-${process.pid}.sock`);
@@ -1181,7 +1182,7 @@ export class Scheduler {
     };
 
     try {
-      ({ worker } = spawnWorker({
+      ({ worker } = this._spawnWorkerFn({
         task: {
           type: 'task',
           userText: effectiveText,
@@ -1240,6 +1241,7 @@ export class Scheduler {
                 deferDeliveryUntilResult,
                 channelSemantics,
                 applyThreadStatus,
+                markStreamDelivered: () => { turnDelivered = true; },
               });
             } catch (err) {
               warn(TAG, `eventBus publish failed: ${err.message}`);
@@ -1306,6 +1308,7 @@ export class Scheduler {
 
           if (msg.type === 'turn_end') {
             await stopTyping();
+            responded = true;
             return;
           }
 
@@ -1440,6 +1443,7 @@ export class Scheduler {
                 deferDeliveryUntilResult,
                 channelSemantics,
                 applyThreadStatus,
+                markStreamDelivered: () => { turnDelivered = true; },
               });
             } catch (err) {
               warn(TAG, `eventBus turn_abort publish failed: ${err.message}`);
@@ -1455,15 +1459,19 @@ export class Scheduler {
 
           info(TAG, `worker exited: pid=${worker.pid} code=${code} signal=${signal} responded=${responded} thread=${threadTs}`);
 
+          const deliveredBeforeExitNotice = turnDelivered;
           const abnormalExit = !responded && (signal !== null || (code !== 0 && code !== null));
           if (abnormalExit) {
             await finalizeStreamsOnAbnormalExit();
           }
 
-          if (!responded) {
+          if (!responded && !deliveredBeforeExitNotice) {
             logError(TAG, `worker exited without response: thread=${threadTs} code=${code} signal=${signal}`);
             this._autoContinueCount.delete(threadTs);
             await adapter.cleanupIndicator(channel, effectiveThreadTs, false, '处理过程中出错，请重试。');
+          } else if (!responded) {
+            warn(TAG, `worker exited without IPC signal but stream delivered: thread=${threadTs} (suppressed user-facing warning)`);
+            this._autoContinueCount.delete(threadTs);
           }
 
           await this.processNextQueued(threadTs);
