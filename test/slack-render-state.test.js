@@ -1,0 +1,123 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {
+  createSlackQiSubscriber,
+  createSlackStatusSubscriber,
+} from '../src/adapters/slack.js';
+import {
+  EventBus,
+  resolveTurnCompleteDeliveryText,
+} from '../src/scheduler.js';
+import { EgressGate } from '../src/egress.js';
+
+function toolUse(turnId, name, input = {}) {
+  return { type: 'cc_event', turnId, eventType: 'tool_use', payload: { type: 'tool_use', id: `${turnId}-${name}`, name, input } };
+}
+
+function result(turnId) {
+  return { type: 'cc_event', turnId, eventType: 'result', payload: { stop_reason: 'end_turn' } };
+}
+
+function createStreamingAdapter() {
+  const calls = [];
+  let seq = 0;
+  return {
+    calls,
+    async startStream(channel, threadTs, options) {
+      seq += 1;
+      const stream = { stream_id: `stream-${seq}`, ts: `${seq}.000` };
+      calls.push(['startStream', channel, threadTs, options, stream]);
+      return stream;
+    },
+    async appendStream(streamId, chunks) {
+      calls.push(['appendStream', streamId, chunks]);
+    },
+    async stopStream(streamId, payload) {
+      calls.push(['stopStream', streamId, payload]);
+    },
+  };
+}
+
+test('turn_complete duplicate delivery posts only once', async () => {
+  const chat = { posts: [], async postMessage(payload) { this.posts.push(payload); return { ok: true, ts: '1.000' }; } };
+  const turn = { egress: new EgressGate() };
+
+  async function deliverTurnComplete(msg) {
+    const deliveryText = resolveTurnCompleteDeliveryText(msg);
+    if (!deliveryText.trim()) return;
+    if (!turn.egress.admit(deliveryText, 'final')) return;
+    await chat.postMessage({ channel: 'C1', thread_ts: '111.222', text: deliveryText });
+  }
+
+  const msg = { type: 'turn_complete', text: 'done', stopReason: 'success' };
+  await deliverTurnComplete(msg);
+  await deliverTurnComplete(msg);
+
+  assert.equal(chat.posts.length, 1);
+  assert.equal(chat.posts[0].text, 'done');
+});
+
+test('Qi stopStream settles existing chunks without repeating append details', async () => {
+  const adapter = createStreamingAdapter();
+  const bus = new EventBus();
+  bus.subscribe(createSlackQiSubscriber(adapter));
+  const ctx = { channel: 'C1', threadTs: '111.222', effectiveThreadTs: '111.222', task: { teamId: 'T1' } };
+
+  await bus.publish(toolUse('turn-q', 'Bash', { description: 'one' }), ctx);
+  await bus.publish(toolUse('turn-q', 'WebSearch', { query: 'two' }), ctx);
+  await bus.publish(toolUse('turn-q', 'Task', { description: 'three' }), ctx);
+  await bus.publish(result('turn-q'), ctx);
+
+  const appendedDetails = adapter.calls
+    .filter((call) => call[0] === 'appendStream')
+    .flatMap(([, , chunks]) => chunks)
+    .map((chunk) => chunk.details || '')
+    .join('');
+  const stopDetails = adapter.calls
+    .filter((call) => call[0] === 'stopStream')
+    .flatMap(([, , payload]) => payload.chunks || [])
+    .map((chunk) => chunk.details || '')
+    .join('');
+
+  assert.equal((appendedDetails.match(/Bash: one/g) || []).length, 1);
+  assert.equal((appendedDetails.match(/WebSearch: two/g) || []).length, 1);
+  assert.equal((appendedDetails.match(/Task: three/g) || []).length, 1);
+  assert.equal(stopDetails.includes('Bash: one'), false);
+  assert.equal(stopDetails.includes('WebSearch: two'), false);
+  assert.equal(stopDetails.includes('Task: three'), false);
+});
+
+test('status bubble clears on turn_abort after tool_use', async () => {
+  const bus = new EventBus();
+  bus.subscribe(createSlackStatusSubscriber({}, { heartbeatMs: 10_000 }));
+  const statuses = [];
+  const ctx = { async applyThreadStatus(status) { statuses.push(status); } };
+
+  await bus.publish(toolUse('turn-status-abort', 'Bash', { description: 'long run' }), ctx);
+  await bus.publish({ type: 'cc_event', turnId: 'turn-status-abort', eventType: 'turn_abort', synthetic: true }, ctx);
+
+  assert.equal(statuses[0], 'Bash: long run');
+  assert.equal(statuses.at(-1), '');
+});
+
+test('new turns allocate distinct Slack streams', async () => {
+  const adapter = createStreamingAdapter();
+  const bus = new EventBus();
+  bus.subscribe(createSlackQiSubscriber(adapter));
+  const ctx = { channel: 'C1', threadTs: '111.222', effectiveThreadTs: '111.222', task: { teamId: 'T1' } };
+
+  await bus.publish(toolUse('turn-a', 'Bash', { description: 'first turn' }), ctx);
+  await bus.publish(result('turn-a'), ctx);
+  await bus.publish(toolUse('turn-b', 'Bash', { description: 'second turn' }), ctx);
+  await bus.publish(result('turn-b'), ctx);
+
+  const streamIds = adapter.calls
+    .filter((call) => call[0] === 'startStream')
+    .map((call) => call[4].stream_id);
+  const stopped = adapter.calls
+    .filter((call) => call[0] === 'stopStream')
+    .map((call) => call[1]);
+
+  assert.deepEqual(streamIds, ['stream-1', 'stream-2']);
+  assert.deepEqual(stopped, ['stream-1', 'stream-2']);
+});
