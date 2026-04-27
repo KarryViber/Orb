@@ -546,7 +546,7 @@ function formatGitDiffFileLine(file) {
   const added = Number(file?.linesAdded) || 0;
   const deleted = Number(file?.linesDeleted) || 0;
   const lineStats = added || deleted ? ` (${formatDiffCount(added, '+')} ${formatDiffCount(deleted, '-')})` : '';
-  return `• \`${status}\` ${path}${lineStats}`;
+  return `> • \`${status}\` ${path}${lineStats}`;
 }
 
 export function formatGitDiffSummary(summary) {
@@ -556,7 +556,7 @@ export function formatGitDiffSummary(summary) {
   const insertions = Number(totals.insertions) || 0;
   const deletions = Number(totals.deletions) || 0;
   const lines = [
-    `📝 *改动* ${filesChanged} files (${formatDiffCount(insertions, '+')} ${formatDiffCount(deletions, '-')})`,
+    `> _📝 改动 · ${filesChanged} files (${formatDiffCount(insertions, '+')} ${formatDiffCount(deletions, '-')})_`,
   ];
   for (const file of Array.isArray(summary.files) ? summary.files : []) {
     const line = formatGitDiffFileLine(file);
@@ -565,8 +565,8 @@ export function formatGitDiffSummary(summary) {
   if (summary.truncated) {
     const remaining = Math.max(0, filesChanged - (Array.isArray(summary.files) ? summary.files.length : 0));
     lines.push(remaining > 0
-      ? `_…还有 ${remaining} 个文件，详见 VS Code Source Control_`
-      : `_…还有更多文件，详见 VS Code Source Control_`);
+      ? `> _…还有 ${remaining} 个文件，详见 VS Code Source Control_`
+      : `> _…还有更多文件，详见 VS Code Source Control_`);
   }
   return lines.join('\n');
 }
@@ -591,8 +591,14 @@ export function buildSendPayloads(text, options = {}) {
   const diffOnly = !text && gitDiffSummary?.hasChanges;
   if (!text && !diffOnly) return [{ text: '(无回复)' }];
   if (diffOnly) {
-    const diffText = formatGitDiffSummary(gitDiffSummary);
-    return [{ text: markdownToMrkdwn(diffText) }];
+    const blocks = [{
+      type: 'context',
+      elements: [{
+        type: 'mrkdwn',
+        text: markdownToMrkdwn(formatGitDiffSummary(gitDiffSummary)),
+      }],
+    }];
+    return [{ blocks, text: '改动摘要' }];
   }
   const textWithDiff = appendGitDiffSummary(text, gitDiffSummary);
 
