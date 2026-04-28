@@ -259,8 +259,9 @@ export function buildRespawnTaskForInjectFailed({
 }
 
 export class EventBus {
-  constructor() {
+  constructor({ subscriberTimeoutMs = 5_000 } = {}) {
     this.subscribers = new Set();
+    this.subscriberTimeoutMs = subscriberTimeoutMs;
   }
 
   subscribe(subscriber) {
@@ -272,14 +273,41 @@ export class EventBus {
   }
 
   async publish(msg, ctx = {}) {
+    const errors = [];
     for (const subscriber of [...this.subscribers]) {
+      try {
+        await this._publishToSubscriber(subscriber, msg, ctx);
+      } catch (err) {
+        errors.push(err);
+        warn(TAG, `eventBus subscriber failed: ${err.message}`);
+      }
+    }
+    if (errors.length > 0) {
+      throw new AggregateError(errors, `EventBus publish failed for ${errors.length} subscriber(s)`);
+    }
+  }
+
+  async _publishToSubscriber(subscriber, msg, ctx) {
+    return this._withSubscriberTimeout(async () => {
       const match = typeof subscriber === 'function'
         ? true
         : (typeof subscriber.match === 'function' ? await subscriber.match(msg, ctx) : true);
-      if (!match) continue;
+      if (!match) return;
       if (typeof subscriber === 'function') await subscriber(msg, ctx);
       else await subscriber.handle(msg, ctx);
-    }
+    });
+  }
+
+  _withSubscriberTimeout(operation) {
+    let timer = null;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`subscriber timed out after ${this.subscriberTimeoutMs}ms`)), this.subscriberTimeoutMs);
+      if (typeof timer.unref === 'function') timer.unref();
+    });
+
+    return Promise.race([operation(), timeout]).finally(() => {
+      if (timer) clearTimeout(timer);
+    });
   }
 }
 

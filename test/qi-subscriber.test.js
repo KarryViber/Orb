@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createSlackQiSubscriber } from '../src/adapters/slack.js';
+import { createSlackQiSubscriber, createSlackTextSubscriber } from '../src/adapters/slack.js';
 import { categorizeTool } from '../src/adapters/slack-format.js';
 import { EventBus, Scheduler } from '../src/scheduler.js';
 
@@ -81,6 +81,31 @@ test('SlackQiSubscriber renders Qi stream from cc_event tool_use/result', async 
     [['qi-exec', 'complete'], ['qi-other', 'complete'], ['qi-summary', 'complete']],
   );
   assert.match(finalChunks.find((chunk) => chunk.id === 'qi-summary').details, /Distilled from 3 probes/);
+});
+
+test('SlackQiSubscriber exposes stream id for text subscriber appends', async () => {
+  const adapter = createMockAdapter();
+  const bus = new EventBus();
+  bus.subscribe(createSlackQiSubscriber(adapter));
+  bus.subscribe(createSlackTextSubscriber(adapter, { debounceMs: 10 }));
+  const turn = {
+    intermediateDeliveredThisTurn: false,
+    taskCardState: { enabled: true, deferred: false, streamId: null, failed: false },
+    egress: { admit: () => true },
+  };
+  const ctx = { channel: 'C1', threadTs: '111.222', effectiveThreadTs: '111.222', platform: 'slack', turn };
+
+  await bus.publish(toolUse('turn-shared-stream', 'Bash', { description: 'Run tests' }), ctx);
+  assert.equal(turn.taskCardState.streamId, 'stream-1');
+
+  await bus.publish({ type: 'cc_event', turnId: 'turn-shared-stream', eventType: 'text', payload: { text: 'streamed text' } }, ctx);
+  await new Promise((resolve) => setTimeout(resolve, 25));
+
+  assert.deepEqual(adapter.calls.at(-1), ['appendStream', 'stream-1', [{ type: 'markdown_text', text: 'streamed text' }]]);
+  assert.equal(turn.intermediateDeliveredThisTurn, true);
+
+  await bus.publish({ type: 'cc_event', turnId: 'turn-shared-stream', eventType: 'result', payload: { stop_reason: 'end_turn' } }, ctx);
+  assert.equal(turn.taskCardState.streamId, null);
 });
 
 test('SlackQiSubscriber serializes concurrent tool_use appends', async () => {

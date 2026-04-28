@@ -148,6 +148,8 @@ function createCcSubscriber(adapter, {
       await state.startPromise;
       return Boolean(state.streamId);
     }
+    const taskCardState = ctx?.turn?.taskCardState;
+    if (taskCardState?.streamId) return false;
     const channel = ctx?.channel || ctx?.task?.channel;
     const threadTs = ctx?.effectiveThreadTs || ctx?.threadTs || ctx?.task?.threadTs;
     if (!channel || !threadTs) return false;
@@ -160,8 +162,10 @@ function createCcSubscriber(adapter, {
         });
         state.streamId = stream?.stream_id || (stream?.ts ? `${channel}:${stream.ts}` : null);
         state.streamTs = stream?.ts || null;
+        if (state.streamId && taskCardState) taskCardState.streamId = state.streamId;
       } catch (err) {
         state.failed = true;
+        if (taskCardState) taskCardState.failed = true;
         warn(TAG, `[cc_subscriber] start failed: ${err.message}`);
       } finally {
         state.startPromise = null;
@@ -221,6 +225,9 @@ function createCcSubscriber(adapter, {
       } catch (err) {
         warn(TAG, `[cc_subscriber] stop failed: ${err.message}`);
       } finally {
+        if (ctx?.turn?.taskCardState?.streamId === streamId) {
+          ctx.turn.taskCardState.streamId = null;
+        }
         turns.delete(key);
       }
     },

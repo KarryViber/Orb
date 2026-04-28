@@ -78,6 +78,36 @@ test('EventBus publishes matching cc_event messages to subscribers', async () =>
   assert.equal(received[0].ctx.threadTs, '111.222');
 });
 
+test('EventBus isolates subscriber errors and still publishes to later subscribers', async () => {
+  const bus = new EventBus();
+  const received = [];
+  bus.subscribe(() => {
+    throw new Error('subscriber boom');
+  });
+  bus.subscribe((msg) => received.push(msg.turnId));
+
+  await assert.rejects(
+    bus.publish({ type: 'cc_event', turnId: 'turn-error', eventType: 'result' }),
+    (err) => err instanceof AggregateError && err.errors.length === 1,
+  );
+
+  assert.deepEqual(received, ['turn-error']);
+});
+
+test('EventBus times out a stuck subscriber and continues publishing', async () => {
+  const bus = new EventBus({ subscriberTimeoutMs: 10 });
+  const received = [];
+  bus.subscribe(() => new Promise(() => {}));
+  bus.subscribe((msg) => received.push(msg.turnId));
+
+  await assert.rejects(
+    bus.publish({ type: 'cc_event', turnId: 'turn-timeout', eventType: 'result' }),
+    /EventBus publish failed/,
+  );
+
+  assert.deepEqual(received, ['turn-timeout']);
+});
+
 test('Scheduler cc_event route publishes fake tool_use without handling legacy IPC branches', async () => {
   const scheduler = new Scheduler({ getProfile: () => ({ name: 'test' }), startPermissionServer: false });
   const received = [];
