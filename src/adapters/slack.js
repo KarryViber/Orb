@@ -300,38 +300,14 @@ export function createSlackTextSubscriber(adapter, { debounceMs = TEXT_DEBOUNCE_
         return;
       } catch (err) {
         const code = err?.data?.error || err?.code || '';
+        if (taskCardState) taskCardState.failed = true;
         if (code === 'message_not_in_streaming_state' || code === 'message_not_owned_by_app') {
-          if (taskCardState) taskCardState.failed = true;
-          warn(TAG, `[text_subscriber] stream ownership lost, degrading to sendReply: ${code}`);
+          warn(TAG, `[text_subscriber] stream ownership lost, skipping subscriber delivery: ${code}`);
         } else {
           warn(TAG, `[text_subscriber] append failed: ${err.message}`);
-          return;
         }
+        return;
       }
-    }
-
-    let admitted = false;
-    if (turn?.egress) {
-      admitted = turn.egress.admit(text, 'intermediate');
-    }
-    if (turn?.egress && !admitted) {
-      turn.intermediateDeliveredThisTurn = true;
-      return;
-    }
-    const channel = ctx?.channel || ctx?.task?.channel;
-    const threadTs = ctx?.effectiveThreadTs || ctx?.threadTs || ctx?.task?.threadTs;
-    if (!channel || !threadTs || typeof adapter.sendReply !== 'function') return;
-    try {
-      const payloads = typeof adapter.buildPayloads === 'function'
-        ? adapter.buildPayloads(text)
-        : [{ text }];
-      for (const payload of payloads) {
-        await adapter.sendReply(channel, threadTs, payload.text, payload.blocks ? { blocks: payload.blocks } : {});
-      }
-      if (turn) turn.intermediateDeliveredThisTurn = true;
-      ctx?.markStreamDelivered?.();
-    } catch (err) {
-      warn(TAG, `[text_subscriber] sendReply failed: ${err.message}`);
     }
   };
 

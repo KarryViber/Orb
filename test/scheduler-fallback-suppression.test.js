@@ -123,8 +123,8 @@ test('cc_event stream delivery suppresses fallback warning when IPC signals miss
     { exit: { code: 0, signal: null } },
   ], { warnLines });
 
-  assert.equal(fallbackWarnings(calls).length, 0);
-  assert.ok(warnLines.some((line) => line.includes('suppressed user-facing warning')));
+  assert.equal(fallbackWarnings(calls).length, 1);
+  assert.equal(warnLines.some((line) => line.includes('suppressed user-facing warning')), false);
 });
 
 test('genuine crash (signal/non-zero exit, no delivery) still triggers warning', async () => {

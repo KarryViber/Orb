@@ -61,21 +61,21 @@ test('SlackTextSubscriber debounces text and appends markdown_text to an open st
   assert.deepEqual(turn.egress.deliveredTexts, ['first\nsecond']);
 });
 
-test('SlackTextSubscriber sends a reply when no task-card stream is open', async () => {
+test('SlackTextSubscriber marks task card failed without sendReply fallback when stream ownership is lost', async () => {
   const adapter = createMockAdapter();
+  adapter.appendStream = async (streamId, chunks) => {
+    adapter.calls.push(['appendStream', streamId, chunks]);
+    throw Object.assign(new Error('not in streaming state'), { data: { error: 'message_not_in_streaming_state' } });
+  };
   const bus = new EventBus();
   bus.subscribe(createSlackTextSubscriber(adapter, { debounceMs: 10 }));
-  const turn = createTurn(null);
+  const turn = createTurn('stream-1');
   const ctx = { channel: 'C1', effectiveThreadTs: '111.222', turn };
 
-  await bus.publish(textEvent('turn-reply', 'plain text'), ctx);
+  await bus.publish(textEvent('turn-stream-failed', 'plain text'), ctx);
   await sleep(25);
 
-  assert.deepEqual(adapter.calls, [
-    ['sendReply', 'C1', '111.222', 'plain text', {}],
-  ]);
-  assert.equal(turn.intermediateDeliveredThisTurn, true);
-  assert.deepEqual(turn.egress.deliveredTexts, ['plain text']);
+  assert.deepEqual(adapter.calls, [['appendStream', 'stream-1', [{ type: 'markdown_text', text: 'plain text' }]]]);
 });
 
 test('SlackTextSubscriber flushes pending text immediately on result', async () => {
