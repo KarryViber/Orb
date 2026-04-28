@@ -7,7 +7,6 @@ import {
 } from '../src/adapters/slack.js';
 import {
   EventBus,
-  resolveTurnCompleteDeliveryText,
 } from '../src/scheduler.js';
 import { EgressGate } from '../src/egress.js';
 
@@ -43,16 +42,14 @@ test('turn_complete duplicate delivery posts only once', async () => {
   const chat = { posts: [], async postMessage(payload) { this.posts.push(payload); return { ok: true, ts: '1.000' }; } };
   const turn = { egress: new EgressGate() };
 
-  async function deliverTurnComplete(msg) {
-    const deliveryText = resolveTurnCompleteDeliveryText(msg);
+  async function deliverTurnComplete(deliveryText) {
     if (!deliveryText.trim()) return;
     if (!turn.egress.admit(deliveryText, 'final')) return;
     await chat.postMessage({ channel: 'C1', thread_ts: '111.222', text: deliveryText });
   }
 
-  const msg = { type: 'turn_complete', text: 'done', stopReason: 'success' };
-  await deliverTurnComplete(msg);
-  await deliverTurnComplete(msg);
+  await deliverTurnComplete('done');
+  await deliverTurnComplete('done');
 
   assert.equal(chat.posts.length, 1);
   assert.equal(chat.posts[0].text, 'done');

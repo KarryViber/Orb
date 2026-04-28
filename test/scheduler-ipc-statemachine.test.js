@@ -6,7 +6,6 @@ import {
   EventBus,
   makeTaskCardState,
   Scheduler,
-  subtractDeliveredText,
 } from '../src/scheduler.js';
 import { EgressGate } from '../src/egress.js';
 
@@ -60,11 +59,6 @@ test('turn abandon clears scheduler-owned turn state', async () => {
   assert.equal(turn.abandoned, true);
   assert.equal(turn.statusRefreshTimer, null);
   assert.deepEqual(adapter.calls, []);
-});
-
-test('result dedupe keeps text not delivered by intermediate delivery', () => {
-  const remaining = subtractDeliveredText('第一段\n第二段', ['第一段\n']);
-  assert.equal(remaining, '第二段');
 });
 
 test('EventBus publishes matching cc_event messages to subscribers', async () => {

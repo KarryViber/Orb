@@ -138,63 +138,11 @@ function getTaskCardStreamErrorCode(err) {
   return match?.[1] || null;
 }
 
-export function subtractDeliveredText(finalText, deliveredTexts = []) {
-  const text = typeof finalText === 'string' ? finalText : '';
-  if (!text.trim()) return '';
-
-  const deliveredEntries = Array.isArray(deliveredTexts)
-    ? deliveredTexts.map((entry) => typeof entry === 'string' ? entry : '').filter((entry) => entry.trim())
-    : [];
-  if (deliveredEntries.length > 1) {
-    let cursor = 0;
-    let remaining = '';
-    let matchedAll = true;
-    for (const entry of deliveredEntries) {
-      const index = text.indexOf(entry, cursor);
-      if (index < 0) {
-        matchedAll = false;
-        break;
-      }
-      remaining += text.slice(cursor, index);
-      cursor = index + entry.length;
-    }
-    if (matchedAll) {
-      remaining += text.slice(cursor);
-      if (!remaining.trim()) return '';
-      if (remaining.length < text.length) return remaining;
-    }
-  }
-
-  const delivered = Array.isArray(deliveredTexts)
-    ? deliveredTexts.map((entry) => typeof entry === 'string' ? entry : '').join('')
-    : '';
-  if (!delivered.trim()) return text;
-
-  if (text === delivered || delivered.includes(text)) return '';
-  if (text.startsWith(delivered)) return text.slice(delivered.length);
-  if (text.endsWith(delivered)) return text.slice(0, text.length - delivered.length);
-
-  const trimmedText = text.trim();
-  const trimmedDelivered = delivered.trim();
-  if (trimmedDelivered) {
-    if (trimmedText === trimmedDelivered || trimmedDelivered.includes(trimmedText)) return '';
-    if (trimmedText.startsWith(trimmedDelivered)) return trimmedText.slice(trimmedDelivered.length);
-    if (trimmedText.endsWith(trimmedDelivered)) {
-      return trimmedText.slice(0, trimmedText.length - trimmedDelivered.length);
-    }
-  }
-
-  const deliveredSet = new Set(
-    (deliveredTexts || []).map((entry) => String(entry || '').trim()).filter(Boolean),
-  );
-  return deliveredSet.has(trimmedText) ? '' : text;
-}
-
-export function resolveTurnCompleteDeliveryText(msg) {
+function getTurnCompleteDeliveryText(msg) {
   if (typeof msg?.undeliveredText === 'string') {
     return msg.undeliveredText.trim() ? msg.undeliveredText : '';
   }
-  return subtractDeliveredText(msg?.text, msg?.deliveredTexts);
+  return typeof msg?.text === 'string' ? msg.text : '';
 }
 
 export function makeTaskCardState({ enabled = false, deferred = false } = {}) {
@@ -1135,18 +1083,6 @@ export class Scheduler {
         if (!turnDelivered) {
           if (deferDeliveryUntilResult && text) {
             turnDelivered = await deliverDeferredFinalResult(text);
-          } else if (turn.intermediateDeliveredThisTurn && text) {
-            const remainingText = subtractDeliveredText(text, turn.egress?.deliveredTexts || []);
-            if (remainingText.trim()) {
-              const payloads = adapter.buildPayloads(remainingText);
-              info(TAG, `sending ${payloads.length} deduped result payload(s) to thread=${threadTs}`);
-              for (const payload of payloads) {
-                await emitPayload(payload);
-              }
-            } else {
-              info(TAG, `result text already delivered via intermediate stream, skip sendReply`);
-            }
-            turnDelivered = true;
           } else {
             const finalText = text || '⚠️ 多次续接仍未生成回复，任务可能需要拆分。请用更小的指令重试。';
             if (turn.egress.admit(finalText, 'result-final')) {
@@ -1346,14 +1282,8 @@ export class Scheduler {
           if (msg.type === 'turn_complete') {
             finalStopReason = msg.stopReason || finalStopReason;
             await stopTyping();
-            const workerResolvedText = resolveTurnCompleteDeliveryText(msg);
-            let deliveryText = workerResolvedText;
-            if (turn.intermediateDeliveredThisTurn && deliveryText) {
-              deliveryText = subtractDeliveredText(deliveryText, turn.egress?.deliveredTexts || []);
-            }
+            const deliveryText = getTurnCompleteDeliveryText(msg);
             const metadataText = typeof msg.text === 'string' ? msg.text : deliveryText;
-            // 中间轮次完成 — 优先使用 worker 提供的 undeliveredText，
-            // 否则按 deliveredTexts 从完整文本中扣掉已发部分。
             try {
               if (deliveryText.trim() && suppressSuccessfulText('turn_complete', deliveryText, msg.stopReason, msg.channelSemantics)) {
                 turnDelivered = true;
