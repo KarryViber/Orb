@@ -211,6 +211,32 @@ def print_text(meta: dict, results: list[dict]) -> None:
     print("\n".join(lines))
 
 
+def _clean_hint_snippet(snippet: str) -> str:
+    text = re.sub(r"\s+", " ", snippet or "").strip()
+    if len(text) > 220:
+        text = text[:217].rstrip() + "..."
+    return text
+
+
+def print_hint(results: list[dict]) -> None:
+    for row in results:
+        # DocStore chunks do not currently store source line numbers; use 1 as
+        # a stable grep-style location placeholder for hook hints.
+        print(f"{row['path']}:1: {_clean_hint_snippet(row.get('snippet', ''))}")
+
+
+def build_hint_fallback_query(query: str) -> str | None:
+    terms = []
+    for term in re.findall(r"[\w.-]{3,}", query, flags=re.UNICODE):
+        if term.upper() in {"AND", "OR", "NOT"}:
+            continue
+        terms.append(term.replace('"', '""'))
+    deduped = list(dict.fromkeys(terms))
+    if len(deduped) < 2:
+        return None
+    return " OR ".join(f'"{term}"' for term in deduped[:6])
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Workspace doc query with auto scope narrowing.")
     parser.add_argument("query")
@@ -220,6 +246,7 @@ def main() -> int:
     parser.add_argument("--cwd", default=os.getcwd())
     parser.add_argument("--db-path", default=str(DEFAULT_DB_PATH or ""))
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--format", choices=["text", "json", "hint"], default="text")
     args = parser.parse_args()
 
     db_path = Path(args.db_path).expanduser()
@@ -233,6 +260,8 @@ def main() -> int:
         if q_slug:
             inferred_slug, slug_reason, cleaned_query = q_slug, q_reason, q_clean
     cleaned_query = strip_fillers(cleaned_query)
+    if args.format == "hint":
+        cleaned_query = build_hint_fallback_query(cleaned_query) or cleaned_query
     inferred_doc_type = None
     doc_type_reason = None
     if not args.doc_type:
@@ -249,7 +278,6 @@ def main() -> int:
         results = run_search(db_path, query, slug, doc_type, args.limit)
         if results:
             break
-
     payload = {
         "query": used_query,
         "original_query": args.query,
@@ -260,8 +288,11 @@ def main() -> int:
         "mode": used_mode,
         "results": results,
     }
-    if args.json:
+    output_format = "json" if args.json else args.format
+    if output_format == "json":
         print(json.dumps(payload, ensure_ascii=False, indent=2))
+    elif output_format == "hint":
+        print_hint(results)
     else:
         print_text(payload, results)
     return 0
