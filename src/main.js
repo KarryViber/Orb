@@ -1,4 +1,7 @@
 import 'dotenv/config';
+import { closeSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { SlackAdapter } from './adapters/slack.js';
 import { WeChatAdapter } from './adapters/wechat.js';
 import { Scheduler } from './scheduler.js';
@@ -9,6 +12,7 @@ import { info, error as logError } from './log.js';
 import { spawnWorker } from './spawn.js';
 
 const TAG = 'main';
+const DAEMON_LOCK_PATH = join(homedir(), 'Orb', '.daemon.lock');
 
 process.on('uncaughtException', (err) => {  if (err?.code === 'EPIPE') return;
   logError(TAG, `uncaughtException: ${err.stack || err.message}`);
@@ -17,7 +21,57 @@ process.on('unhandledRejection', (reason) => {
   logError(TAG, `unhandledRejection: ${reason?.stack || reason}`);
 });
 
+function isPidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err?.code === 'EPERM';
+  }
+}
+
+function readDaemonLockPid() {
+  try {
+    const parsed = JSON.parse(readFileSync(DAEMON_LOCK_PATH, 'utf-8'));
+    const pid = Number(parsed?.pid);
+    return Number.isInteger(pid) ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+function acquireDaemonLock() {
+  mkdirSync(join(DAEMON_LOCK_PATH, '..'), { recursive: true });
+  let fd = null;
+  try {
+    fd = openSync(DAEMON_LOCK_PATH, 'wx');
+    writeFileSync(fd, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }) + '\n', 'utf-8');
+    return () => {
+      try { closeSync(fd); } catch {}
+      try {
+        if (readDaemonLockPid() === process.pid) unlinkSync(DAEMON_LOCK_PATH);
+      } catch {}
+    };
+  } catch (err) {
+    if (fd != null) {
+      try { closeSync(fd); } catch {}
+    }
+    if (err?.code !== 'EEXIST') throw err;
+    const pid = readDaemonLockPid();
+    if (isPidAlive(pid)) {
+      info(TAG, `daemon already running (pid=${pid}), exiting`);
+      process.exit(0);
+    }
+    try { unlinkSync(DAEMON_LOCK_PATH); } catch {}
+    return acquireDaemonLock();
+  }
+}
+
 async function start() {
+  const releaseDaemonLock = acquireDaemonLock();
+  process.once('exit', releaseDaemonLock);
+
   const config = loadConfig();
 
   const profiles = config.profiles;

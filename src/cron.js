@@ -8,13 +8,15 @@
  * This module only reads the file and executes due jobs.
  */
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, unlinkSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { info, error as logError, warn } from './log.js';
 import { writeLessonCandidate } from './lesson-candidates.js';
 
 const TAG = 'cron';
 const TICK_INTERVAL = 60_000; // 60 seconds
+const JOBS_LOCK_TIMEOUT_MS = 5_000;
+const JOBS_LOCK_STALE_MS = 60_000;
 const PROFILE_DM_CHANNELS = {
   karry: 'D0ANGB3M1CZ',
 };
@@ -186,13 +188,78 @@ function loadJobs(dataDir) {
   }
 }
 
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function isPidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err?.code === 'EPERM';
+  }
+}
+
+function readLockPid(lockPath) {
+  try {
+    const raw = readFileSync(lockPath, 'utf-8').trim();
+    const parsed = JSON.parse(raw);
+    const pid = Number(parsed?.pid);
+    return Number.isInteger(pid) ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+function withJobsFileLock(dataDir, fn) {
+  mkdirSync(dataDir, { recursive: true });
+  const lockPath = join(dataDir, 'cron-jobs.json.lock');
+  const startedAt = Date.now();
+  let fd = null;
+
+  while (fd == null) {
+    try {
+      fd = openSync(lockPath, 'wx');
+      writeFileSync(fd, JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }) + '\n', 'utf-8');
+    } catch (err) {
+      if (err?.code !== 'EEXIST') throw err;
+      const pid = readLockPid(lockPath);
+      let stale = !isPidAlive(pid);
+      try {
+        stale = stale || Date.now() - statSync(lockPath).mtimeMs > JOBS_LOCK_STALE_MS;
+      } catch {
+        stale = true;
+      }
+      if (stale) {
+        try { unlinkSync(lockPath); } catch {}
+        continue;
+      }
+      if (Date.now() - startedAt >= JOBS_LOCK_TIMEOUT_MS) {
+        throw new Error(`timed out waiting for ${lockPath}`);
+      }
+      sleepSync(25);
+    }
+  }
+
+  try {
+    return fn();
+  } finally {
+    try { closeSync(fd); } catch {}
+    try { unlinkSync(lockPath); } catch {}
+  }
+}
+
 function saveJobs(dataDir, jobs) {
   const p = jobsPath(dataDir);
   const tmp = p + '.tmp.' + process.pid;
   try {
-    mkdirSync(join(p, '..'), { recursive: true });
-    writeFileSync(tmp, JSON.stringify(jobs, null, 2) + '\n', 'utf-8');
-    renameSync(tmp, p);
+    withJobsFileLock(dataDir, () => {
+      mkdirSync(join(p, '..'), { recursive: true });
+      writeFileSync(tmp, JSON.stringify(jobs, null, 2) + '\n', 'utf-8');
+      renameSync(tmp, p);
+    });
   } catch (err) {
     logError(TAG, `failed to save jobs to ${p}: ${err.message}`);
     try { unlinkSync(tmp); } catch {}

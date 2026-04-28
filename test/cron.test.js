@@ -124,6 +124,32 @@ test('per-job guard prevents concurrent execution of the same job', async () => 
   await scheduler._awaitJobWrites(dataDir);
 });
 
+test('queued job writes merge concurrent scheduler updates', async () => {
+  const dataDir = createTempDataDir();
+  const scheduler = createScheduler(dataDir, async () => 'ok');
+
+  writeJobs(dataDir, [
+    createJob('job-1', { nextRunAt: '2026-01-01T00:00:00.000Z' }),
+    createJob('job-2', { nextRunAt: '2026-01-01T00:00:00.000Z' }),
+  ]);
+
+  await Promise.all([
+    scheduler._queueJobWrite(dataDir, (jobs) => {
+      jobs.find((job) => job.id === 'job-1').nextRunAt = '2026-01-01T00:01:00.000Z';
+      return true;
+    }),
+    scheduler._queueJobWrite(dataDir, (jobs) => {
+      jobs.find((job) => job.id === 'job-2').nextRunAt = '2026-01-01T00:02:00.000Z';
+      return true;
+    }),
+  ]);
+
+  assert.deepEqual(readJobs(dataDir).map((job) => [job.id, job.nextRunAt]), [
+    ['job-1', '2026-01-01T00:01:00.000Z'],
+    ['job-2', '2026-01-01T00:02:00.000Z'],
+  ]);
+});
+
 test('per-job guard is scoped per profile for identical job ids', async () => {
   const alphaDataDir = createTempDataDir();
   const betaDataDir = createTempDataDir();
