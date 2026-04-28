@@ -91,7 +91,7 @@ Scheduler and worker communicate over Node IPC.
 | `progress_update` | `text` | Todo/progress card update |
 | `intermediate_text` | `text` | Mid-turn assistant text |
 | `turn_end` | none | Turn finished on Claude side |
-| `turn_complete` | `text`, `toolCount`, `lastTool`, `stopReason`, `deliveredTexts`, optional `undeliveredText` | Deliver one Claude turn while keeping the worker alive |
+| `turn_complete` | `text`, `toolCount`, `lastTool`, `stopReason`, `segments` | Deliver one Claude turn while keeping the worker alive |
 | `result` | `text`, `toolCount`, optional `lastTool`, optional `stopReason` | Final worker result before exit |
 | `error` | `error`, optional `errorContext` | Terminal failure |
 

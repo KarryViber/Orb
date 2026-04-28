@@ -112,10 +112,10 @@ function getTaskCardStreamErrorCode(err) {
   return match?.[1] || null;
 }
 
-function computeUndeliveredWithLedger(finalText, deliveredTexts = []) {
+function computeUndeliveredWithLedger(finalText, segments = []) {
   const ledger = new TurnEgressLedger();
-  if (Array.isArray(deliveredTexts)) {
-    for (const entry of deliveredTexts) {
+  if (Array.isArray(segments)) {
+    for (const entry of segments) {
       ledger.record('legacy_segment', typeof entry === 'string' ? entry : '');
     }
   }
@@ -125,10 +125,7 @@ function computeUndeliveredWithLedger(finalText, deliveredTexts = []) {
 export const subtractDeliveredText = computeUndeliveredWithLedger;
 
 export function resolveTurnCompleteDeliveryText(msg) {
-  if (typeof msg?.undeliveredText === 'string') {
-    return msg.undeliveredText.trim() ? msg.undeliveredText : '';
-  }
-  return computeUndeliveredWithLedger(msg?.text, msg?.deliveredTexts);
+  return computeUndeliveredWithLedger(msg?.text, msg?.segments);
 }
 
 export function makeTaskCardState({ enabled = false, deferred = false } = {}) {
@@ -993,9 +990,8 @@ export class Scheduler {
     };
 
     const recordWorkerDeliveredSegments = (msg) => {
-      // TODO(commit 3): delete this shim after worker IPC sends `segments`.
-      if (!Array.isArray(msg?.deliveredTexts)) return;
-      for (const entry of msg.deliveredTexts) {
+      if (!Array.isArray(msg?.segments)) return;
+      for (const entry of msg.segments) {
         if (typeof entry !== 'string' || !entry.trim()) continue;
         if (!turn.ledger.isAlreadyDelivered(entry)) {
           turn.ledger.record('worker_segment', entry);

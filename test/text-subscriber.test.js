@@ -29,14 +29,14 @@ function textEvent(turnId, text) {
 }
 
 function createTurn(streamId = null) {
-  const deliveredTexts = [];
+  const segments = [];
   return {
     intermediateDeliveredThisTurn: false,
     taskCardState: { streamId, failed: false },
     egress: {
-      deliveredTexts,
+      segments,
       admit(text) {
-        deliveredTexts.push(text);
+        segments.push(text);
         return true;
       },
     },
@@ -58,7 +58,7 @@ test('SlackTextSubscriber debounces text and appends markdown_text to an open st
     ['appendStream', 'stream-1', [{ type: 'markdown_text', text: 'first\nsecond' }]],
   ]);
   assert.equal(turn.intermediateDeliveredThisTurn, true);
-  assert.deepEqual(turn.egress.deliveredTexts, ['first\nsecond']);
+  assert.deepEqual(turn.egress.segments, ['first\nsecond']);
 });
 
 test('SlackTextSubscriber sends a reply when no task-card stream is open', async () => {
@@ -75,7 +75,7 @@ test('SlackTextSubscriber sends a reply when no task-card stream is open', async
     ['sendReply', 'C1', '111.222', 'plain text', {}],
   ]);
   assert.equal(turn.intermediateDeliveredThisTurn, true);
-  assert.deepEqual(turn.egress.deliveredTexts, ['plain text']);
+  assert.deepEqual(turn.egress.segments, ['plain text']);
 });
 
 test('SlackTextSubscriber flushes pending text immediately on result', async () => {
