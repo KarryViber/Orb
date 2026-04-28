@@ -18,7 +18,7 @@
 | `tool_use(其他)` | append(category) | noop | noop | set(toolName) | noop |
 | `tool_result` | noop | noop | noop | clear | noop |
 | `text` | noop | noop | append(debounce) | noop | noop |
-| `result` | stopStream(settled chunks) | stopStream(last snapshot) | flush | clear | deliver if pending final text |
+| `result` | stopStream(settled chunks) | stopStream(last snapshot) | flush | clear | deliver if undeliveredText |
 | `turn_abort` | abandon | abandon | flush/noop | clear | noop |
 
 ## 已知边界 / 反例

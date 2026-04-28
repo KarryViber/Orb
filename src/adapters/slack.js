@@ -268,13 +268,6 @@ export function createSlackPlanSubscriber(adapter) {
 export function createSlackTextSubscriber(adapter, { debounceMs = TEXT_DEBOUNCE_MS } = {}) {
   const turns = new Map();
 
-  const recordIntermediateDelivery = (turn, text) => {
-    const ledger = turn?.ledger;
-    if (!ledger || typeof ledger.record !== 'function') return;
-    if (typeof ledger.isAlreadyDelivered === 'function' && ledger.isAlreadyDelivered(text)) return;
-    ledger.record('intermediate', text);
-  };
-
   const clearState = (key) => {
     const state = turns.get(key);
     if (state?.timer) clearTimeout(state.timer);
@@ -301,7 +294,6 @@ export function createSlackTextSubscriber(adapter, { debounceMs = TEXT_DEBOUNCE_
     if (streamId && !taskCardState?.failed && typeof adapter.appendStream === 'function') {
       try {
         await adapter.appendStream(streamId, [{ type: 'markdown_text', text }]);
-        recordIntermediateDelivery(turn, text);
         if (turn) turn.intermediateDeliveredThisTurn = true;
         if (turn?.egress) turn.egress.admit(text, 'intermediate');
         ctx?.markStreamDelivered?.();
@@ -336,7 +328,6 @@ export function createSlackTextSubscriber(adapter, { debounceMs = TEXT_DEBOUNCE_
       for (const payload of payloads) {
         await adapter.sendReply(channel, threadTs, payload.text, payload.blocks ? { blocks: payload.blocks } : {});
       }
-      recordIntermediateDelivery(turn, text);
       if (turn) turn.intermediateDeliveredThisTurn = true;
       ctx?.markStreamDelivered?.();
     } catch (err) {

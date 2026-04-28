@@ -27,7 +27,7 @@ import { storeConversation } from './memory.js';
  * Worker -> Scheduler:
  *   { type: 'turn_start', injectId? }  — explicit turn ownership start on task/inject receipt
  *   { type: 'turn_end' }  — explicit turn ownership end when Claude emits result
- *   { type: 'turn_complete', text, toolCount, lastTool, stopReason, channelSemantics, segments, gitDiffSummary? }
+ *   { type: 'turn_complete', text, toolCount, lastTool, stopReason, channelSemantics, deliveredTexts, undeliveredText?, gitDiffSummary? }
  *     - one Claude turn finished; scheduler may deliver text while keeping the worker alive for injects.
  *   { type: 'cc_event', turnId, eventType, payload }  — raw Claude Code event forwarded to scheduler subscribers
  *   { type: 'inject_failed', injectId?, userText, fileContent?, imagePaths? }  — follow-up inject could not reach CLI;
@@ -256,11 +256,11 @@ process.on('message', async (msg) => {
           turnId: _currentTurnId,
           manifest: _currentMemoryManifest,
           toolInputs: turn.toolInputs || [],
-          finalText: turn.text || '',
+          finalText: turn.text || turn.undeliveredText || '',
         }).catch((err) => console.warn(`[worker] memory usage record failed: ${err.message}`));
         if (turn.text?.trim()) {
           const gitDiffSummary = await collectGitDiffSummary(WORKSPACE, _currentTurnModifiedPaths);
-          _lastEmittedTurnText = turn.text || '';
+          _lastEmittedTurnText = turn.text || turn.undeliveredText || '';
           await ipcSend({
             type: 'turn_complete',
             text: turn.text,
@@ -268,7 +268,8 @@ process.on('message', async (msg) => {
             lastTool: turn.lastTool,
             stopReason: turn.stopReason,
             channelSemantics: _currentChannelSemantics,
-            segments: turn.segments || [],
+            deliveredTexts: turn.deliveredTexts || [],
+            undeliveredText: turn.undeliveredText,
             gitDiffSummary,
           });
         }
@@ -834,7 +835,8 @@ function runClaudeInteractive(args, initialContent, workspace) {
   let lastTurnText = '';
   let onTurnComplete = null;
   let onTurnEnd = null;
-  let segments = [];
+  let deliveredTexts = [];
+  let accumulatedDelivered = '';
   let closed = false;
   let turnOpen = true;
   let taskCardEmittedInTurn = false;
@@ -978,12 +980,14 @@ function runClaudeInteractive(args, initialContent, workspace) {
       if (turnText && turnText !== lastTurnText) {
         lastTurnText = turnText;
         if (onTurnComplete) {
+          const undeliveredText = computeUndeliveredTurnText(turnText, accumulatedDelivered, deliveredTexts);
           onTurnComplete({
             text: turnText,
             toolCount: totalToolCount,
             lastTool,
             stopReason: lastStopReason,
-            segments: [...segments],
+            deliveredTexts: [...deliveredTexts],
+            undeliveredText,
             toolInputs: [...turnToolInputs],
           });
         }
@@ -991,7 +995,8 @@ function runClaudeInteractive(args, initialContent, workspace) {
         lastTurnText = turnText;
       }
       resetTurnStreamingState();
-      segments = [];
+      deliveredTexts = [];
+      accumulatedDelivered = '';
       turnBuffer = [];
       resetIdleTimer();
     }
@@ -1076,6 +1081,31 @@ function ipcSend(msg) {
 
 function sanitizeFileToken(value) {
   return String(value || 'unknown').replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 80) || 'unknown';
+}
+
+export function computeUndeliveredTurnText(finalText, accumulatedDelivered = '', deliveredTexts = []) {
+  const text = typeof finalText === 'string' ? finalText : '';
+  if (!text.trim()) return '';
+
+  const accumulated = typeof accumulatedDelivered === 'string' ? accumulatedDelivered : '';
+  if (accumulated.trim()) {
+    if (text === accumulated || accumulated.includes(text)) return '';
+    if (text.startsWith(accumulated)) return text.slice(accumulated.length);
+    if (text.endsWith(accumulated)) return text.slice(0, text.length - accumulated.length);
+  }
+
+  const deliveredJoined = Array.isArray(deliveredTexts)
+    ? deliveredTexts.map((entry) => typeof entry === 'string' ? entry : '').join('')
+    : '';
+  if (deliveredJoined.trim()) {
+    if (text === deliveredJoined || deliveredJoined.includes(text)) return '';
+    if (text.startsWith(deliveredJoined)) return text.slice(deliveredJoined.length);
+    if (text.endsWith(deliveredJoined)) return text.slice(0, text.length - deliveredJoined.length);
+  }
+
+  const trimmedText = text.trim();
+  const deliveredSet = new Set((deliveredTexts || []).map((entry) => String(entry || '').trim()).filter(Boolean));
+  return deliveredSet.has(trimmedText) ? '' : text;
 }
 
 function buildUserContent({ userText, fileContent, imagePaths, workspace }) {
