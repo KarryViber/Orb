@@ -1,20 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { computeUndeliveredTurnText } from '../src/worker.js';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 
-test('computeUndeliveredTurnText only returns the remaining suffix after streamed chunks', () => {
-  const chunkA = '先说 A。';
-  const finalText = '先说 A。\n\n然后 B 和 C。';
+const root = dirname(dirname(fileURLToPath(import.meta.url)));
+const removedTurnTextMarker = ['_last', 'Emitted', 'TurnText'].join('');
+const removedDiffHelper = ['compute', 'Undelivered', 'TurnText'].join('');
 
-  const undelivered = computeUndeliveredTurnText(finalText, chunkA, [chunkA]);
+test('worker result IPC never carries final text', () => {
+  const source = readFileSync(join(root, 'src', 'worker.js'), 'utf8');
 
-  assert.equal(undelivered, '\n\n然后 B 和 C。');
-});
-
-test('computeUndeliveredTurnText skips fully delivered finals', () => {
-  const finalText = '已经完整发过了';
-
-  const undelivered = computeUndeliveredTurnText(finalText, finalText, [finalText]);
-
-  assert.equal(undelivered, '');
+  assert.equal(source.includes(removedDiffHelper), false);
+  assert.equal(source.includes(removedTurnTextMarker), false);
+  assert.match(source, /type:\s*'result',\s*\n\s*text:\s*''/);
 });

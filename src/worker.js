@@ -77,10 +77,6 @@ let _currentProfileName = null;
 let _currentDataDir = null;
 let _currentChannelSemantics = 'reply';
 let _currentTurnModifiedPaths = new Set();
-// Last full turn text emitted via turn_complete IPC. Exit path compares against
-// exitResult.lastTurnText and suppresses duplicate result text when the
-// scheduler has already handled that turn through turn_complete delivery.
-let _lastEmittedTurnText = null;
 let _currentMemoryManifest = [];
 
 process.on('message', async (msg) => {
@@ -89,7 +85,6 @@ process.on('message', async (msg) => {
       beginCcTurn();
       const injected = _activeCli.inject(msg.userText, msg.fileContent, msg.imagePaths);
       if (injected) {
-        _lastEmittedTurnText = null;
         await ipcSend({ type: 'turn_start', injectId: msg.injectId || null }).catch(() => {});
         console.log(`[worker] injected: "${(msg.userText || '').slice(0, 60)}"`);
       } else {
@@ -121,7 +116,6 @@ process.on('message', async (msg) => {
 
   let { userText, fileContent, imagePaths, threadTs, channel, userId, platform, profile, threadHistory, model, effort, mode, priorConversation, disablePermissionPrompt, maxTurns } = msg;
   _currentChannelSemantics = normalizeChannelSemantics(msg.channelSemantics);
-  _lastEmittedTurnText = null;
   beginCcTurn({
     threadTs,
     profileName: profile?.name,
@@ -138,7 +132,7 @@ process.on('message', async (msg) => {
       try {
         process.send({
           type: 'result',
-          text: '[skipped: no context]',
+          text: '',
           toolCount: 0,
           channelSemantics: _currentChannelSemantics,
           exitOnly: true,
@@ -260,7 +254,6 @@ process.on('message', async (msg) => {
         }).catch((err) => console.warn(`[worker] memory usage record failed: ${err.message}`));
         if (turn.text?.trim()) {
           const gitDiffSummary = await collectGitDiffSummary(WORKSPACE, _currentTurnModifiedPaths);
-          _lastEmittedTurnText = turn.text || turn.undeliveredText || '';
           await ipcSend({
             type: 'turn_complete',
             text: turn.text,
@@ -268,8 +261,6 @@ process.on('message', async (msg) => {
             lastTool: turn.lastTool,
             stopReason: turn.stopReason,
             channelSemantics: _currentChannelSemantics,
-            deliveredTexts: turn.deliveredTexts || [],
-            undeliveredText: turn.undeliveredText,
             gitDiffSummary,
           });
         }
@@ -326,30 +317,17 @@ process.on('message', async (msg) => {
       await updateSession(dataDir, sessionKey, { sessionId: exitResult.sessionId, userId });
     }
 
-    // Send final result (last turn's output).
-    // Suppress text if it matches what turn_complete already delivered — prevents the
-    // canvas stopStream + exit-path sendReply from posting the same text twice.
-    const exitText = exitResult.lastTurnText || '';
-    const shouldSuppressText = !!exitText && exitText.trim() === (_lastEmittedTurnText || '').trim();
+    // Send final result as an exit/status signal only. turn_complete is the only
+    // worker IPC message that carries deliverable final text.
     await ipcSend({
       type: 'result',
-      text: shouldSuppressText ? '' : exitText,
+      text: '',
       toolCount: exitResult.toolCount,
       lastTool: exitResult.lastTool,
       stopReason: exitResult.stopReason,
       channelSemantics: _currentChannelSemantics,
       exitOnly: true,
     });
-    if (exitText && exitText.trim() !== (_lastEmittedTurnText || '').trim()) {
-      recordMemoryUsage({
-        dataDir,
-        threadId: threadTs,
-        turnId: _currentTurnId,
-        manifest: _currentMemoryManifest,
-        toolInputs: exitResult.toolInputs || [],
-        finalText: exitText,
-      }).catch((err) => console.warn(`[worker] memory usage record failed: ${err.message}`));
-    }
 
     const memDbPath = join(dataDir, 'memory.db');
     storeConversation({ userText, responseText: exitResult.lastTurnText || '', threadTs, userId, dbPath: memDbPath }).catch(() => {});
@@ -835,8 +813,6 @@ function runClaudeInteractive(args, initialContent, workspace) {
   let lastTurnText = '';
   let onTurnComplete = null;
   let onTurnEnd = null;
-  let deliveredTexts = [];
-  let accumulatedDelivered = '';
   let closed = false;
   let turnOpen = true;
   let taskCardEmittedInTurn = false;
@@ -980,14 +956,11 @@ function runClaudeInteractive(args, initialContent, workspace) {
       if (turnText && turnText !== lastTurnText) {
         lastTurnText = turnText;
         if (onTurnComplete) {
-          const undeliveredText = computeUndeliveredTurnText(turnText, accumulatedDelivered, deliveredTexts);
           onTurnComplete({
             text: turnText,
             toolCount: totalToolCount,
             lastTool,
             stopReason: lastStopReason,
-            deliveredTexts: [...deliveredTexts],
-            undeliveredText,
             toolInputs: [...turnToolInputs],
           });
         }
@@ -995,8 +968,6 @@ function runClaudeInteractive(args, initialContent, workspace) {
         lastTurnText = turnText;
       }
       resetTurnStreamingState();
-      deliveredTexts = [];
-      accumulatedDelivered = '';
       turnBuffer = [];
       resetIdleTimer();
     }
@@ -1081,31 +1052,6 @@ function ipcSend(msg) {
 
 function sanitizeFileToken(value) {
   return String(value || 'unknown').replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 80) || 'unknown';
-}
-
-export function computeUndeliveredTurnText(finalText, accumulatedDelivered = '', deliveredTexts = []) {
-  const text = typeof finalText === 'string' ? finalText : '';
-  if (!text.trim()) return '';
-
-  const accumulated = typeof accumulatedDelivered === 'string' ? accumulatedDelivered : '';
-  if (accumulated.trim()) {
-    if (text === accumulated || accumulated.includes(text)) return '';
-    if (text.startsWith(accumulated)) return text.slice(accumulated.length);
-    if (text.endsWith(accumulated)) return text.slice(0, text.length - accumulated.length);
-  }
-
-  const deliveredJoined = Array.isArray(deliveredTexts)
-    ? deliveredTexts.map((entry) => typeof entry === 'string' ? entry : '').join('')
-    : '';
-  if (deliveredJoined.trim()) {
-    if (text === deliveredJoined || deliveredJoined.includes(text)) return '';
-    if (text.startsWith(deliveredJoined)) return text.slice(deliveredJoined.length);
-    if (text.endsWith(deliveredJoined)) return text.slice(0, text.length - deliveredJoined.length);
-  }
-
-  const trimmedText = text.trim();
-  const deliveredSet = new Set((deliveredTexts || []).map((entry) => String(entry || '').trim()).filter(Boolean));
-  return deliveredSet.has(trimmedText) ? '' : text;
 }
 
 function buildUserContent({ userText, fileContent, imagePaths, workspace }) {
