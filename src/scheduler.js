@@ -801,19 +801,25 @@ export class Scheduler {
     }
     info(TAG, `profile resolved: user=${userId} → ${profile.name} (${profile.workspaceDir})`);
 
-    // 消息前缀解析模型 / effort（可选覆盖）
-    let effectiveModel = null;
-    let effectiveEffort = null;
+    // 优先级最高：task 已显式指定（cron / executeTask 程序化调用）
+    let effectiveModel = task.model || null;
+    let effectiveEffort = task.effort || null;
     let effectiveText = userText || '';
-    const modelMatch = effectiveText.match(/^\[(haiku|sonnet|opus)\]\s+/i);
-    if (modelMatch) {
-      effectiveModel = modelMatch[1].toLowerCase();
-      effectiveText = effectiveText.slice(modelMatch[0].length);
+
+    // 消息前缀解析模型 / effort（可选覆盖）
+    if (!effectiveModel) {
+      const modelMatch = effectiveText.match(/^\[(haiku|sonnet|opus)\]\s+/i);
+      if (modelMatch) {
+        effectiveModel = modelMatch[1].toLowerCase();
+        effectiveText = effectiveText.slice(modelMatch[0].length);
+      }
     }
-    const effortMatch = effectiveText.match(/^\[effort:(low|medium|high|xhigh|max)\]\s+/i);
-    if (effortMatch) {
-      effectiveEffort = effortMatch[1].toLowerCase();
-      effectiveText = effectiveText.slice(effortMatch[0].length);
+    if (!effectiveEffort) {
+      const effortMatch = effectiveText.match(/^\[effort:(low|medium|high|xhigh|max)\]\s+/i);
+      if (effortMatch) {
+        effectiveEffort = effortMatch[1].toLowerCase();
+        effectiveText = effectiveText.slice(effortMatch[0].length);
+      }
     }
 
     // 关键词自动升 xhigh（若未手动指定 effort）
@@ -822,7 +828,7 @@ export class Scheduler {
       info(TAG, `effort escalated to xhigh by keyword match`);
     }
 
-    // Fallback: 前缀 > 关键词 > config.defaults > 内置兜底（getDefaults 已保证 effort 非空）
+    // Fallback: task fields > 前缀 > 关键词 > config.defaults > 内置兜底（getDefaults 已保证 effort 非空）
     const defaults = getDefaults();
     if (!effectiveModel) effectiveModel = defaults.model;
     if (!effectiveEffort) effectiveEffort = defaults.effort;
