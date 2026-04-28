@@ -1,5 +1,6 @@
 import { join } from 'node:path';
 import net from 'node:net';
+import { randomUUID } from 'node:crypto';
 import { appendFileSync, readdirSync, readFileSync, existsSync, statSync, unlinkSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { info, error as logError, warn } from './log.js';
@@ -53,6 +54,7 @@ const PERSISTED_TASK_FIELDS = [
   'deferDeliveryUntilResult',
   'enableTaskCard',
   'channelSemantics',
+  'attemptId',
 ];
 
 // --- Effort escalation keywords ---
@@ -99,6 +101,24 @@ function sanitizeTaskForPersistence(task) {
     }
   }
   return persisted;
+}
+
+function makeAttemptId() {
+  return `attempt-${randomUUID()}`;
+}
+
+function ensureAttemptId(task) {
+  if (!task || typeof task !== 'object') return task;
+  if (!task.attemptId) task.attemptId = makeAttemptId();
+  return task.attemptId;
+}
+
+function taskDedupKey(task, fallbackThreadTs = null) {
+  const attemptId = task?.attemptId;
+  if (!attemptId) return null;
+  const threadTs = task?.threadTs || fallbackThreadTs;
+  if (!threadTs) return null;
+  return `${threadTs}:${attemptId}`;
 }
 
 function isSilentResultText(text) {
@@ -255,6 +275,7 @@ export function buildRespawnTaskForInjectFailed({
     enableTaskCard: failedTask?.enableTaskCard ?? task.enableTaskCard,
     deferDeliveryUntilResult: failedTask?.deferDeliveryUntilResult ?? deferDeliveryUntilResult,
     channelSemantics: normalizeChannelSemantics(failedTask?.channelSemantics ?? task.channelSemantics ?? channelSemantics),
+    attemptId: failedTask?.attemptId ?? msg.attemptId ?? task.attemptId ?? makeAttemptId(),
   };
 }
 
@@ -620,11 +641,33 @@ export class Scheduler {
     const threadQueues = raw.threadQueues && typeof raw.threadQueues === 'object'
       ? raw.threadQueues
       : {};
-    return { globalQueue, threadQueues };
+    const seen = new Set();
+    const dedupQueue = (queue, fallbackThreadTs = null) => {
+      const out = [];
+      for (const task of Array.isArray(queue) ? queue : []) {
+        if (!task) continue;
+        const key = taskDedupKey(task, fallbackThreadTs);
+        if (key && seen.has(key)) {
+          warn(TAG, `startup replay deduped task attempt=${task.attemptId} thread=${task.threadTs || fallbackThreadTs || 'unknown'} from ${queuePath}`);
+          continue;
+        }
+        if (key) seen.add(key);
+        out.push(task);
+      }
+      return out;
+    };
+    const dedupedGlobalQueue = dedupQueue(globalQueue);
+    const dedupedThreadQueues = {};
+    for (const [threadTs, queue] of Object.entries(threadQueues)) {
+      const deduped = dedupQueue(queue, threadTs);
+      if (deduped.length > 0) dedupedThreadQueues[threadTs] = deduped;
+    }
+    return { globalQueue: dedupedGlobalQueue, threadQueues: dedupedThreadQueues };
   }
 
   async submit(task) {
     const { threadTs, channel, platform } = task;
+    ensureAttemptId(task);
     const adapter = this._getAdapter(platform);
     if (!adapter) {
       logError(TAG, `submit failed: no adapter for platform=${platform} thread=${threadTs}`);
@@ -653,6 +696,7 @@ export class Scheduler {
       const injectId = `inject-${this._nextInjectId++}`;
       const injectTask = {
         ...task,
+        attemptId: task.attemptId,
         deliveryThreadTs: task.deliveryThreadTs === undefined
           ? (entry?.deliveryThreadTs ?? threadTs ?? null)
           : task.deliveryThreadTs,
@@ -669,6 +713,7 @@ export class Scheduler {
           userText: task.userText,
           fileContent: task.fileContent,
           imagePaths: task.imagePaths,
+          attemptId: injectTask.attemptId,
         });
         info(TAG, `injected into active worker: thread=${threadTs}`);
         return;
@@ -1071,6 +1116,7 @@ export class Scheduler {
             userId,
             platform,
             teamId: task.teamId || null,
+            attemptId: task.attemptId,
             threadHistory: task.threadHistory,
             profile,
             maxTurns: task.maxTurns || null,
@@ -1161,6 +1207,7 @@ export class Scheduler {
           userId,
           platform,
           teamId: task.teamId || null,
+          attemptId: task.attemptId,
           channelSemantics,
           threadHistory: task.threadHistory,
           model: effectiveModel,

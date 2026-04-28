@@ -15,22 +15,22 @@ import { storeConversation } from './memory.js';
  * Scheduler -> Worker:
  *   { type: 'task', userText, fileContent, imagePaths, threadTs, channel,
  *                   userId, platform, threadHistory, profile, model, effort,
- *                   channelSemantics?, mode?, priorConversation?, disablePermissionPrompt?, maxTurns? }
+ *                   channelSemantics?, attemptId?, mode?, priorConversation?, disablePermissionPrompt?, maxTurns? }
  *     - channelSemantics: 'reply' (default) delivers turn text to the thread;
  *       'silent' suppresses successful worker text delivery in the scheduler;
  *       'broadcast' is reserved for top-level channel delivery.
  *     - mode: 'skill-review' enters a dedicated branch that requires
  *       priorConversation; context.js injects it as "## 待审查会话".
  *     - priorConversation: [{role: 'user'|'assistant', content: string}, ...]
- *   { type: 'inject', injectId?, userText, fileContent?, imagePaths? }
+ *   { type: 'inject', injectId?, attemptId?, userText, fileContent?, imagePaths? }
  *
  * Worker -> Scheduler:
- *   { type: 'turn_start', injectId? }  — explicit turn ownership start on task/inject receipt
+ *   { type: 'turn_start', injectId?, attemptId? }  — explicit turn ownership start on task/inject receipt
  *   { type: 'turn_end' }  — explicit turn ownership end when Claude emits result
  *   { type: 'turn_complete', text, toolCount, lastTool, stopReason, channelSemantics, deliveredTexts, undeliveredText?, gitDiffSummary? }
  *     - one Claude turn finished; scheduler may deliver text while keeping the worker alive for injects.
- *   { type: 'cc_event', turnId, eventType, payload }  — raw Claude Code event forwarded to scheduler subscribers
- *   { type: 'inject_failed', injectId?, userText, fileContent?, imagePaths? }  — follow-up inject could not reach CLI;
+ *   { type: 'cc_event', turnId, attemptId?, eventType, payload }  — raw Claude Code event forwarded to scheduler subscribers
+ *   { type: 'inject_failed', injectId?, attemptId?, userText, fileContent?, imagePaths? }  — follow-up inject could not reach CLI;
  *     scheduler should respawn a fresh worker and replay the user payload.
  *   { type: 'error', error, errorContext? }
  *   { type: 'result', text, stopReason?, channelSemantics, exitOnly: true, toolCount?, lastTool? }
@@ -73,6 +73,7 @@ let _activeCli = null;   // reference to active interactive CLI session
 let _currentTurnId = null;
 let _currentJobId = null;
 let _currentThreadTs = null;
+let _currentAttemptId = null;
 let _currentProfileName = null;
 let _currentDataDir = null;
 let _currentChannelSemantics = 'reply';
@@ -82,10 +83,10 @@ let _currentMemoryManifest = [];
 process.on('message', async (msg) => {
   if (msg.type === 'inject') {
     if (_activeCli) {
-      beginCcTurn();
+      beginCcTurn({ attemptId: msg.attemptId || null });
       const injected = _activeCli.inject(msg.userText, msg.fileContent, msg.imagePaths);
       if (injected) {
-        await ipcSend({ type: 'turn_start', injectId: msg.injectId || null }).catch(() => {});
+        await ipcSend({ type: 'turn_start', injectId: msg.injectId || null, attemptId: msg.attemptId || null }).catch(() => {});
         console.log(`[worker] injected: "${(msg.userText || '').slice(0, 60)}"`);
       } else {
         clearCcTurn();
@@ -93,6 +94,7 @@ process.on('message', async (msg) => {
         await ipcSend({
           type: 'inject_failed',
           injectId: msg.injectId || null,
+          attemptId: msg.attemptId || null,
           userText: msg.userText,
           fileContent: msg.fileContent,
           imagePaths: msg.imagePaths,
@@ -104,6 +106,7 @@ process.on('message', async (msg) => {
       await ipcSend({
         type: 'inject_failed',
         injectId: msg.injectId || null,
+        attemptId: msg.attemptId || null,
         userText: msg.userText,
         fileContent: msg.fileContent,
         imagePaths: msg.imagePaths,
@@ -114,14 +117,15 @@ process.on('message', async (msg) => {
   }
   if (msg.type !== 'task') return;
 
-  let { userText, fileContent, imagePaths, threadTs, channel, userId, platform, profile, threadHistory, model, effort, mode, priorConversation, disablePermissionPrompt, maxTurns } = msg;
+  let { userText, fileContent, imagePaths, threadTs, channel, userId, platform, profile, threadHistory, model, effort, mode, priorConversation, disablePermissionPrompt, maxTurns, attemptId } = msg;
   _currentChannelSemantics = normalizeChannelSemantics(msg.channelSemantics);
   beginCcTurn({
     threadTs,
+    attemptId,
     profileName: profile?.name,
     dataDir: profile?.dataDir || process.cwd(),
   });
-  await ipcSend({ type: 'turn_start' }).catch(() => {});
+  await ipcSend({ type: 'turn_start', attemptId: attemptId || null }).catch(() => {});
 
   // Fail-fast: skill-review mode without context produces "no skill" noise.
   // Without real content to review the worker is just burning tokens on nothing.
@@ -521,11 +525,12 @@ export async function collectGitDiffSummary(cwd, modifiedPaths = new Set()) {
   }
 }
 
-function beginCcTurn({ threadTs, profileName, dataDir } = {}) {
+function beginCcTurn({ threadTs, attemptId, profileName, dataDir } = {}) {
   if (threadTs !== undefined) {
     _currentThreadTs = threadTs;
     _currentJobId = typeof threadTs === 'string' && threadTs.startsWith('cron:') ? threadTs : null;
   }
+  if (attemptId !== undefined) _currentAttemptId = attemptId || null;
   if (profileName !== undefined) _currentProfileName = profileName || 'default';
   if (dataDir !== undefined) _currentDataDir = dataDir;
   _currentTurnModifiedPaths.clear();
@@ -534,6 +539,7 @@ function beginCcTurn({ threadTs, profileName, dataDir } = {}) {
 
 function clearCcTurn() {
   _currentTurnId = null;
+  _currentAttemptId = null;
 }
 
 function runMemoryUsageScript(scriptName, payload) {
@@ -626,6 +632,7 @@ function writeCcEvent({ event_type, payload }) {
       turn_id: _currentTurnId,
       job_id: _currentJobId,
       profile: _currentProfileName || 'default',
+      attempt_id: _currentAttemptId || null,
       event_type,
       payload: payload || {},
     })}\n`);
@@ -639,6 +646,7 @@ function sendCcEvent(eventType, payload) {
   ipcSend({
     type: 'cc_event',
     turnId: _currentTurnId,
+    attemptId: _currentAttemptId || null,
     eventType,
     payload,
   }).catch(() => {});
