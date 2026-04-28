@@ -8,6 +8,7 @@
  * This module only reads the file and executes due jobs.
  */
 
+import { randomUUID } from 'node:crypto';
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { info, error as logError, warn } from './log.js';
@@ -298,13 +299,11 @@ export class CronScheduler {
   /**
    * @param {object} opts
    * @param {Function} opts.getProfilePaths - (profileName) => { dataDir, workspaceDir, scriptsDir }
-   * @param {Function} opts.spawnCronWorker - (job, profilePaths) => Promise<{ text: string, stopReason?: string | null }>
-   * @param {Function} opts.deliverResult - (job, text) => Promise<void>
+   * @param {object} [opts.scheduler] - Scheduler with executeTask()
    */
-  constructor({ getProfilePaths, spawnCronWorker, deliverResult }) {
+  constructor({ getProfilePaths, scheduler = null }) {
     this._getProfilePaths = getProfilePaths;
-    this._spawnCronWorker = spawnCronWorker;
-    this._deliverResult = deliverResult;
+    this._scheduler = scheduler;
     this._running = false;
     this._inflightJobs = new Set();
     this._jobWriteChains = new Map();
@@ -421,11 +420,7 @@ export class CronScheduler {
 
     this._inflightJobs.add(inflightKey);
     info(TAG, `executing job ${job.id} "${job.name}" (profile=${job.profileName})`);
-    let failureDelivered = false;
-    const deliverFailure = async (reason, errorContext = '') => {
-      if (failureDelivered) return;
-      failureDelivered = true;
-      await this._deliverCronFailureDM(job, reason, errorContext);
+    const recordFailureLesson = (reason, errorContext = '') => {
       try {
         writeLessonCandidate(paths.dataDir, {
           source: 'cron-failure',
@@ -441,98 +436,62 @@ export class CronScheduler {
     };
 
     try {
-      const deliver = job.deliver || null;
-      const nativeTaskCardEnabled = job.enableTaskCard !== false;
-      const scheduler = globalThis.__orbSchedulerInstance;
+      const scheduler = this._getScheduler();
+      if (typeof scheduler?.executeTask !== 'function') {
+        throw new Error('scheduler executeTask unavailable for cron job');
+      }
+      const delivery = this._resolveDelivery(job);
+      const jobRunId = `${job.id}:${now.getTime()}:${randomUUID()}`;
       let responseText = '';
       let stopReason = null;
-      let deliveredByScheduler = false;
 
-      if (
-        nativeTaskCardEnabled
-        && deliver?.platform === 'slack'
-        && deliver?.channel
-        && typeof scheduler?.executeTask === 'function'
-      ) {
-        const result = await scheduler.executeTask({
-          userText: job.prompt,
-          fileContent: '',
-          imagePaths: [],
-          threadTs: `cron:${job.id}`,
-          deliveryThreadTs: deliver.threadTs || null,
-          channel: deliver.channel,
-          userId: null,
-          platform: deliver.platform,
-          channelSemantics: 'silent',
-          threadHistory: null,
-          model: job.model || null,
-          effort: job.effort || null,
-          maxTurns: job.maxTurns || null,
-          enableTaskCard: false,
-          forceNewWorker: true,
-          profile: {
-            name: job.profileName,
-            workspaceDir: paths.workspaceDir,
-            dataDir: paths.dataDir,
-            scriptsDir: paths.scriptsDir,
-          },
-        });
-        responseText = result?.text || '';
-        stopReason = result?.stopReason || null;
-        deliveredByScheduler = true;
-      } else {
-        const result = await this._spawnCronWorker({
-          ...job,
-          enableTaskCard: nativeTaskCardEnabled,
-          maxTurns: job.maxTurns || null,
-          channelSemantics: 'silent',
-        }, paths);
-        responseText = result?.text || '';
-        stopReason = result?.stopReason || null;
-      }
+      const result = await scheduler.executeTask({
+        userText: job.prompt,
+        fileContent: '',
+        imagePaths: [],
+        threadTs: `cron:${job.id}`,
+        deliveryThreadTs: delivery.threadTs || null,
+        channel: delivery.channel,
+        userId: null,
+        platform: delivery.platform,
+        channelSemantics: 'silent',
+        threadHistory: null,
+        model: job.model || null,
+        effort: job.effort || null,
+        maxTurns: job.maxTurns || null,
+        enableTaskCard: false,
+        forceNewWorker: true,
+        jobRunId,
+        profile: {
+          name: job.profileName,
+          workspaceDir: paths.workspaceDir,
+          dataDir: paths.dataDir,
+          scriptsDir: paths.scriptsDir,
+        },
+      });
+      responseText = result?.text || '';
+      stopReason = result?.stopReason || null;
 
-      const silent = responseText?.startsWith('[SILENT]');
       const failureReason = failureReasonFromResult(responseText, stopReason);
 
       job.lastRunAt = now.toISOString();
       if (failureReason) {
         job.lastStatus = 'failed';
         job.lastError = truncateErrorContext(failureReason);
-        try {
-          await deliverFailure(failureReason, responseText || stopReason || '');
-          job.lastDeliveryError = null;
-        } catch (deliveryErr) {
-          job.lastDeliveryError = deliveryErr.message;
-          logError(TAG, `cron failure DM failed for job ${job.id}: ${deliveryErr.message}`);
-        }
+        recordFailureLesson(failureReason, responseText || stopReason || '');
+        job.lastDeliveryError = null;
       } else {
         job.lastStatus = 'ok';
         job.lastError = null;
-
-        if (deliveredByScheduler) {
-          job.lastDeliveryError = null;
-        } else if (!silent && responseText && job.deliver) {
-          try {
-            await this._deliverResult(job, responseText);
-            job.lastDeliveryError = null;
-          } catch (err) {
-            job.lastDeliveryError = err.message;
-            logError(TAG, `delivery failed for job ${job.id}: ${err.message}`);
-          }
-        }
+        job.lastDeliveryError = null;
       }
     } catch (err) {
       job.lastRunAt = now.toISOString();
       job.lastStatus = 'failed';
       job.lastError = truncateErrorContext(err.message);
       logError(TAG, `job ${job.id} failed: ${err.message}`);
-      try {
-        await deliverFailure(err.message || 'worker_error', err.stack || err.message);
-        job.lastDeliveryError = null;
-      } catch (deliveryErr) {
-        job.lastDeliveryError = deliveryErr.message;
-        logError(TAG, `cron failure DM failed for job ${job.id}: ${deliveryErr.message}`);
-      }
+      recordFailureLesson(err.message || 'worker_error', err.stack || err.message);
+      job.lastDeliveryError = null;
     }
 
     // Repeat tracking
@@ -562,6 +521,18 @@ export class CronScheduler {
 
   _inflightKey(dataDir, jobId) {
     return `${dataDir}:${jobId}`;
+  }
+
+  _getScheduler() {
+    return this._scheduler || globalThis.__orbSchedulerInstance;
+  }
+
+  _resolveDelivery(job) {
+    return {
+      platform: 'slack',
+      channel: PROFILE_DM_CHANNELS[job.profileName] || PROFILE_DM_CHANNELS.karry,
+      threadTs: null,
+    };
   }
 
   async _awaitJobWrites(dataDir) {
@@ -612,21 +583,6 @@ export class CronScheduler {
 
       return true;
     });
-  }
-
-  async _deliverCronFailureDM(job, reason, errorContext = '') {
-    const channel = PROFILE_DM_CHANNELS[job.profileName] || PROFILE_DM_CHANNELS.karry;
-    if (!channel) throw new Error(`no failure DM channel for profile: ${job.profileName || 'unknown'}`);
-    const timestamp = new Date().toISOString();
-    const text = `:warning: cron 失败 — ${job.name || job.id} ${timestamp}\nreason: ${reason}\nerror: ${truncateErrorContext(errorContext)}`;
-    await this._deliverResult({
-      ...job,
-      deliver: {
-        platform: 'slack',
-        channel,
-        threadTs: null,
-      },
-    }, text);
   }
 
   /**

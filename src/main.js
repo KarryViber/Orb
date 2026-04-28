@@ -9,7 +9,6 @@ import { CronScheduler } from './cron.js';
 import { loadConfig, resolveProfile, resolveProfilePaths } from './config.js';
 import { cleanupSessions } from './session.js';
 import { info, error as logError } from './log.js';
-import { spawnWorker } from './spawn.js';
 
 const TAG = 'main';
 const DAEMON_LOCK_PATH = join(homedir(), 'Orb', '.daemon.lock');
@@ -160,79 +159,13 @@ async function start() {
 
   // ── Cron scheduler ──
 
-  const allAdapters = scheduler.adapters; // Map<platform, adapter>
-
   const cronScheduler = new CronScheduler({
     getProfilePaths: (profileName) => {
       const profileDef = config.profiles[profileName];
       if (!profileDef) throw new Error(`unknown profile: ${profileName}`);
       return resolveProfilePaths(profileDef);
     },
-
-    spawnCronWorker: (job, profilePaths) => {
-      return new Promise((resolve, reject) => {
-        let settled = false;
-        let responseText = '';
-        let stopReason = null;
-        const settle = (fn, val) => { if (!settled) { settled = true; fn(val); } };
-
-        try {
-          spawnWorker({
-            task: {
-              type: 'task',
-              userText: job.prompt,
-              threadTs: `cron:${job.id}`,
-              channel: null,
-              userId: null,
-              platform: 'cron',
-              model: job.model || null,
-              effort: job.effort || null,
-              maxTurns: job.maxTurns || null,
-              profile: {
-                name: job.profileName,
-                workspaceDir: profilePaths.workspaceDir,
-                dataDir: profilePaths.dataDir,
-                scriptsDir: profilePaths.scriptsDir,
-              },
-            },
-            timeout: 600_000,
-            label: `cron:${job.id}`,
-            onMessage: (msg) => {
-              if (msg?.type === 'turn_complete') {
-                responseText = typeof msg.text === 'string' ? msg.text : responseText;
-                stopReason = msg.stopReason || stopReason;
-              }
-              else if (msg?.type === 'result') {
-                responseText = msg.text || responseText;
-                stopReason = msg.stopReason || stopReason;
-                settle(resolve, { text: responseText, stopReason });
-              }
-              else if (msg?.type === 'error') settle(reject, new Error(msg.error || 'worker error'));
-            },
-            onExit: (code, signal) => {
-              if (code !== 0 || signal) {
-                settle(reject, new Error(signal ? `cron worker killed: ${signal}` : `worker exited with code ${code}`));
-              } else {
-                settle(resolve, { text: responseText, stopReason });
-              }
-            },
-          });
-        } catch (err) {
-          settle(reject, new Error(`fork failed: ${err.message}`));
-        }
-      });
-    },
-
-    deliverResult: async (job, text) => {
-      if (!job.deliver) return;
-      const { platform, channel, threadTs } = job.deliver;
-      const adapter = allAdapters.get(platform);
-      if (!adapter) throw new Error(`no adapter for platform: ${platform}`);
-      const payloads = adapter.buildPayloads(text);
-      for (const payload of payloads) {
-        await adapter.sendReply(channel, threadTs || null, payload.text, payload.blocks ? { blocks: payload.blocks } : {});
-      }
-    },
+    scheduler,
   });
 
   cronScheduler.setProfileNames(Object.keys(config.profiles));

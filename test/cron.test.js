@@ -45,24 +45,22 @@ function createJob(id, overrides = {}) {
   };
 }
 
-function createScheduler(dataDir, spawnCronWorker, deliverResult = async () => {}) {
+function createScheduler(dataDir, executeTask) {
   const scheduler = new CronScheduler({
     getProfilePaths: () => ({ dataDir, workspaceDir: dataDir, scriptsDir: dataDir }),
-    spawnCronWorker,
-    deliverResult,
+    scheduler: { executeTask },
   });
   scheduler.setProfileNames(['karry']);
   return scheduler;
 }
 
-function createMultiProfileScheduler(profileDirs, spawnCronWorker) {
+function createMultiProfileScheduler(profileDirs, executeTask) {
   const scheduler = new CronScheduler({
     getProfilePaths: (profileName) => {
       const dataDir = profileDirs[profileName];
       return { dataDir, workspaceDir: dataDir, scriptsDir: dataDir };
     },
-    spawnCronWorker,
-    deliverResult: async () => {},
+    scheduler: { executeTask },
   });
   scheduler.setProfileNames(Object.keys(profileDirs));
   return scheduler;
@@ -71,12 +69,12 @@ function createMultiProfileScheduler(profileDirs, spawnCronWorker) {
 test('tick releases the scheduler lock before worker completion', async () => {
   const dataDir = createTempDataDir();
   const gate = deferred();
-  const spawned = [];
+  const executed = [];
 
   const scheduler = createScheduler(dataDir, async (job) => {
-    spawned.push(job.id);
-    if (job.id === 'job-1') return gate.promise;
-    return 'ok';
+    executed.push(job.threadTs);
+    if (job.threadTs === 'cron:job-1') return gate.promise;
+    return { text: 'ok' };
   });
 
   writeJobs(dataDir, [createJob('job-1')]);
@@ -91,7 +89,7 @@ test('tick releases the scheduler lock before worker completion', async () => {
   ]);
 
   await scheduler.tick();
-  assert.deepEqual(spawned, ['job-1', 'job-2']);
+  assert.deepEqual(executed, ['cron:job-1', 'cron:job-2']);
 
   gate.resolve('ok');
   await delay(20);
@@ -101,10 +99,10 @@ test('tick releases the scheduler lock before worker completion', async () => {
 test('per-job guard prevents concurrent execution of the same job', async () => {
   const dataDir = createTempDataDir();
   const gate = deferred();
-  let spawnCount = 0;
+  let executeCount = 0;
 
   const scheduler = createScheduler(dataDir, async () => {
-    spawnCount += 1;
+    executeCount += 1;
     return gate.promise;
   });
 
@@ -117,7 +115,7 @@ test('per-job guard prevents concurrent execution of the same job', async () => 
   writeJobs(dataDir, jobs);
 
   await scheduler.tick();
-  assert.equal(spawnCount, 1);
+  assert.equal(executeCount, 1);
 
   gate.resolve('ok');
   await delay(20);
@@ -154,12 +152,12 @@ test('per-job guard is scoped per profile for identical job ids', async () => {
   const alphaDataDir = createTempDataDir();
   const betaDataDir = createTempDataDir();
   const gate = deferred();
-  const spawnedProfiles = [];
+  const executedProfiles = [];
 
   const scheduler = createMultiProfileScheduler(
     { alpha: alphaDataDir, beta: betaDataDir },
     async (job) => {
-      spawnedProfiles.push(job.profileName);
+      executedProfiles.push(job.profile.name);
       return gate.promise;
     }
   );
@@ -168,7 +166,7 @@ test('per-job guard is scoped per profile for identical job ids', async () => {
   writeJobs(betaDataDir, [createJob('shared-job', { profileName: 'beta' })]);
 
   await scheduler.tick();
-  assert.deepEqual(spawnedProfiles.sort(), ['alpha', 'beta']);
+  assert.deepEqual(executedProfiles.sort(), ['alpha', 'beta']);
 
   gate.resolve('ok');
   await delay(20);
@@ -180,7 +178,7 @@ test('per-job guard is scoped per profile for identical job ids', async () => {
 
 test('fire-and-forget execution still persists job state', async () => {
   const dataDir = createTempDataDir();
-  const scheduler = createScheduler(dataDir, async () => 'ok');
+  const scheduler = createScheduler(dataDir, async () => ({ text: 'ok' }));
 
   writeJobs(dataDir, [
     createJob('job-1', {
@@ -200,16 +198,14 @@ test('fire-and-forget execution still persists job state', async () => {
   assert.match(job.lastRunAt, /\d{4}-\d{2}-\d{2}T/);
 });
 
-test('cron worker failure sends one DM and persists failed status', async () => {
+test('cron scheduler failure persists failed status and uses the failure DM channel', async () => {
   const dataDir = createTempDataDir();
-  const deliveries = [];
+  const executed = [];
   const scheduler = createScheduler(
     dataDir,
-    async () => {
+    async (task) => {
+      executed.push(task);
       throw new Error('script exited 1');
-    },
-    async (job, text) => {
-      deliveries.push({ deliver: job.deliver, text });
     },
   );
 
@@ -223,21 +219,17 @@ test('cron worker failure sends one DM and persists failed status', async () => 
   assert.equal(job.lastStatus, 'failed');
   assert.equal(job.lastError, 'script exited 1');
   assert.equal(job.lastDeliveryError, null);
-  assert.equal(deliveries.length, 1);
-  assert.deepEqual(deliveries[0].deliver, { platform: 'slack', channel: 'D0ANGB3M1CZ', threadTs: null });
-  assert.match(deliveries[0].text, /^:warning: cron 失败 — Failing Cron /);
-  assert.match(deliveries[0].text, /reason: script exited 1/);
+  assert.equal(executed.length, 1);
+  assert.equal(executed[0].channel, 'D0ANGB3M1CZ');
+  assert.equal(executed[0].platform, 'slack');
+  assert.equal(executed[0].channelSemantics, 'silent');
 });
 
-test('cron failed result text is treated as failure without normal delivery', async () => {
+test('cron failed result text is treated as failure without direct delivery', async () => {
   const dataDir = createTempDataDir();
-  const deliveries = [];
   const scheduler = createScheduler(
     dataDir,
     async () => ({ text: 'failed: boom', stopReason: 'success' }),
-    async (job, text) => {
-      deliveries.push({ deliver: job.deliver, text });
-    },
   );
 
   writeJobs(dataDir, [createJob('job-failed-text', {
@@ -251,7 +243,5 @@ test('cron failed result text is treated as failure without normal delivery', as
   const [job] = readJobs(dataDir);
   assert.equal(job.lastStatus, 'failed');
   assert.equal(job.lastError, 'boom');
-  assert.equal(deliveries.length, 1);
-  assert.equal(deliveries[0].deliver.channel, 'D0ANGB3M1CZ');
-  assert.match(deliveries[0].text, /reason: boom/);
+  assert.equal(job.lastDeliveryError, null);
 });
