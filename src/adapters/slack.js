@@ -12,6 +12,7 @@ import {
   buildPlanSnapshotTitle,
   buildSendPayloads,
   categorizeTool,
+  markdownToMrkdwn,
 } from './slack-format.js';
 import { PlatformAdapter } from './interface.js';
 import { downloadAndCacheImage, cleanImageCache, IMAGE_EXTENSIONS } from './image-cache.js';
@@ -1700,7 +1701,8 @@ export class SlackAdapter extends PlatformAdapter {
     for (const chunk of Array.isArray(chunks) ? chunks : []) {
       if (!chunk || typeof chunk !== 'object') continue;
       if (chunk.type === 'markdown_text') {
-        const text = String(chunk.text || chunk.markdown_text || '').trim();
+        const raw = String(chunk.text || chunk.markdown_text || '').trim();
+        const text = raw ? markdownToMrkdwn(raw) : '';
         if (text) normalized.push({ type: 'markdown_text', text });
         continue;
       }
@@ -1722,7 +1724,8 @@ export class SlackAdapter extends PlatformAdapter {
         continue;
       }
       if (chunk.type === 'text') {
-        normalized.push({ type: 'markdown_text', text: String(chunk.text || '').trim() || ' ' });
+        const raw = String(chunk.text || '').trim();
+        normalized.push({ type: 'markdown_text', text: raw ? markdownToMrkdwn(raw) : ' ' });
         continue;
       }
       blocks.push(chunk);

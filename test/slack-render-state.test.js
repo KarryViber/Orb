@@ -123,6 +123,42 @@ test('new turns allocate distinct Slack streams', async () => {
   assert.deepEqual(stopped, ['stream-1', 'stream-2']);
 });
 
+test('stream markdown_text chunks convert markdown emphasis to Slack mrkdwn', () => {
+  const adapter = new SlackAdapter({ botToken: 'xoxb-test', appToken: 'xapp-test' });
+
+  assert.deepEqual(
+    adapter.normalizeStreamChunks([{ type: 'markdown_text', text: '**bold**' }]),
+    [{ type: 'markdown_text', text: '*bold*' }],
+  );
+});
+
+test('stream text chunks convert mixed markdown with CJK boundaries to Slack mrkdwn', () => {
+  const adapter = new SlackAdapter({ botToken: 'xoxb-test', appToken: 'xapp-test' });
+
+  assert.deepEqual(
+    adapter.normalizeStreamChunks([{ type: 'text', text: '这里**重点**词 + *italic*' }]),
+    [{ type: 'markdown_text', text: '这里\u200b*重点*\u200b词 + _italic_' }],
+  );
+});
+
+test('stream non-text chunk paths keep existing normalization behavior', () => {
+  const adapter = new SlackAdapter({ botToken: 'xoxb-test', appToken: 'xapp-test' });
+  const blocks = [{ type: 'section', text: { type: 'mrkdwn', text: '**raw**' } }];
+
+  assert.deepEqual(
+    adapter.normalizeStreamChunks([
+      { type: 'task_update', id: 'task-1', title: '**raw**', status: 'completed', details: '**details**' },
+      { type: 'plan_update', title: '**plan**' },
+      { type: 'blocks', blocks },
+    ]),
+    [
+      { type: 'task_update', id: 'task-1', title: '**raw**', status: 'complete', details: '**details**' },
+      { type: 'plan_update', title: '**plan**' },
+      { type: 'blocks', blocks },
+    ],
+  );
+});
+
 test('thread history keeps emoji-prefixed bot messages when blocks contain content', async () => {
   const adapter = new SlackAdapter({ botToken: 'xoxb-test', appToken: 'xapp-test' });
   adapter._slack = {
