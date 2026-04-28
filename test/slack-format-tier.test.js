@@ -122,3 +122,33 @@ test('thread reply sample keeps tiered visual snapshot and block headings', () =
     ],
   );
 });
+
+test('text plus git diff summary uses section and context blocks', () => {
+  const [payload] = buildSendPayloads('完成处理', {
+    gitDiffSummary: {
+      hasChanges: true,
+      totals: { filesChanged: 1, insertions: 2, deletions: 1 },
+      files: [{ status: 'M', path: 'src/adapters/slack-format.js', linesAdded: 2, linesDeleted: 1 }],
+    },
+  });
+
+  assert.equal(payload.text, '完成处理');
+  assert.deepEqual(payload.blocks.map((block) => block.type), ['section', 'context']);
+  assert.equal(payload.blocks[0].text.text, '完成处理');
+  assert.match(payload.blocks[1].elements[0].text, /^> _📝 改动 · 1 files \(\+2 -1\)_/);
+  assert.match(payload.blocks[1].elements[0].text, /> • `M` src\/adapters\/slack-format\.js \(\+2 -1\)/);
+});
+
+test('diff-only git summary stays a context block payload', () => {
+  const [payload] = buildSendPayloads('', {
+    gitDiffSummary: {
+      hasChanges: true,
+      totals: { filesChanged: 1, insertions: 0, deletions: 0 },
+      files: [{ status: 'M', path: 'README.md' }],
+    },
+  });
+
+  assert.equal(payload.text, '改动摘要');
+  assert.deepEqual(payload.blocks.map((block) => block.type), ['context']);
+  assert.match(payload.blocks[0].elements[0].text, /^> _📝 改动 · 1 files \(\+0 -0\)_/);
+});

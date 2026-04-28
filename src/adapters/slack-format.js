@@ -574,10 +574,16 @@ export function formatGitDiffSummary(summary) {
   return lines.join('\n');
 }
 
-function appendGitDiffSummary(text, summary) {
+function buildGitDiffContextBlock(summary) {
   const diffText = formatGitDiffSummary(summary);
-  if (!diffText) return text;
-  return `${text || ''}\n\n${diffText}`;
+  if (!diffText) return null;
+  return {
+    type: 'context',
+    elements: [{
+      type: 'mrkdwn',
+      text: markdownToMrkdwn(diffText),
+    }],
+  };
 }
 
 // --- Public API ---
@@ -593,35 +599,23 @@ export function buildSendPayloads(text, options = {}) {
   const gitDiffSummary = options?.gitDiffSummary;
   const diffOnly = !text && gitDiffSummary?.hasChanges;
   if (!text && !diffOnly) return [{ text: '(无回复)' }];
+  const diffContextBlock = buildGitDiffContextBlock(gitDiffSummary);
   if (diffOnly) {
-    const blocks = [{
-      type: 'context',
-      elements: [{
-        type: 'mrkdwn',
-        text: markdownToMrkdwn(formatGitDiffSummary(gitDiffSummary)),
-      }],
-    }];
+    const blocks = [diffContextBlock];
     return [{ blocks, text: '改动摘要' }];
   }
-  const textWithDiff = appendGitDiffSummary(text, gitDiffSummary);
 
   // Agent explicitly output Block Kit JSON
   const explicit = parseBlockKit(text);
   if (explicit) {
-    const diffText = formatGitDiffSummary(gitDiffSummary);
-    if (diffText) {
-      explicit.blocks.push({
-        type: 'section',
-        text: { type: 'mrkdwn', text: markdownToMrkdwn(diffText) },
-      });
-    }
+    if (diffContextBlock) explicit.blocks.push(diffContextBlock);
     return [{ blocks: explicit.blocks, text: explicit.text }];
   }
 
   // Extract markdown tables BEFORE mrkdwn conversion (preserves raw markdown)
   const tableBlocks = [];
   const TABLE_RE = /^(\|.+\|)\n\|[-| :]+\|\n((?:\|.+\|\n?)*)/gm;
-  const withPlaceholders = textWithDiff.replace(TABLE_RE, (match) => {
+  const withPlaceholders = text.replace(TABLE_RE, (match) => {
     const block = markdownTableToBlock(match);
     if (block) {
       tableBlocks.push(block);
@@ -633,7 +627,7 @@ export function buildSendPayloads(text, options = {}) {
   const converted = markdownToMrkdwn(withPlaceholders);
 
   // Force blocks mode if we have tables
-  const useBlocks = shouldUseBlocks(converted) || tableBlocks.length > 0;
+  const useBlocks = Boolean(diffContextBlock) || shouldUseBlocks(converted) || tableBlocks.length > 0;
 
   if (!useBlocks) {
     return [{ text: converted }];
@@ -641,8 +635,10 @@ export function buildSendPayloads(text, options = {}) {
 
   const blocks = buildBlocks(converted, tableBlocks);
   if (blocks.length === 0) {
+    if (diffContextBlock) return [{ blocks: [diffContextBlock], text: buildFallbackText(text) || '改动摘要' }];
     return [{ text: converted }];
   }
+  if (diffContextBlock) blocks.push(diffContextBlock);
 
   const fallback = buildFallbackText(text);
   const groups = buildBlockGroups(blocks);
