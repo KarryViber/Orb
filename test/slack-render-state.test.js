@@ -264,3 +264,29 @@ test('thread history keeps emoji-prefixed bot messages when blocks contain conte
   assert.doesNotMatch(history, /white_check_mark/);
   assert.doesNotMatch(history, /执行下建议的操作/);
 });
+
+test('isHeadingLine rejects line with inline bold + colon end', async () => {
+  const { buildSendPayloads } = await import('../src/adapters/slack-format.js');
+  const text = '下面这段是给你目视验证的，**故意紧贴中文+全角括号**触发原 bug pattern：\n\n正文';
+  const payloads = buildSendPayloads(text);
+  const firstBlockText = payloads[0].blocks[0].text.text;
+
+  assert.match(firstBlockText, /\*故意紧贴中文\+全角括号\*/);
+  assert.doesNotMatch(firstBlockText, /^\*下面这段/);
+});
+
+test('isHeadingLine still accepts pure bold-only title', async () => {
+  const { buildSendPayloads } = await import('../src/adapters/slack-format.js');
+  const text = '**纯标题**\n\n正文';
+  const payloads = buildSendPayloads(text);
+
+  assert.equal(payloads[0].blocks[0].text.text, '*纯标题*');
+});
+
+test('isHeadingLine still accepts plain colon-end title without emphasis', async () => {
+  const { buildSendPayloads } = await import('../src/adapters/slack-format.js');
+  const text = '今日待办：\n\n正文';
+  const payloads = buildSendPayloads(text);
+
+  assert.equal(payloads[0].blocks[0].text.text, '*今日待办*');
+});

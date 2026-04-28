@@ -441,6 +441,8 @@ function isHeadingLine(line) {
   if (!line || line.includes('\n')) return false;
   const t = line.trim();
   if (t.length > 100) return false;
+  // Lines already containing emphasis/code must not get another outer * wrapper.
+  if (/[*_`]/.test(t.replace(/^\*(.+)\*$/, ''))) return false;
   if (/^【.{1,80}】$/.test(t)) return true;     // converted # heading
   if (t.endsWith('：')) return true;             // Japanese colon title
   if (/^\*.{2,80}\*$/.test(t)) return true;     // *bold title* alone
