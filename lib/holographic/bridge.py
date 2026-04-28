@@ -9,7 +9,8 @@ Commands:
     search          {"query": "...", "category": null, "min_trust": 0.3, "limit": 5}
     session_search  {"query": "", "thread_ts": "...", "user_id": "...", "limit": 20}
     add             {"content": "...", "category": "general", "tags": "",
-                     "confidence": "default", "skip_arbitrate": false}
+                     "confidence": "default", "source_kind": "extracted",
+                     "source_confidence": 0.5, "skip_arbitrate": false}
     probe           {"entity": "...", "category": null, "limit": 10}
     related         {"entity": "...", "category": null, "limit": 10}
     reason          {"entities": ["a","b"], "category": null, "limit": 10}
@@ -235,6 +236,8 @@ def apply_fact_write(
     tags: str,
     source: str,
     confidence: str,
+    source_kind: str,
+    source_confidence: float | None,
     skip_arbitrate: bool,
 ) -> dict:
     """One-shot fact write with arbitration.
@@ -301,6 +304,7 @@ def apply_fact_write(
         fact_id = store.add_fact(
             content=content, category=category, tags=tags,
             source=source, confidence=confidence,
+            source_kind=source_kind, confidence_score=source_confidence,
         )
         store.tombstone_fact(target, superseded_by=fact_id)
         return {
@@ -313,11 +317,38 @@ def apply_fact_write(
     fact_id = store.add_fact(
         content=content, category=category, tags=tags,
         source=source, confidence=confidence,
+        source_kind=source_kind, confidence_score=source_confidence,
     )
     return {
         "fact_id": fact_id, "action": "ADD",
         "reason": decision.get("reason", ""),
     }
+
+
+# ── Importable API ───────────────────────────────────────────────────
+
+def search(
+    query: str,
+    limit: int = 5,
+    category: str | None = None,
+    min_trust: float = 0.3,
+    db_path: str | None = None,
+) -> list[dict]:
+    """Importable convenience wrapper used by acceptance checks."""
+    resolved_db = db_path or os.environ.get("HOLOGRAPHIC_DB") or str(
+        Path.home() / "Orb" / "profiles" / "karry" / "data" / "memory.db"
+    )
+    store = MemoryStore(db_path=resolved_db)
+    try:
+        retriever = FactRetriever(store, temporal_decay_half_life=0)
+        return retriever.search(
+            query=query,
+            category=category,
+            min_trust=min_trust,
+            limit=limit,
+        )
+    finally:
+        store.close()
 
 
 # ── Command dispatch ─────────────────────────────────────────────────
@@ -351,6 +382,8 @@ def main():
                 tags=args.get("tags", ""),
                 source=args.get("source", "unknown"),
                 confidence=args.get("confidence", "default"),
+                source_kind=args.get("source_kind", "extracted"),
+                source_confidence=args.get("source_confidence"),
                 skip_arbitrate=args.get("skip_arbitrate", False),
             )
         elif command == "session_search":
@@ -424,6 +457,8 @@ def main():
                         tags=op_args.get("tags", ""),
                         source=op_args.get("source", "unknown"),
                         confidence=op_args.get("confidence", "default"),
+                        source_kind=op_args.get("source_kind", "extracted"),
+                        source_confidence=op_args.get("source_confidence"),
                         skip_arbitrate=op_args.get("skip_arbitrate", False),
                     ))
                 elif cmd == "remove":

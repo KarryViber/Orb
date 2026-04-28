@@ -21,6 +21,8 @@ CREATE TABLE IF NOT EXISTS facts (
     content         TEXT NOT NULL UNIQUE,
     category        TEXT DEFAULT 'general',
     tags            TEXT DEFAULT '',
+    source_kind     TEXT DEFAULT 'extracted',
+    confidence      REAL DEFAULT 0.5,
     trust_score     REAL DEFAULT 0.5,
     retrieval_count INTEGER DEFAULT 0,
     helpful_count   INTEGER DEFAULT 0,
@@ -200,6 +202,7 @@ class MemoryStore:
         """Create tables, indexes, and triggers if they do not exist. Enable WAL mode."""
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(_SCHEMA)
+        self._migrate_v2()
         # Migrate: add columns if missing (safe for existing databases)
         columns = {row[1] for row in self._conn.execute("PRAGMA table_info(facts)").fetchall()}
         if "hrr_vector" not in columns:
@@ -221,6 +224,25 @@ class MemoryStore:
         )
         self._conn.commit()
 
+    def _migrate_v2(self) -> None:
+        """Add source_kind/confidence metadata columns, safely re-runnable."""
+        try:
+            columns = {row[1] for row in self._conn.execute("PRAGMA table_info(facts)").fetchall()}
+            if "source_kind" not in columns:
+                self._conn.execute("ALTER TABLE facts ADD COLUMN source_kind TEXT DEFAULT 'extracted'")
+            if "confidence" not in columns:
+                self._conn.execute("ALTER TABLE facts ADD COLUMN confidence REAL DEFAULT 0.5")
+            self._conn.execute(
+                "UPDATE facts SET source_kind = 'extracted' WHERE source_kind IS NULL OR source_kind = ''"
+            )
+            self._conn.execute(
+                "UPDATE facts SET confidence = 0.5 WHERE confidence IS NULL"
+            )
+            self._conn.commit()
+        except sqlite3.Error:
+            self._conn.rollback()
+            logger.exception("holographic v2 migration failed")
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -232,6 +254,8 @@ class MemoryStore:
         tags: str = "",
         source: str = "unknown",
         confidence: str = "default",
+        source_kind: str = "extracted",
+        confidence_score: float | None = None,
     ) -> int:
         """Insert a fact and return its fact_id.
 
@@ -248,6 +272,15 @@ class MemoryStore:
                 raise ValueError("content must not be empty")
 
             trust_score = _CONFIDENCE_TRUST.get(confidence, self.default_trust)
+            if source_kind not in {"extracted", "inferred", "ambiguous"}:
+                source_kind = "extracted"
+            if confidence_score is None:
+                confidence_score = {
+                    "confirmed": 0.9,
+                    "default": 0.5,
+                    "speculative": 0.2,
+                }.get(confidence, 0.5)
+            confidence_score = max(0.0, min(1.0, float(confidence_score)))
 
             duplicate = self._conn.execute(
                 "SELECT fact_id FROM facts WHERE content = ?", (content,)
@@ -292,10 +325,13 @@ class MemoryStore:
             try:
                 cur = self._conn.execute(
                     """
-                    INSERT INTO facts (content, category, tags, trust_score, source, trust_frozen)
-                    VALUES (?, ?, ?, ?, ?, 1)
+                    INSERT INTO facts (
+                        content, category, tags, source_kind, confidence,
+                        trust_score, source, trust_frozen
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 1)
                     """,
-                    (content, category, tags, trust_score, source),
+                    (content, category, tags, source_kind, confidence_score, trust_score, source),
                 )
                 self._conn.commit()
                 fact_id: int = cur.lastrowid  # type: ignore[assignment]
@@ -356,7 +392,8 @@ class MemoryStore:
 
             sql = f"""
                 SELECT f.fact_id, f.content, f.category, f.tags,
-                       f.trust_score, f.retrieval_count, f.helpful_count,
+                       f.source_kind, f.confidence, f.trust_score,
+                       f.retrieval_count, f.helpful_count,
                        f.created_at, f.updated_at
                 FROM facts f
                 JOIN facts_fts fts ON fts.rowid = f.fact_id
@@ -569,7 +606,8 @@ class MemoryStore:
 
             sql = f"""
                 SELECT fact_id, content, category, tags, trust_score,
-                       retrieval_count, helpful_count, created_at, updated_at
+                       source_kind, confidence, retrieval_count, helpful_count,
+                       created_at, updated_at
                 FROM facts
                 WHERE trust_score >= ?
                   {category_clause}

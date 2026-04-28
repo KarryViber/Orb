@@ -16,12 +16,20 @@ Rules:
 - Focus on WHAT TO DO DIFFERENTLY, not what went wrong
 - Skip generic advice ("be careful", "check errors") — only specific, reusable insights
 - If the error is trivial or transient (API 500, network blip), return empty array
+- Add source_kind for each lesson:
+  - extracted: directly stated in the user/error/agent text
+  - inferred: derived from the surrounding context
+  - ambiguous: contains uncertainty words such as "maybe", "probably", "可能", "也许", "估计"
+- Few-shot:
+  - Error says "ENOENT /tmp/a": {{"source_kind":"extracted","source_confidence":0.8}}
+  - Context implies missing setup before test: {{"source_kind":"inferred","source_confidence":0.6}}
+  - Text says "可能是权限问题": {{"source_kind":"ambiguous","source_confidence":0.35}}
 
 Error: {error}
 User was asking: {user}
 Agent response (if any): {response}
 
-Return ONLY a JSON array of objects: [{{"content": "lesson text", "category": "lesson", "severity": "high|medium|low", "source": "llm_distill"}}]
+Return ONLY a JSON array of objects: [{{"content": "lesson text", "category": "lesson", "severity": "high|medium|low", "source": "llm_distill", "source_kind": "extracted|inferred|ambiguous", "source_confidence": 0.0}}]
 No markdown, no explanation, just the JSON array."""
 
 def distill_llm(ctx):
@@ -61,6 +69,8 @@ def distill_llm(ctx):
                     l.setdefault('category', 'lesson')
                     l.setdefault('severity', 'medium')
                     l.setdefault('source', 'llm_distill')
+                    l.setdefault('source_kind', 'inferred')
+                    l.setdefault('source_confidence', 0.6)
                     valid.append(l)
             return valid if valid else None
         return None
@@ -80,6 +90,8 @@ def distill_regex(ctx):
             'category': 'lesson',
             'severity': 'high',
             'source': 'error_capture',
+            'source_kind': 'extracted',
+            'source_confidence': 0.8,
         })
 
     patterns = [
@@ -101,6 +113,8 @@ def distill_regex(ctx):
                 'category': 'lesson',
                 'severity': 'medium',
                 'source': 'pattern_match',
+                'source_kind': 'extracted',
+                'source_confidence': 0.8,
             })
 
     seen = set()
@@ -133,6 +147,8 @@ Rules:
 - Focus on the USER'S STANDARD or PREFERENCE, not the specific content
 - Extract reusable patterns: "user prefers X style", "always do Y before Z"
 - If the correction is too situation-specific to generalize, return empty array
+- Add source_kind/source_confidence using the same evidence labels:
+  extracted = directly stated, inferred = context-derived, ambiguous = uncertainty language.
 
 Thread context (recent messages):
 {thread}
@@ -140,7 +156,7 @@ Thread context (recent messages):
 User's correction: {correction}
 Agent's response after correction: {response}
 
-Return ONLY a JSON array: [{{"content": "lesson text", "category": "lesson", "severity": "medium", "source": "correction_capture"}}]
+Return ONLY a JSON array: [{{"content": "lesson text", "category": "lesson", "severity": "medium", "source": "correction_capture", "source_kind": "extracted|inferred|ambiguous", "source_confidence": 0.0}}]
 No markdown, no explanation, just the JSON array."""
 
 
@@ -174,6 +190,8 @@ def distill_correction(ctx):
                     l.setdefault('category', 'lesson')
                     l.setdefault('severity', 'medium')
                     l.setdefault('source', 'correction_capture')
+                    l.setdefault('source_kind', 'extracted')
+                    l.setdefault('source_confidence', 0.8)
                     valid.append(l)
             return valid
         return []

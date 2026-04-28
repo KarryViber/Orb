@@ -210,8 +210,13 @@ export async function buildPrompt({ userText, fileContent, threadTs, userId, cha
   if (memories.length > 0) {
     const memoryBlock = memories
       .map((m) => {
-        const prefix = m.category === 'lesson' ? '⚠️ ' : '';
-        return `- [trust:${m.trust_score?.toFixed(2) || '?'}] ${prefix}${m.content}`;
+        const lessonPrefix = m.category === 'lesson' ? '⚠️ ' : '';
+        const sourcePrefix = m.source_kind === 'inferred'
+          ? '⚙️ 推断: '
+          : m.source_kind === 'ambiguous'
+            ? '❓ 模糊: '
+            : '';
+        return `- [trust:${m.trust_score?.toFixed(2) || '?'}] ${lessonPrefix}${sourcePrefix}${m.content}`;
       })
       .join('\n');
     userParts.push(`## 相关上下文\n${memoryBlock}`);

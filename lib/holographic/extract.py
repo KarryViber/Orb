@@ -10,7 +10,8 @@ Usage:
     python3 extract.py <user_text> <response_text>
 
 Output: JSON array of extracted facts, each with:
-    { "content": "...", "category": "...", "importance": "high"|"medium"|"low" }
+    { "content": "...", "category": "...", "importance": "high"|"medium"|"low",
+      "source_kind": "extracted"|"inferred"|"ambiguous" }
 
 Categories:
     - preference: User preferences, habits, style choices
@@ -40,6 +41,10 @@ SKIP_RESPONSE_PATTERNS = [
 
 MIN_USER_LEN = 8       # Skip very short user messages
 MIN_RESPONSE_LEN = 20  # Skip very short responses
+AMBIGUOUS_PATTERN = re.compile(
+    r"(可能|也许|估计|大概|似乎|看起来|不确定|maybe|probably|likely|seems|appears)",
+    re.IGNORECASE,
+)
 
 
 # ── Category detection ──
@@ -113,6 +118,29 @@ def _confidence_for(category: str, importance: str) -> str:
     return "default"
 
 
+def classify_source_kind(text: str, derived_from_response: bool = False) -> str:
+    """Classify evidence source: direct text, inference, or ambiguous language.
+
+    Few-shot intent:
+    - "User: 以后都用 sonnet" -> extracted
+    - "Q: ... A: We should use strategy B" -> inferred
+    - "可能用 strategy B" -> ambiguous
+    """
+    if AMBIGUOUS_PATTERN.search(text):
+        return "ambiguous"
+    if derived_from_response:
+        return "inferred"
+    return "extracted"
+
+
+def source_confidence(source_kind: str, trust_confidence: str) -> float:
+    if source_kind == "ambiguous":
+        return 0.35
+    if source_kind == "inferred":
+        return 0.6
+    return {"confirmed": 0.9, "default": 0.7, "speculative": 0.5}.get(trust_confidence, 0.7)
+
+
 def extract_facts(user_text: str, response_text: str) -> list[dict]:
     """Extract structured facts from a conversation turn."""
     if should_skip(user_text, response_text):
@@ -125,11 +153,15 @@ def extract_facts(user_text: str, response_text: str) -> list[dict]:
 
     # For instruction/preference/decision, store the user's exact words
     if user_category in ("instruction", "preference", "decision"):
+        trust_confidence = _confidence_for(user_category, "high")
+        source_kind = classify_source_kind(user_text)
         facts.append({
             "content": f"User: {user_text.strip()}",
             "category": user_category,
             "importance": "high",
-            "confidence": _confidence_for(user_category, "high"),
+            "confidence": trust_confidence,
+            "source_kind": source_kind,
+            "source_confidence": source_confidence(source_kind, trust_confidence),
         })
 
     # Build a condensed summary of the exchange
@@ -170,11 +202,15 @@ def extract_facts(user_text: str, response_text: str) -> list[dict]:
         if importance == "low" and category == "conversation":
             return []
 
+        trust_confidence = _confidence_for(category, importance)
+        source_kind = classify_source_kind(content, derived_from_response=bool(condensed_response))
         facts.append({
             "content": content,
             "category": category,
             "importance": importance,
-            "confidence": _confidence_for(category, importance),
+            "confidence": trust_confidence,
+            "source_kind": source_kind,
+            "source_confidence": source_confidence(source_kind, trust_confidence),
         })
 
     # Extract any explicit entities mentioned
@@ -190,11 +226,14 @@ def extract_facts(user_text: str, response_text: str) -> list[dict]:
         for match in re.finditer(pattern, combined):
             entity = match.group(1).strip()
             if len(entity) > 2 and entity not in [f["content"] for f in facts]:
+                trust_confidence = _confidence_for("entity", "low")
                 facts.append({
                     "content": f"Entity: {entity}",
                     "category": "entity",
                     "importance": "low",
-                    "confidence": _confidence_for("entity", "low"),
+                    "confidence": trust_confidence,
+                    "source_kind": "extracted",
+                    "source_confidence": source_confidence("extracted", trust_confidence),
                 })
 
     return facts

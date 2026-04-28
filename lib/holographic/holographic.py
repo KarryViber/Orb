@@ -23,6 +23,10 @@ import hashlib
 import logging
 import struct
 import math
+import os
+import sqlite3
+import sys
+from pathlib import Path
 
 try:
     import numpy as np
@@ -201,3 +205,27 @@ def snr_estimate(dim: int, n_items: int) -> float:
         )
 
     return snr
+
+
+def _print_info(db_path: str | None = None) -> int:
+    resolved_db = db_path or os.environ.get("HOLOGRAPHIC_DB") or str(
+        Path.home() / "Orb" / "profiles" / "karry" / "data" / "memory.db"
+    )
+    conn = sqlite3.connect(resolved_db)
+    try:
+        columns = conn.execute("PRAGMA table_info(facts)").fetchall()
+        print(f"db_path: {resolved_db}")
+        print("facts columns:")
+        for cid, name, col_type, notnull, default_value, pk in columns:
+            default = f" DEFAULT {default_value}" if default_value is not None else ""
+            pk_text = " PRIMARY KEY" if pk else ""
+            print(f"- {name} {col_type}{default}{pk_text}")
+        return 0
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    if len(sys.argv) >= 2 and sys.argv[1] == "info":
+        db_arg = sys.argv[2] if len(sys.argv) >= 3 else None
+        raise SystemExit(_print_info(db_arg))

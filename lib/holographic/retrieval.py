@@ -94,7 +94,7 @@ class FactRetriever:
                         + self.hrr_weight * hrr_sim)
 
             # Trust weighting
-            score = relevance * fact["trust_score"]
+            score = fact["trust_score"] * self._source_kind_weight(fact.get("source_kind"))
 
             # Optional temporal decay
             if self.half_life > 0:
@@ -145,7 +145,7 @@ class FactRetriever:
             # FTS5 search within session-filtered facts
             sql = f"""
                 SELECT f.fact_id, f.content, f.category, f.tags,
-                       f.trust_score, f.created_at, f.updated_at
+                       f.source_kind, f.confidence, f.trust_score, f.created_at, f.updated_at
                 FROM facts_fts
                 JOIN facts f ON f.fact_id = facts_fts.rowid
                 WHERE facts_fts MATCH ? AND {where_sql}
@@ -157,7 +157,7 @@ class FactRetriever:
             # All facts for this session, newest first
             sql = f"""
                 SELECT fact_id, content, category, tags,
-                       trust_score, created_at, updated_at
+                       source_kind, confidence, trust_score, created_at, updated_at
                 FROM facts
                 WHERE {where_sql}
                 ORDER BY created_at DESC
@@ -221,7 +221,7 @@ class FactRetriever:
 
         rows = conn.execute(
             f"""
-            SELECT fact_id, content, category, tags, trust_score,
+            SELECT fact_id, content, category, tags, source_kind, confidence, trust_score,
                    retrieval_count, helpful_count, created_at, updated_at,
                    hrr_vector
             FROM facts
@@ -244,7 +244,7 @@ class FactRetriever:
             role_content = hrr.encode_atom("__hrr_role_content__", self.hrr_dim)
             content_vec = hrr.bind(hrr.encode_text(fact["content"], self.hrr_dim), role_content)
             sim = hrr.similarity(residual, content_vec)
-            fact["score"] = (sim + 1.0) / 2.0 * fact["trust_score"]
+            fact["score"] = fact["trust_score"] * self._source_kind_weight(fact.get("source_kind"))
             scored.append(fact)
 
         scored.sort(key=lambda x: x["score"], reverse=True)
@@ -281,7 +281,7 @@ class FactRetriever:
 
         rows = conn.execute(
             f"""
-            SELECT fact_id, content, category, tags, trust_score,
+            SELECT fact_id, content, category, tags, source_kind, confidence, trust_score,
                    retrieval_count, helpful_count, created_at, updated_at,
                    hrr_vector
             FROM facts
@@ -312,7 +312,7 @@ class FactRetriever:
             # Take the max — entity could appear in either role
             best_sim = max(entity_role_sim, content_role_sim)
 
-            fact["score"] = (best_sim + 1.0) / 2.0 * fact["trust_score"]
+            fact["score"] = fact["trust_score"] * self._source_kind_weight(fact.get("source_kind"))
             scored.append(fact)
 
         scored.sort(key=lambda x: x["score"], reverse=True)
@@ -360,7 +360,7 @@ class FactRetriever:
 
         rows = conn.execute(
             f"""
-            SELECT fact_id, content, category, tags, trust_score,
+            SELECT fact_id, content, category, tags, source_kind, confidence, trust_score,
                    retrieval_count, helpful_count, created_at, updated_at,
                    hrr_vector
             FROM facts
@@ -390,7 +390,7 @@ class FactRetriever:
                 entity_scores.append(sim)
 
             min_sim = min(entity_scores)
-            fact["score"] = (min_sim + 1.0) / 2.0 * fact["trust_score"]
+            fact["score"] = fact["trust_score"] * self._source_kind_weight(fact.get("source_kind"))
             scored.append(fact)
 
         scored.sort(key=lambda x: x["score"], reverse=True)
@@ -425,7 +425,8 @@ class FactRetriever:
 
         rows = conn.execute(
             f"""
-            SELECT f.fact_id, f.content, f.category, f.tags, f.trust_score,
+            SELECT f.fact_id, f.content, f.category, f.tags,
+                   f.source_kind, f.confidence, f.trust_score,
                    f.created_at, f.updated_at, f.hrr_vector
             FROM facts f
             {where}
@@ -519,7 +520,7 @@ class FactRetriever:
 
         rows = conn.execute(
             f"""
-            SELECT fact_id, content, category, tags, trust_score,
+            SELECT fact_id, content, category, tags, source_kind, confidence, trust_score,
                    retrieval_count, helpful_count, created_at, updated_at,
                    hrr_vector
             FROM facts
@@ -533,7 +534,7 @@ class FactRetriever:
             fact = dict(row)
             fact_vec = hrr.bytes_to_phases(fact.pop("hrr_vector"))
             sim = hrr.similarity(target_vec, fact_vec)
-            fact["score"] = (sim + 1.0) / 2.0 * fact["trust_score"]
+            fact["score"] = fact["trust_score"] * self._source_kind_weight(fact.get("source_kind"))
             scored.append(fact)
 
         scored.sort(key=lambda x: x["score"], reverse=True)
@@ -558,7 +559,7 @@ class FactRetriever:
         try:
             rows = conn.execute(
                 f"""
-                SELECT fact_id, content, category, tags, trust_score,
+                SELECT fact_id, content, category, tags, source_kind, confidence, trust_score,
                        retrieval_count, helpful_count, created_at, updated_at,
                        hrr_vector, 1.0 as fts_rank
                 FROM facts
@@ -640,6 +641,14 @@ class FactRetriever:
             results.append(fact)
 
         return results
+
+    @staticmethod
+    def _source_kind_weight(source_kind: str | None) -> float:
+        if source_kind == "inferred":
+            return 0.7
+        if source_kind == "ambiguous":
+            return 0.4
+        return 1.0
 
     @staticmethod
     def _tokenize(text: str) -> set[str]:

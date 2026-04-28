@@ -267,6 +267,8 @@ export async function storeConversation({ userText, responseText, threadTs, user
           category: fact.category || 'conversation',
           tags,
           confidence: fact.confidence || 'default',
+          source_kind: fact.source_kind || 'extracted',
+          source_confidence: fact.source_confidence ?? 0.5,
         },
       }));
       try {
@@ -282,6 +284,8 @@ export async function storeConversation({ userText, responseText, threadTs, user
         content: condensed,
         category: 'conversation',
         tags,
+        source_kind: 'inferred',
+        source_confidence: 0.6,
       });
     }
     // Short trivial exchanges: don't store at all
@@ -337,6 +341,8 @@ export async function storeLesson({ userText, errorText, responseText, threadTs,
         category: 'lesson',
         tags,
         source: lesson.source || 'unknown',
+        source_kind: lesson.source_kind || 'inferred',
+        source_confidence: lesson.source_confidence ?? 0.6,
       }).catch((error) => {
         logBridgeFallback('storeLesson.add', dbPath, error);
       });
@@ -397,6 +403,8 @@ export async function storeCorrectionLesson({ userText, responseText, threadHist
         category: 'lesson',
         tags,
         source: lesson.source || 'correction_capture',
+        source_kind: lesson.source_kind || 'extracted',
+        source_confidence: lesson.source_confidence ?? 0.8,
       }).catch((error) => {
         logBridgeFallback('storeCorrectionLesson.add', dbPath, error);
       });
