@@ -26,6 +26,9 @@ src/
     interface.js       — PlatformAdapter abstract base class
     slack.js           — Slack Socket Mode implementation
     slack-format.js    — Markdown→mrkdwn, Block Kit builder
+    wechat.js          — WeChat adapter
+    wechat-format.js   — WeChat plain-text formatter (Markdown unsupported)
+    image-cache.js     — Adapter-shared image download/cache helper
 ```
 
 ## Key Paths
@@ -165,7 +168,7 @@ Scheduler ↔ Worker communication via Node IPC (process.send/on('message')):
 | Worker → Scheduler | `cc_event` | `{ type: 'cc_event', turnId, eventType, payload }` | Raw Claude Code event forwarded to scheduler subscribers. Slack Qi, plan, text, and status rendering is driven from this stream. |
 | Worker → Scheduler | `inject_failed` | `{ type: 'inject_failed', injectId?, userText, fileContent?, imagePaths? }` | Follow-up inject could not reach the live CLI session (for example the session already closed). Scheduler must fail forward by replaying that payload through a fresh worker on the same thread. |
 | Worker → Scheduler | `error` | `{ type: 'error', error, errorContext? }` | Terminal failure payload. |
-| Worker → Scheduler | `result` | `{ type: 'result', stopReason?, channelSemantics, exitOnly: true, toolCount?, lastTool? }` | Worker process-exit completion signal. Carries no `text` — final-text delivery already happened via `turn_complete`; `result` only handles lifecycle / auto-continue / non-success `stopReason` surfacing. |
+| Worker → Scheduler | `result` | `{ type: 'result', text, stopReason?, channelSemantics, exitOnly: true, toolCount?, lastTool? }` | Worker process-exit completion signal. `text` is usually empty — final-text delivery already happened via `turn_complete`, and the worker suppresses duplicates by comparing against the last emitted turn text. `result` is kept for lifecycle / auto-continue / non-success `stopReason` surfacing. |
 
 Adding or changing message types/payload fields requires updating `worker.js` header comment, `scheduler.js` handler, and this section together.
 
