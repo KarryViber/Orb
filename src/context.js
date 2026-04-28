@@ -258,7 +258,7 @@ export async function buildPrompt({ userText, fileContent, threadTs, userId, cha
   }
 
   // Thread metadata (dynamic → user)
-  userParts.push(`## 消息信息\n- thread: ${threadTs}\n- user: ${userId}\n- time: ${new Date().toISOString()}`);
+  userParts.push(`## 消息信息\n- channel: ${channel || '(unknown)'}\n- thread: ${threadTs}\n- user: ${userId}\n- time: ${new Date().toISOString()}`);
 
   // Attached file content (dynamic → user)
   if (fileContent) {
