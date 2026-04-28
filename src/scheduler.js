@@ -1,6 +1,6 @@
 import { join } from 'node:path';
 import net from 'node:net';
-import { appendFileSync, readdirSync, readFileSync, existsSync, statSync, unlinkSync, writeFileSync, mkdirSync } from 'node:fs';
+import { readdirSync, readFileSync, existsSync, statSync, unlinkSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { info, error as logError, warn } from './log.js';
 import { taskQueue } from './queue.js';
@@ -8,10 +8,11 @@ import { sanitizeErrorText } from './format-utils.js';
 import { listFacts, storeLesson, storeCorrectionLesson, purgeTransient, lintMemory } from './memory.js';
 import { spawnWorker } from './spawn.js';
 import { getDefaults } from './config.js';
-import { EgressGate } from './egress.js';
 import { extractSuggestedPrompts } from './adapters/slack-format.js';
 import { writeLessonCandidate, isUserCorrectionText } from './lesson-candidates.js';
 import { assessSkillReviewTrigger } from './skill-review-trigger.js';
+import { TurnEgressLedger } from './turn-egress-ledger.js';
+import { deliverTurnText } from './deliver-turn-text.js';
 const TAG = 'scheduler';
 const DRAIN_TIMEOUT = 30_000;
 const SKILL_REVIEW_THRESHOLD = 10;   // cumulative tool uses before triggering review
@@ -22,7 +23,6 @@ const PERMISSION_APPROVAL_TIMEOUT_MS = parseInt(process.env.ORB_PERMISSION_TIMEO
 const STATUS_REFRESH_MS = 20_000;
 const SHUTDOWN_QUEUE_FILE = 'shutdown-queue.json';
 const SHUTDOWN_QUEUE_VERSION = 2;
-const SILENT_PREFIX = '[SILENT]';
 const LOADING_MESSAGES = [
   'Cooking…',
   'Reading files…',
@@ -101,34 +101,8 @@ function sanitizeTaskForPersistence(task) {
   return persisted;
 }
 
-function isSilentResultText(text) {
-  return typeof text === 'string' && text.startsWith(SILENT_PREFIX);
-}
-
 function normalizeChannelSemantics(value) {
   return value === 'silent' || value === 'broadcast' ? value : 'reply';
-}
-
-function isSuccessfulStopReason(stopReason) {
-  return !stopReason || stopReason === 'success' || stopReason === 'stop' || stopReason === 'end_turn';
-}
-
-function shouldSuppressForChannelSemantics(channelSemantics, stopReason) {
-  return channelSemantics === 'silent' && isSuccessfulStopReason(stopReason);
-}
-
-function writeSilentReceipt(profile, payload) {
-  try {
-    const dir = join(profile.dataDir, 'silent-suppressed');
-    mkdirSync(dir, { recursive: true });
-    const date = new Date().toISOString().slice(0, 10);
-    appendFileSync(join(dir, `${date}.jsonl`), `${JSON.stringify({
-      ts: new Date().toISOString(),
-      ...payload,
-    })}\n`);
-  } catch (err) {
-    warn(TAG, `failed to write silent receipt: ${err.message}`);
-  }
 }
 
 function getTaskCardStreamErrorCode(err) {
@@ -138,63 +112,23 @@ function getTaskCardStreamErrorCode(err) {
   return match?.[1] || null;
 }
 
-export function subtractDeliveredText(finalText, deliveredTexts = []) {
-  const text = typeof finalText === 'string' ? finalText : '';
-  if (!text.trim()) return '';
-
-  const deliveredEntries = Array.isArray(deliveredTexts)
-    ? deliveredTexts.map((entry) => typeof entry === 'string' ? entry : '').filter((entry) => entry.trim())
-    : [];
-  if (deliveredEntries.length > 1) {
-    let cursor = 0;
-    let remaining = '';
-    let matchedAll = true;
-    for (const entry of deliveredEntries) {
-      const index = text.indexOf(entry, cursor);
-      if (index < 0) {
-        matchedAll = false;
-        break;
-      }
-      remaining += text.slice(cursor, index);
-      cursor = index + entry.length;
-    }
-    if (matchedAll) {
-      remaining += text.slice(cursor);
-      if (!remaining.trim()) return '';
-      if (remaining.length < text.length) return remaining;
+function computeUndeliveredWithLedger(finalText, deliveredTexts = []) {
+  const ledger = new TurnEgressLedger();
+  if (Array.isArray(deliveredTexts)) {
+    for (const entry of deliveredTexts) {
+      ledger.record('legacy_segment', typeof entry === 'string' ? entry : '');
     }
   }
-
-  const delivered = Array.isArray(deliveredTexts)
-    ? deliveredTexts.map((entry) => typeof entry === 'string' ? entry : '').join('')
-    : '';
-  if (!delivered.trim()) return text;
-
-  if (text === delivered || delivered.includes(text)) return '';
-  if (text.startsWith(delivered)) return text.slice(delivered.length);
-  if (text.endsWith(delivered)) return text.slice(0, text.length - delivered.length);
-
-  const trimmedText = text.trim();
-  const trimmedDelivered = delivered.trim();
-  if (trimmedDelivered) {
-    if (trimmedText === trimmedDelivered || trimmedDelivered.includes(trimmedText)) return '';
-    if (trimmedText.startsWith(trimmedDelivered)) return trimmedText.slice(trimmedDelivered.length);
-    if (trimmedText.endsWith(trimmedDelivered)) {
-      return trimmedText.slice(0, trimmedText.length - trimmedDelivered.length);
-    }
-  }
-
-  const deliveredSet = new Set(
-    (deliveredTexts || []).map((entry) => String(entry || '').trim()).filter(Boolean),
-  );
-  return deliveredSet.has(trimmedText) ? '' : text;
+  return ledger.computeUndelivered(finalText);
 }
+
+export const subtractDeliveredText = computeUndeliveredWithLedger;
 
 export function resolveTurnCompleteDeliveryText(msg) {
   if (typeof msg?.undeliveredText === 'string') {
     return msg.undeliveredText.trim() ? msg.undeliveredText : '';
   }
-  return subtractDeliveredText(msg?.text, msg?.deliveredTexts);
+  return computeUndeliveredWithLedger(msg?.text, msg?.deliveredTexts);
 }
 
 export function makeTaskCardState({ enabled = false, deferred = false } = {}) {
@@ -224,6 +158,7 @@ export async function emitPayloadWithCapabilityFallback({
 }
 
 function makeTurnState(log, taskCardConfig) {
+  const ledger = new TurnEgressLedger();
   return {
     intermediateDeliveredThisTurn: false,
     typingActive: false,
@@ -231,7 +166,20 @@ function makeTurnState(log, taskCardConfig) {
     pendingStatusLoadingMessages: null,
     statusRefreshTimer: null,
     abandoned: false,
-    egress: new EgressGate(log),
+    ledger,
+    egress: {
+      admit(text, source) {
+        if (ledger.isAlreadyDelivered(text)) {
+          if (typeof log === 'function') log(`[TurnEgressLedger] DROP dup text (source=${source})`);
+          return false;
+        }
+        ledger.record(source, text);
+        return true;
+      },
+      reset() {
+        ledger.reset();
+      },
+    },
     taskCardState: makeTaskCardState(taskCardConfig),
   };
 }
@@ -895,24 +843,6 @@ export class Scheduler {
       task._completion?.[method]?.(payload);
     };
 
-    const suppressSuccessfulText = (phase, text, stopReason, messageChannelSemantics = channelSemantics) => {
-      const effectiveChannelSemantics = normalizeChannelSemantics(messageChannelSemantics);
-      if (!shouldSuppressForChannelSemantics(effectiveChannelSemantics, stopReason)) return false;
-      const textLength = String(text || '').length;
-      writeSilentReceipt(profile, {
-        phase,
-        threadTs,
-        channel,
-        deliveryThreadTs: effectiveThreadTs,
-        platform,
-        channelSemantics: effectiveChannelSemantics,
-        stopReason: stopReason || null,
-        textLength,
-      });
-      info(TAG, `silent ${phase} suppressed: thread=${threadTs} textLen=${textLength}`);
-      return true;
-    };
-
     const clearStatusRefresh = (targetTurn = turn) => {
       if (targetTurn?.statusRefreshTimer) {
         clearTimeout(targetTurn.statusRefreshTimer);
@@ -1036,31 +966,50 @@ export class Scheduler {
       });
     };
 
-    const deliverDeferredFinalResult = async (text) => {
-      if (!text) return false;
-      if (!turn.egress.admit(text, 'deferred')) return true;
-      const payloads = adapter.buildPayloads(text);
-      for (const payload of payloads) {
-        await emitPayload(payload);
+    const deliverViaFunnel = async ({
+      phase,
+      fullText,
+      stopReason = finalStopReason,
+      messageChannelSemantics = channelSemantics,
+    }) => {
+      if (!fullText) return { delivered: false, reason: 'empty' };
+      const result = await deliverTurnText({
+        ledger: turn.ledger,
+        phase,
+        fullText,
+        channelSemantics: normalizeChannelSemantics(messageChannelSemantics),
+        stopReason,
+        channel,
+        threadTs: effectiveThreadTs,
+        adapter,
+        profile,
+      });
+      if (result.reason === 'silent') {
+        info(TAG, `silent ${phase} suppressed: thread=${threadTs}`);
+      } else if (result.reason === 'already_delivered') {
+        info(TAG, `${phase} text already delivered, skip sendReply`);
       }
-      return true;
+      return result;
+    };
+
+    const recordWorkerDeliveredSegments = (msg) => {
+      // TODO(commit 3): delete this shim after worker IPC sends `segments`.
+      if (!Array.isArray(msg?.deliveredTexts)) return;
+      for (const entry of msg.deliveredTexts) {
+        if (typeof entry !== 'string' || !entry.trim()) continue;
+        if (!turn.ledger.isAlreadyDelivered(entry)) {
+          turn.ledger.record('worker_segment', entry);
+        }
+      }
     };
 
     const handleExitResult = async (msg) => {
       const text = msg.text?.trim() || null;
-      const silentDeferredResult = deferDeliveryUntilResult && isSilentResultText(text);
       finalResultText = text || '';
       finalStopReason = msg.stopReason || finalStopReason;
+      let deliveryResult = null;
 
       try {
-        if (text && suppressSuccessfulText('result', text, msg.stopReason, msg.channelSemantics)) {
-          finalResultText = '';
-          turnDelivered = true;
-          resetTaskCardState();
-          this._autoContinueCount.delete(threadTs);
-          return;
-        }
-
         // Exit signal: empty text after turn_complete delivery is expected and
         // should not enter auto-continue or fallback delivery.
         if (!text && turnDelivered) {
@@ -1125,43 +1074,31 @@ export class Scheduler {
           this._autoContinueCount.delete(threadTs);
         }
 
-        if (silentDeferredResult) {
-          info(TAG, `silent deferred result suppressed: thread=${threadTs}`);
-          turnDelivered = true;
-        }
-
         // Fallback delivery remains here for exit-only results that were not
         // covered by turn_complete, such as fail-fast paths or older CLI exits.
         if (!turnDelivered) {
-          if (deferDeliveryUntilResult && text) {
-            turnDelivered = await deliverDeferredFinalResult(text);
-          } else if (turn.intermediateDeliveredThisTurn && text) {
-            const remainingText = subtractDeliveredText(text, turn.egress?.deliveredTexts || []);
-            if (remainingText.trim()) {
-              const payloads = adapter.buildPayloads(remainingText);
-              info(TAG, `sending ${payloads.length} deduped result payload(s) to thread=${threadTs}`);
-              for (const payload of payloads) {
-                await emitPayload(payload);
-              }
-            } else {
-              info(TAG, `result text already delivered via intermediate stream, skip sendReply`);
-            }
+          if (text) {
+            deliveryResult = await deliverViaFunnel({
+              phase: 'result',
+              fullText: text,
+              stopReason: msg.stopReason,
+              messageChannelSemantics: msg.channelSemantics,
+            });
             turnDelivered = true;
           } else {
             const finalText = text || '⚠️ 多次续接仍未生成回复，任务可能需要拆分。请用更小的指令重试。';
-            if (turn.egress.admit(finalText, 'result-final')) {
-              const payloads = adapter.buildPayloads(finalText);
-              info(TAG, `sending ${payloads.length} payload(s) to thread=${threadTs}`);
-              for (const payload of payloads) {
-                await emitPayload(payload);
-              }
-            }
+            deliveryResult = await deliverViaFunnel({
+              phase: 'result',
+              fullText: finalText,
+              stopReason: msg.stopReason,
+              messageChannelSemantics: msg.channelSemantics,
+            });
             turnDelivered = true;
           }
         }
 
         resetTaskCardState();
-        if (!silentDeferredResult) await updateThreadMetadata(text);
+        if (deliveryResult?.reason !== 'silent') await updateThreadMetadata(text);
 
         if (text) {
           const errorPatterns = /(?:error|failed|permission denied|ENOENT|not found|timed?\s*out|EACCES)/i;
@@ -1346,34 +1283,21 @@ export class Scheduler {
           if (msg.type === 'turn_complete') {
             finalStopReason = msg.stopReason || finalStopReason;
             await stopTyping();
-            const workerResolvedText = resolveTurnCompleteDeliveryText(msg);
-            let deliveryText = workerResolvedText;
-            if (turn.intermediateDeliveredThisTurn && deliveryText) {
-              deliveryText = subtractDeliveredText(deliveryText, turn.egress?.deliveredTexts || []);
-            }
-            const metadataText = typeof msg.text === 'string' ? msg.text : deliveryText;
-            // 中间轮次完成 — 优先使用 worker 提供的 undeliveredText，
-            // 否则按 deliveredTexts 从完整文本中扣掉已发部分。
+            recordWorkerDeliveredSegments(msg);
+            const deliveryText = typeof msg.text === 'string' ? msg.text : '';
+            const metadataText = deliveryText;
             try {
-              if (deliveryText.trim() && suppressSuccessfulText('turn_complete', deliveryText, msg.stopReason, msg.channelSemantics)) {
-                turnDelivered = true;
-                resetTaskCardState();
-                return;
-              }
-              if (deferDeliveryUntilResult && isSilentResultText(deliveryText)) {
-                info(TAG, `silent deferred turn suppressed: thread=${threadTs}`);
-                turnDelivered = true;
-                resetTaskCardState();
-                return;
-              }
               if (deliveryText.trim()) {
+                const deliveryResult = await deliverViaFunnel({
+                  phase: 'turn_complete',
+                  fullText: deliveryText,
+                  stopReason: msg.stopReason,
+                  messageChannelSemantics: msg.channelSemantics,
+                });
                 turnDelivered = true;
-                if (deferDeliveryUntilResult) await deliverDeferredFinalResult(deliveryText);
-                else if (turn.egress.admit(deliveryText, 'final')) {
-                  const payloads = adapter.buildPayloads(deliveryText, { gitDiffSummary: msg.gitDiffSummary });
-                  for (const payload of payloads) {
-                    await emitPayload(payload);
-                  }
+                if (deliveryResult.reason === 'silent') {
+                  resetTaskCardState();
+                  return;
                 }
               } else if (metadataText?.trim()) {
                 turnDelivered = true;
@@ -1391,19 +1315,15 @@ export class Scheduler {
             } catch (err) {
               logError(TAG, `failed to send turn_complete: ${err.message}`);
               const fallbackText = deliveryText;
-              const silentDeferredFallback = deferDeliveryUntilResult && isSilentResultText(fallbackText);
-              if (silentDeferredFallback) {
-                info(TAG, `silent deferred turn suppressed after delivery failure: thread=${threadTs}`);
+              let fallbackResult = null;
+              if (fallbackText.trim()) {
+                fallbackResult = await deliverViaFunnel({
+                  phase: 'fallback',
+                  fullText: fallbackText,
+                  stopReason: msg.stopReason,
+                  messageChannelSemantics: msg.channelSemantics,
+                });
                 turnDelivered = true;
-              } else if (fallbackText.trim()) {
-                turnDelivered = true;
-                if (deferDeliveryUntilResult) await deliverDeferredFinalResult(fallbackText);
-                else if (turn.egress.admit(fallbackText, 'fallback')) {
-                  const payloads = adapter.buildPayloads(fallbackText, { gitDiffSummary: msg.gitDiffSummary });
-                  for (const payload of payloads) {
-                    await emitPayload(payload);
-                  }
-                }
               } else if (metadataText?.trim()) {
                 turnDelivered = true;
                 info(TAG, `turn_complete fallback diff empty after dedupe, skip sendReply`);
@@ -1415,7 +1335,7 @@ export class Scheduler {
                   }
                 }
               }
-              if (!silentDeferredFallback) await updateThreadMetadata(metadataText);
+              if (fallbackResult?.reason !== 'silent') await updateThreadMetadata(metadataText);
               resetTaskCardState();
             }
             return;
