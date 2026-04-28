@@ -142,6 +142,29 @@ export function subtractDeliveredText(finalText, deliveredTexts = []) {
   const text = typeof finalText === 'string' ? finalText : '';
   if (!text.trim()) return '';
 
+  const deliveredEntries = Array.isArray(deliveredTexts)
+    ? deliveredTexts.map((entry) => typeof entry === 'string' ? entry : '').filter((entry) => entry.trim())
+    : [];
+  if (deliveredEntries.length > 1) {
+    let cursor = 0;
+    let remaining = '';
+    let matchedAll = true;
+    for (const entry of deliveredEntries) {
+      const index = text.indexOf(entry, cursor);
+      if (index < 0) {
+        matchedAll = false;
+        break;
+      }
+      remaining += text.slice(cursor, index);
+      cursor = index + entry.length;
+    }
+    if (matchedAll) {
+      remaining += text.slice(cursor);
+      if (!remaining.trim()) return '';
+      if (remaining.length < text.length) return remaining;
+    }
+  }
+
   const delivered = Array.isArray(deliveredTexts)
     ? deliveredTexts.map((entry) => typeof entry === 'string' ? entry : '').join('')
     : '';

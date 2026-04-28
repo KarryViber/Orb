@@ -57,3 +57,21 @@ test('subtractDeliveredText returns empty when streamed chunks already cover the
 
   assert.equal(remaining, '');
 });
+
+test('subtractDeliveredText treats ordered streamed chunks separated by whitespace as delivered', () => {
+  const remaining = subtractDeliveredText(
+    '等一下--我先验证再动手。\n\n不需要动了。事实链对不上，停手。',
+    ['等一下--我先验证再动手。', '不需要动了。事实链对不上，停手。'],
+  );
+
+  assert.equal(remaining, '');
+});
+
+test('subtractDeliveredText keeps non-streamed text between ordered chunks', () => {
+  const remaining = subtractDeliveredText(
+    '第一段\n\n新增结论\n\n第二段',
+    ['第一段', '第二段'],
+  );
+
+  assert.equal(remaining, '\n\n新增结论\n\n');
+});
