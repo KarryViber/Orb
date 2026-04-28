@@ -1192,7 +1192,7 @@ export class SlackAdapter extends PlatformAdapter {
       return this._buildPermissionApprovalBlocks(prompt, approvalId);
     }
     return [
-      { type: 'section', text: { type: 'mrkdwn', text: prompt } },
+      { type: 'section', text: { type: 'mrkdwn', text: markdownToMrkdwn(String(prompt || '')) } },
       { type: 'actions', elements: [
         { type: 'button', text: { type: 'plain_text', text: 'Allow Once', emoji: true },
           style: 'primary', action_id: 'orb_approve_once', value: approvalId },
@@ -1294,7 +1294,7 @@ export class SlackAdapter extends PlatformAdapter {
     if (prompt && typeof prompt === 'object' && prompt.kind === 'permission') {
       return `权限请求: ${prompt.toolName || 'unknown'}`;
     }
-    return `承認リクエスト: ${String(prompt || '').slice(0, 100)}`;
+    return markdownToMrkdwn(`承認リクエスト: ${String(prompt || '').slice(0, 100)}`);
   }
 
   _approvalTimeoutReason(prompt) {
@@ -1437,7 +1437,7 @@ export class SlackAdapter extends PlatformAdapter {
   }
 
   async _updateBlockActionCard(channel, messageTs, text, originalBlocks = null) {
-    const safeText = String(text || '');
+    const safeText = markdownToMrkdwn(String(text || ''));
     const statusBlock = {
       type: 'context',
       elements: [{ type: 'mrkdwn', text: safeText }],
@@ -1853,7 +1853,7 @@ export class SlackAdapter extends PlatformAdapter {
       : Array.isArray(final_blocks) && final_blocks.length > 0
         ? final_blocks
         : null;
-    const finalText = typeof markdown_text === 'string' ? markdown_text.trim() : '';
+    const finalText = typeof markdown_text === 'string' ? markdownToMrkdwn(markdown_text.trim()) : '';
     if (finalText && streamTrace()) {
       info(TAG, `[slack:stopStream] emitting markdown_text as implicit post (len=${finalText.length}, channel=${stream.channel}, ts=${stream.ts})`);
     }
@@ -1901,7 +1901,7 @@ export class SlackAdapter extends PlatformAdapter {
       info(TAG, `uploaded file: ${filename || filePath}`);
     } catch (err) {
       logError(TAG, `file upload failed: ${err.message}`);
-      await this._postReply(channel, threadTs, `:warning: 文件上传失败: ${filename || filePath}`);
+      await this._postReply(channel, threadTs, markdownToMrkdwn(`:warning: 文件上传失败: ${filename || filePath}`));
     }
   }
 
@@ -1970,7 +1970,7 @@ export class SlackAdapter extends PlatformAdapter {
   async cleanupIndicator(channel, threadTs, typingSet, errorMsg) {
     if (typingSet) await this.setThreadStatus(channel, threadTs, '').catch(() => {});
     try {
-      await this._postReply(channel, threadTs, `:warning: ${errorMsg}`);
+      await this._postReply(channel, threadTs, markdownToMrkdwn(`:warning: ${errorMsg}`));
     } catch (err) {
       logError(TAG, `failed to send error msg: ${err.message}`);
     }
@@ -2141,7 +2141,7 @@ export class SlackAdapter extends PlatformAdapter {
     };
 
     try {
-      const mainText = this._interpRuleTemplate(rule.target.mainTemplate, ctx);
+      const mainText = markdownToMrkdwn(this._interpRuleTemplate(rule.target.mainTemplate, ctx));
       const mainMsg = await this._slack.chat.postMessage({
         channel: rule.target.channel,
         text: mainText,
@@ -2174,11 +2174,11 @@ export class SlackAdapter extends PlatformAdapter {
     } catch (err) {
       logError(TAG, `DM routing failed (rule=${rule.name}): ${err.message}`);
       try {
-        const pendingText = [
+        const pendingText = markdownToMrkdwn([
           this._interpRuleTemplate(rule.target.mainTemplate || '待补', ctx),
           '',
           '待补：DM 路由已命中，但自动建卡/启动 worker 时遇到 Slack API 故障；请稍后补处理。',
-        ].filter((line) => line !== null && line !== undefined).join('\n');
+        ].filter((line) => line !== null && line !== undefined).join('\n'));
         const pendingMsg = await this._slack.chat.postMessage({
           channel: rule.target.channel,
           text: pendingText,

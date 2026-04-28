@@ -159,6 +159,81 @@ test('stream non-text chunk paths keep existing normalization behavior', () => {
   );
 });
 
+test('stopStream finalText converts **bold** before send', async () => {
+  const adapter = new SlackAdapter({ botToken: 'xoxb-test', appToken: 'xapp-test' });
+  const calls = [];
+  adapter._slack = {
+    async apiCall(method, payload) {
+      calls.push([method, payload]);
+      return { ok: true };
+    },
+  };
+  adapter._streams.set('stream-1', {
+    channel: 'C1',
+    ts: '111.222',
+    startedAt: Date.now(),
+  });
+
+  await adapter.stopStream('stream-1', {
+    markdown_text: '**Tesla App 远程关哨兵**（最新版仍保留）',
+  });
+
+  assert.equal(calls[0][0], 'chat.stopStream');
+  assert.equal(calls[0][1].markdown_text, '*Tesla App 远程关哨兵*\u200b（最新版仍保留）');
+});
+
+test('cleanupIndicator wraps errorMsg with markdownToMrkdwn', async () => {
+  const adapter = new SlackAdapter({ botToken: 'xoxb-test', appToken: 'xapp-test' });
+  const replies = [];
+  adapter._postReply = async (channel, threadTs, text) => {
+    replies.push({ channel, threadTs, text });
+  };
+
+  await adapter.cleanupIndicator('C1', '111.222', false, '**boom**');
+
+  assert.deepEqual(replies, [
+    { channel: 'C1', threadTs: '111.222', text: ':warning: *boom*' },
+  ]);
+});
+
+test('DM routing mainText converts mainTemplate placeholders', async () => {
+  const adapter = new SlackAdapter({
+    botToken: 'xoxb-test',
+    appToken: 'xapp-test',
+    dmRouting: {
+      enabled: true,
+      rules: [{
+        name: 'repo',
+        match: { urlPattern: 'https://github\\.com/[^\\s]+' },
+        target: {
+          channel: 'C-target',
+          mainTemplate: '卡片：**{repo_slug}**',
+          workerPrompt: 'worker {repo_slug}',
+        },
+      }],
+    },
+  });
+  const posts = [];
+  adapter._slack = {
+    chat: {
+      async postMessage(payload) {
+        posts.push(payload);
+        return { ok: true, ts: '222.333' };
+      },
+    },
+  };
+
+  const result = await adapter._routeDMMessage({
+    text: 'see https://github.com/acme/orb',
+    files: [],
+    user: 'U1',
+    ts: '111.222',
+  });
+
+  assert.deepEqual(result, { routed: true });
+  assert.equal(posts[0].text, '卡片：\u200b*acme/orb*');
+});
+
 test('thread history keeps emoji-prefixed bot messages when blocks contain content', async () => {
   const adapter = new SlackAdapter({ botToken: 'xoxb-test', appToken: 'xapp-test' });
   adapter._slack = {
