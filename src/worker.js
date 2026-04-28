@@ -1177,7 +1177,7 @@ function buildWorkerMcpConfig({ threadTs, channel, userId, permissionTimeoutMs, 
   return configPath;
 }
 
-function collectWorkspaceMcpServers(workspace, extraEnv) {
+export function collectWorkspaceMcpServers(workspace, extraEnv) {
   const dir = join(workspace, '.claude', 'mcp-servers');
   if (!existsSync(dir)) return {};
 
@@ -1204,12 +1204,14 @@ function collectWorkspaceMcpServers(workspace, extraEnv) {
           ? def.args.map((arg) => (looksRelativePath(arg) ? join(workspace, arg) : arg))
           : [];
         // Workspace MCP runs inside the worker child process and can access Orb env.
-        result[name] = {
+        const entry = {
           type: def.type || 'stdio',
           command: def.command,
           args,
           env: { ...(def.env || {}), ...extraEnv },
         };
+        if (def.alwaysLoad === true) entry.alwaysLoad = true;
+        result[name] = entry;
       }
     } catch (err) {
       console.warn(`[worker] failed to load MCP registration ${fname}: ${err.message}`);
