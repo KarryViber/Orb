@@ -110,7 +110,7 @@ Optional fields:
 - `"effort"`: `"low"` | `"medium"` | `"high"` | `"xhigh"` | `"max"` (Opus defaults xhigh)
 - `"maxTurns"`: positive integer override for Claude CLI `--max-turns`, e.g. `"maxTurns": 60`
 
-Cron workers are dispatched with IPC `channelSemantics: "silent"`, so successful worker text is suppressed by scheduler contract after any target-channel delivery. Worker `error` messages and non-success `result.stopReason` remain deliverable as failure receipts.
+Cron workers are dispatched with IPC `channelSemantics: "silent"`, so successful worker text is suppressed by scheduler contract after any target-channel delivery. Worker `error` messages and non-success `result.stopReason` remain deliverable as failure receipts; CLI/API failures are surfaced to Karry's DM with a short cron failure title while longer stderr stays in logs/lesson-candidate context.
 
 Token tier guidelines:
 | Task type | model | effort |
@@ -168,7 +168,7 @@ Scheduler ↔ Worker communication via Node IPC (process.send/on('message')):
 | Worker → Scheduler | `cc_event` | `{ type: 'cc_event', turnId, attemptId?, eventType, payload }` | Raw Claude Code event forwarded to scheduler subscribers. Slack Qi, plan, text, and status rendering is driven from this stream. |
 | Worker → Scheduler | `inject_failed` | `{ type: 'inject_failed', injectId?, attemptId?, userText, fileContent?, imagePaths? }` | Follow-up inject could not reach the live CLI session (for example the session already closed). Scheduler must fail forward by replaying that payload through a fresh worker on the same thread. |
 | Worker → Scheduler | `error` | `{ type: 'error', error, errorContext? }` | Terminal failure payload. |
-| Worker → Scheduler | `result` | `{ type: 'result', text, stopReason?, channelSemantics, exitOnly: true, toolCount?, lastTool? }` | Worker process-exit completion signal. `text` is usually empty — final-text delivery already happened via `turn_complete`, and the worker suppresses duplicates by comparing against the last emitted turn text. `result` is kept for lifecycle / auto-continue / non-success `stopReason` surfacing. |
+| Worker → Scheduler | `result` | `{ type: 'result', text, stopReason?, channelSemantics, exitOnly: true, toolCount?, lastTool?, exitCode?, stderrSummary? }` | Worker process-exit completion signal. `text` is usually empty — final-text delivery already happened via `turn_complete`, and the worker suppresses duplicates by comparing against the last emitted turn text. `result` is kept for lifecycle / auto-continue / non-success `stopReason` surfacing; non-zero CLI exits set a non-success stopReason such as `api_error` / `cli_error`. |
 
 Adding or changing message types/payload fields requires updating `worker.js` header comment, `scheduler.js` handler, and this section together.
 

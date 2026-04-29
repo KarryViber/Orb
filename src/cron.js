@@ -282,10 +282,13 @@ function isSuccessfulStopReason(stopReason) {
   return !stopReason || stopReason === 'success' || stopReason === 'stop' || stopReason === 'end_turn';
 }
 
-function failureReasonFromResult(responseText, stopReason) {
+function failureReasonFromResult(responseText, stopReason, errorSummary = '') {
   const text = String(responseText || '').trim();
   if (text.toLowerCase().startsWith('failed:')) return text.slice('failed:'.length).trim() || 'failed';
-  if (!isSuccessfulStopReason(stopReason)) return `stopReason=${stopReason}`;
+  if (!isSuccessfulStopReason(stopReason)) {
+    const summary = truncateErrorContext(errorSummary, 160);
+    return summary ? `${stopReason}: ${summary}` : `stopReason=${stopReason}`;
+  }
   return null;
 }
 
@@ -462,6 +465,7 @@ export class CronScheduler {
         enableTaskCard: false,
         forceNewWorker: true,
         jobRunId,
+        cronName: job.name || job.id,
         profile: {
           name: job.profileName,
           workspaceDir: paths.workspaceDir,
@@ -472,7 +476,7 @@ export class CronScheduler {
       responseText = result?.text || '';
       stopReason = result?.stopReason || null;
 
-      const failureReason = failureReasonFromResult(responseText, stopReason);
+      const failureReason = failureReasonFromResult(responseText, stopReason, result?.errorSummary || '');
 
       job.lastRunAt = now.toISOString();
       if (failureReason) {

@@ -140,6 +140,31 @@ function isSuccessfulStopReason(stopReason) {
   return !stopReason || stopReason === 'success' || stopReason === 'stop' || stopReason === 'end_turn';
 }
 
+function shortFailureReason(value, fallback = 'worker failed') {
+  const text = sanitizeErrorText(value || fallback)
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)[0] || fallback;
+  return text.length <= 80 ? text : `${text.slice(0, 77)}...`;
+}
+
+function formatJstMonthDay(date = new Date()) {
+  return new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Asia/Tokyo',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(date);
+}
+
+function buildFailureReceiptText({ task, threadTs, stopReason, stderrSummary, exitCode }) {
+  const reason = shortFailureReason(stderrSummary || stopReason || (exitCode != null ? `exitCode=${exitCode}` : 'worker failed'));
+  const cronName = task?.cronName || (String(threadTs || '').startsWith('cron:') ? String(threadTs).slice('cron:'.length) : '');
+  if (cronName) {
+    return `⚠️ ${cronName} ${formatJstMonthDay()}｜失败：LLM｜${reason}`;
+  }
+  return `:warning: 出错了: ${reason}`;
+}
+
 function shouldSuppressForChannelSemantics(channelSemantics, stopReason) {
   return channelSemantics === 'silent' && isSuccessfulStopReason(stopReason);
 }
@@ -915,6 +940,7 @@ export class Scheduler {
     let metadataUpdatedForTurn = false;
     let finalResultText = '';
     let finalStopReason = null;
+    let finalErrorSummary = null;
     let workerFailure = null;
     let completionSettled = false;
     let currentCcTurnId = null;
@@ -1100,8 +1126,40 @@ export class Scheduler {
       const text = '';
       finalResultText = '';
       finalStopReason = msg.stopReason || finalStopReason;
+      finalErrorSummary = msg.stderrSummary || finalErrorSummary;
 
       try {
+        if (!isSuccessfulStopReason(msg.stopReason)) {
+          this._autoContinueCount.delete(threadTs);
+          const receiptText = buildFailureReceiptText({
+            task,
+            threadTs,
+            stopReason: msg.stopReason,
+            stderrSummary: msg.stderrSummary,
+            exitCode: msg.exitCode,
+          });
+          warn(TAG, `worker non-success result: thread=${threadTs} stopReason=${msg.stopReason || 'unknown'} exitCode=${msg.exitCode ?? 'unknown'}`);
+          if (!userVisibleDeliveryObserved) {
+            const result = await orchestrator.emit({
+              turnId: currentCcTurnId || makeTurnId({ threadTs, attemptId: task.attemptId }),
+              attemptId: task.attemptId || '',
+              channel,
+              threadTs: effectiveThreadTs,
+              platform,
+              channelSemantics: 'reply',
+              intent: CONTROL_PLANE_MESSAGE,
+              text: receiptText,
+              source: 'scheduler.result_failure',
+              meta: {
+                stopReason: msg.stopReason || null,
+                exitCode: msg.exitCode ?? null,
+              },
+            });
+            if (result.delivered) userVisibleDeliveryObserved = true;
+          }
+          return;
+        }
+
         // Exit signal: empty text after turn_complete delivery is expected and
         // should not enter auto-continue or fallback delivery.
         if (userVisibleDeliveryObserved) {
@@ -1484,7 +1542,7 @@ export class Scheduler {
               channel,
               threadTs: effectiveThreadTs,
               platform,
-              channelSemantics,
+              channelSemantics: 'reply',
               intent: CONTROL_PLANE_MESSAGE,
               text: `:warning: 出错了: ${safeError}`,
               source: 'scheduler.worker_error',
@@ -1568,7 +1626,12 @@ export class Scheduler {
           } else if (!responded) {
             settleCompletion('reject', new Error(signal ? `worker killed: ${signal}` : `worker exited with code ${code}`));
           } else {
-            settleCompletion('resolve', { text: finalResultText, threadTs: effectiveThreadTs, stopReason: finalStopReason });
+            settleCompletion('resolve', {
+              text: finalResultText,
+              threadTs: effectiveThreadTs,
+              stopReason: finalStopReason,
+              errorSummary: finalErrorSummary,
+            });
           }
         },
       }));

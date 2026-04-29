@@ -245,3 +245,31 @@ test('cron failed result text is treated as failure without direct delivery', as
   assert.equal(job.lastError, 'boom');
   assert.equal(job.lastDeliveryError, null);
 });
+
+test('cron non-success stopReason records stderr summary as failed status', async () => {
+  const dataDir = createTempDataDir();
+  const executed = [];
+  const scheduler = createScheduler(
+    dataDir,
+    async (task) => {
+      executed.push(task);
+      return {
+        text: '',
+        stopReason: 'api_error',
+        errorSummary: 'API Error: 500 Internal server error',
+      };
+    },
+  );
+
+  writeJobs(dataDir, [createJob('skill-promotion-tick')]);
+
+  await scheduler.tick();
+  await delay(20);
+  await scheduler._awaitJobWrites(dataDir);
+
+  const [job] = readJobs(dataDir);
+  assert.equal(job.lastStatus, 'failed');
+  assert.equal(job.lastError, 'api_error: API Error: 500 Internal server error');
+  assert.equal(job.lastDeliveryError, null);
+  assert.equal(executed[0].cronName, 'skill-promotion-tick');
+});

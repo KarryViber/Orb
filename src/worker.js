@@ -33,7 +33,7 @@ import { storeConversation } from './memory.js';
  *   { type: 'inject_failed', injectId?, attemptId?, userText, fileContent?, imagePaths? }  — follow-up inject could not reach CLI;
  *     scheduler should respawn a fresh worker and replay the user payload.
  *   { type: 'error', error, errorContext? }
- *   { type: 'result', text, stopReason?, channelSemantics, exitOnly: true, toolCount?, lastTool? }
+ *   { type: 'result', text, stopReason?, channelSemantics, exitOnly: true, toolCount?, lastTool?, exitCode?, stderrSummary? }
  *     - process-exit completion signal, not a UI stream primitive.
  */
 
@@ -43,6 +43,7 @@ const MEMORY_USAGE_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'li
 const MAX_TURNS = parseInt(process.env.MAX_TURNS, 10) || 50;
 const DEFAULT_PERMISSION_TIMEOUT_MS = parseInt(process.env.ORB_PERMISSION_TIMEOUT_MS, 10) || 300_000;
 const MCP_PERMISSION_TOOL_NOT_FOUND_RE = /MCP tool mcp__orb_permission__orb_request_permission[\s\S]*not found[\s\S]*Available MCP tools: none/i;
+const CLI_API_ERROR_RE = /\b(?:API Error|Internal server error|5\d\d|rate limit|overloaded|upstream)\b/i;
 const DEFAULT_WORKSPACE_ALLOW_RULES = [
   'Read(*)',
   'Skill(*)',
@@ -323,14 +324,20 @@ process.on('message', async (msg) => {
 
     // Send final result as an exit/status signal only. turn_complete is the only
     // worker IPC message that carries deliverable final text.
+    const stderrSummary = summarizeCliStderr(exitResult.stderr);
+    const cliFailure = exitResult.code !== 0 || (!exitResult.stopReason && CLI_API_ERROR_RE.test(stderrSummary));
+    const resultStopReason = exitResult.stopReason
+      || (cliFailure ? (CLI_API_ERROR_RE.test(stderrSummary) ? 'api_error' : 'cli_error') : null);
     await ipcSend({
       type: 'result',
       text: '',
       toolCount: exitResult.toolCount,
       lastTool: exitResult.lastTool,
-      stopReason: exitResult.stopReason,
+      stopReason: resultStopReason,
       channelSemantics: _currentChannelSemantics,
       exitOnly: true,
+      exitCode: exitResult.code,
+      stderrSummary,
     });
 
     const memDbPath = join(dataDir, 'memory.db');
@@ -357,6 +364,14 @@ function truncateText(text, maxChars) {
   const normalized = String(text || '').replace(/\s+\n/g, '\n').trim();
   if (normalized.length <= maxChars) return normalized;
   return `${normalized.slice(0, maxChars - 3)}...`;
+}
+
+function summarizeCliStderr(stderr) {
+  const lines = String(stderr || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  return truncateText(lines.slice(-6).join('\n'), 1000);
 }
 
 function normalizeChannelSemantics(value) {

@@ -71,7 +71,7 @@ function makeScheduler(sequence, adapter) {
   return scheduler;
 }
 
-async function runTask(sequence, { warnLines } = {}) {
+async function runTask(sequence, { warnLines, taskOverrides = {} } = {}) {
   const adapter = makeAdapter();
   const scheduler = makeScheduler(sequence, adapter);
   let resolveCompletion;
@@ -88,6 +88,7 @@ async function runTask(sequence, { warnLines } = {}) {
     channel: 'C1',
     userId: 'U1',
     platform: 'slack',
+    ...taskOverrides,
     _completion: { resolve: resolveCompletion, reject: rejectCompletion },
   });
   try {
@@ -139,4 +140,35 @@ test('genuine crash (signal/non-zero exit, no delivery) still triggers warning',
   ], { warnLines: [] });
 
   assert.equal(fallbackWarnings(calls).length, 1);
+});
+
+test('non-success result sends cron failure receipt instead of auto-continue', async () => {
+  const calls = await runTask([
+    { msg: { type: 'turn_start' } },
+    {
+      msg: {
+        type: 'result',
+        text: '',
+        exitOnly: true,
+        stopReason: 'api_error',
+        exitCode: 1,
+        stderrSummary: 'API Error: 500 Internal server error',
+        channelSemantics: 'silent',
+      },
+    },
+    { exit: { code: 0, signal: null } },
+  ], {
+    taskOverrides: {
+      threadTs: 'cron:skill-promotion-tick',
+      deliveryThreadTs: null,
+      channelSemantics: 'silent',
+      cronName: 'skill-promotion-tick',
+    },
+  });
+
+  const replies = calls.filter((call) => call[0] === 'sendReply');
+  assert.equal(fallbackWarnings(calls).length, 0);
+  assert.equal(replies.length, 1);
+  assert.equal(replies[0][1], 'C1');
+  assert.match(replies[0][3], /^⚠️ skill-promotion-tick \d{2}\/\d{2}｜失败：LLM｜API Error: 500 Internal server error$/);
 });
