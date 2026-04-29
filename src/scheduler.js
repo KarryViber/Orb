@@ -970,6 +970,10 @@ export class Scheduler {
         if (!capturedTurn.pendingThreadStatus || !canManageThreadStatus || !effectiveThreadTs) return;
         try {
           await adapter.setThreadStatus(channel, effectiveThreadTs, capturedTurn.pendingThreadStatus, capturedTurn.pendingStatusLoadingMessages || undefined);
+          if (turn !== capturedTurn || capturedTurn.abandoned || !capturedTurn.pendingThreadStatus) {
+            await adapter.setThreadStatus(channel, effectiveThreadTs, '', null).catch(() => {});
+            return;
+          }
           armStatusRefresh();
         } catch (err) {
           warn(TAG, `status refresh failed: ${err.message}`);
