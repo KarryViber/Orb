@@ -7,7 +7,6 @@ import {
   makeTaskCardState,
   Scheduler,
 } from '../src/scheduler.js';
-import { EgressGate } from '../src/egress.js';
 
 function createMockAdapter({ appendFails = false } = {}) {
   const calls = [];
@@ -33,14 +32,6 @@ function createMockAdapter({ appendFails = false } = {}) {
   };
 }
 
-test('rotate equivalent: EgressGate reset admits similar text after a stream boundary', () => {
-  const gate = new EgressGate();
-  assert.equal(gate.admit('继续分析...', 'before-rotate'), true);
-  assert.equal(gate.admit('继续分析...', 'before-rotate-dup'), false);
-  gate.reset();
-  assert.equal(gate.admit('继续分析...', 'after-rotate'), true);
-});
-
 test('Qi settled chunks keep the subscriber final state shape', () => {
   assert.equal(buildQiSettledChunks(3).at(-1).details, 'Distilled from 3 probes');
 });
@@ -51,7 +42,6 @@ test('turn abandon clears scheduler-owned turn state', async () => {
     abandoned: false,
     statusRefreshTimer: setTimeout(() => {}, 10_000),
     taskCardState: makeTaskCardState({ enabled: true }),
-    egress: new EgressGate(),
   };
 
   await abandonTurnState({ turn, adapter, channel: 'C1' });

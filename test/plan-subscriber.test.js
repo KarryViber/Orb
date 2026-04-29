@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createSlackPlanSubscriber } from '../src/adapters/slack.js';
 import { EventBus, Scheduler } from '../src/scheduler.js';
+import { TurnDeliveryOrchestrator } from '../src/turn-delivery/orchestrator.js';
 
 function createMockAdapter() {
   const calls = [];
@@ -20,10 +21,42 @@ function createMockAdapter() {
     async stopStream(streamId, payload) {
       calls.push(['stopStream', streamId, payload]);
     },
+    get capabilities() {
+      return { stream: true };
+    },
+    async deliver(intent, { channel, turnState }) {
+      if (channel !== 'stream') return { ts: null };
+      if (intent.intent === 'task_progress.start') {
+        return this.startStream(intent.channel, intent.threadTs, {
+          task_display_mode: intent.meta.task_display_mode,
+          initial_chunks: intent.meta.chunks,
+          team_id: intent.meta.teamId,
+        });
+      }
+      if (intent.intent === 'task_progress.append') {
+        await this.appendStream(turnState.streamId, intent.meta.chunks);
+      } else if (intent.intent === 'task_progress.stop') {
+        await this.stopStream(turnState.streamId, { chunks: intent.meta.chunks });
+      }
+      return { ts: turnState.streamMessageTs || null };
+    },
     createPlanSubscriber() {
       return createSlackPlanSubscriber(this);
     },
   };
+}
+
+function attachOrchestrator(adapter, ctx, turnId) {
+  const orchestrator = new TurnDeliveryOrchestrator({ adapter });
+  orchestrator.beginTurn({
+    turnId,
+    attemptId: 'attempt-1',
+    channel: ctx.channel,
+    threadTs: ctx.effectiveThreadTs || ctx.threadTs,
+    platform: 'slack',
+  });
+  ctx.orchestrator = orchestrator;
+  ctx.task = { ...(ctx.task || {}), attemptId: 'attempt-1' };
 }
 
 function todoWrite(turnId, todos) {
@@ -45,6 +78,7 @@ test('SlackPlanSubscriber renders TodoWrite rows and replaces snapshot on later 
   const bus = new EventBus();
   bus.subscribe(createSlackPlanSubscriber(adapter));
   const ctx = { channel: 'C1', threadTs: '111.222', effectiveThreadTs: '111.222', task: { teamId: 'T1' } };
+  attachOrchestrator(adapter, ctx, 'turn-plan');
 
   await bus.publish(todoWrite('turn-plan', [
     { content: '第一步', status: 'in_progress' },

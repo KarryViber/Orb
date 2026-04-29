@@ -405,6 +405,14 @@ export class WeChatAdapter extends PlatformAdapter {
     return false;
   }
 
+  get capabilities() {
+    return {
+      stream: false,
+      edit: false,
+      metadata: false,
+    };
+  }
+
   // --- PlatformAdapter interface ---
 
   async start(onMessage) {
@@ -478,6 +486,15 @@ export class WeChatAdapter extends PlatformAdapter {
 
   async editMessage() {
     // WeChat doesn't support message editing
+  }
+
+  async deliver(intent, { channel: deliveryChannel } = {}) {
+    if (deliveryChannel === 'silent') return { ts: null };
+    if (deliveryChannel === 'metadata' || deliveryChannel === 'edit') return { ts: null };
+    const text = String(intent.text || '').trim();
+    if (!text) return { ts: null };
+    await this.sendReply(intent.channel, intent.threadTs || intent.channel, text, intent.meta || {});
+    return { ts: null };
   }
 
   async uploadFile(channel, threadTs, filePath, filename) {

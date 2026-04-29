@@ -21,18 +21,8 @@ function createMockAdapter() {
 }
 
 function createTurn() {
-  let admitCount = 0;
   return {
     taskCardState: { enabled: true, deferred: false, failed: false, streamId: null },
-    egress: {
-      admit() {
-        admitCount += 1;
-        return true;
-      },
-      get admitCount() {
-        return admitCount;
-      },
-    },
   };
 }
 
@@ -79,6 +69,5 @@ test('Slack cc_event subscribers ignore non-Slack platform contexts', async () =
     for (const msg of Object.values(messages)) await bus.publish(msg, ctx);
 
     assert.deepEqual(adapter.calls, []);
-    assert.equal(turn.egress.admitCount, 0);
   }
 });

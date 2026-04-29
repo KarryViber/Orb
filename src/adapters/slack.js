@@ -18,13 +18,14 @@ import { PlatformAdapter } from './interface.js';
 import { downloadAndCacheImage, cleanImageCache, IMAGE_EXTENSIONS } from './image-cache.js';
 import {
   ASSISTANT_TEXT_DELTA,
+  ASSISTANT_TEXT_FINAL,
   CONTROL_PLANE_MESSAGE,
   CONTROL_PLANE_UPDATE,
+  METADATA_STATUS,
+  METADATA_TITLE,
   TASK_PROGRESS_APPEND,
   TASK_PROGRESS_START,
   TASK_PROGRESS_STOP,
-  createTurnDeliveryRecord,
-  makeTurnId,
 } from '../turn-delivery/intents.js';
 
 const TAG = 'slack';
@@ -103,42 +104,6 @@ function chunksText(chunks) {
     .join('\n');
 }
 
-function observeShadow(ctx, recordInput) {
-  try {
-    ctx?.shadowRecorder?.observe(createTurnDeliveryRecord({
-      turnId: makeTurnId({
-        turnId: recordInput.turnId || ctx?.turnId,
-        threadTs: recordInput.threadTs || ctx?.threadTs || ctx?.effectiveThreadTs || ctx?.task?.threadTs,
-        attemptId: recordInput.attemptId || ctx?.task?.attemptId,
-      }),
-      attemptId: recordInput.attemptId || ctx?.task?.attemptId || '',
-      channel: recordInput.channel || ctx?.channel || ctx?.task?.channel || '',
-      threadTs: recordInput.threadTs || ctx?.threadTs || ctx?.effectiveThreadTs || ctx?.task?.threadTs || '',
-      platform: recordInput.platform || ctx?.platform || ctx?.task?.platform || 'slack',
-      ...recordInput,
-    }));
-  } catch (err) {
-    warn(TAG, `shadow observe failed: ${err.message}`);
-  }
-}
-
-function observePromptShadow(prompt, recordInput) {
-  const shadow = prompt?._turnDeliveryShadow;
-  if (!shadow?.recorder) return;
-  try {
-    shadow.recorder.observe(createTurnDeliveryRecord({
-      turnId: shadow.turnId || makeTurnId({ threadTs: recordInput.threadTs, attemptId: shadow.attemptId }),
-      attemptId: shadow.attemptId || '',
-      channel: recordInput.channel || '',
-      threadTs: recordInput.threadTs || '',
-      platform: shadow.platform || 'slack',
-      ...recordInput,
-    }));
-  } catch (err) {
-    warn(TAG, `shadow observe failed: ${err.message}`);
-  }
-}
-
 export function buildQiSettledChunks(toolCount = 0, reason = '') {
   const count = Number.isFinite(Number(toolCount)) ? Number(toolCount) : 0;
   const details = reason ? `Settled: ${reason}` : `Distilled from ${count} probes`;
@@ -192,7 +157,7 @@ function createCcSubscriber(adapter, {
   buildToolChunks,
   getInitialChunks,
   onResult,
-  shadowSource = 'subscriber.qi',
+  recordSource = 'subscriber.qi',
 }) {
   const turns = new Map();
   const getState = (turnId) => {
@@ -214,26 +179,24 @@ function createCcSubscriber(adapter, {
     if (!channel || !threadTs) return false;
     state.startPromise = (async () => {
       try {
-        const stream = await adapter.startStream(channel, threadTs, {
-          task_display_mode: 'plan',
-          initial_chunks: initialChunks,
-          team_id: ctx?.task?.teamId || ctx?.teamId || null,
-        });
-        state.streamId = stream?.stream_id || (stream?.ts ? `${channel}:${stream.ts}` : null);
-        state.streamTs = stream?.ts || null;
-        if (state.streamId && taskCardState) taskCardState.streamId = state.streamId;
-        observeShadow(ctx, {
+        const result = await ctx.orchestrator?.emit({
           turnId,
+          attemptId: ctx?.task?.attemptId || '',
+          channel,
+          threadTs,
+          platform: 'slack',
+          channelSemantics: ctx?.channelSemantics,
           intent: TASK_PROGRESS_START,
-          deliveryChannel: 'stream',
+          source: recordSource,
           text: chunksText(initialChunks),
-          streamMessageTs: state.streamTs,
-          source: shadowSource,
           meta: {
-            streamId: state.streamId,
-            chunkCount: Array.isArray(initialChunks) ? initialChunks.length : 0,
+            task_display_mode: 'plan',
+            chunks: initialChunks,
+            teamId: ctx?.task?.teamId || ctx?.teamId || null,
           },
         });
+        state.streamId = ctx?.turn?.taskCardState?.streamId || ctx?.orchestrator?.getTurnState?.(turnId)?.streamId || null;
+        state.streamTs = result?.ts || ctx?.orchestrator?.getTurnState?.(turnId)?.streamMessageTs || null;
       } catch (err) {
         state.failed = true;
         if (taskCardState) taskCardState.failed = true;
@@ -274,17 +237,20 @@ function createCcSubscriber(adapter, {
         if (!await ensureStarted(state, ctx, initialChunks, msg.turnId)) return;
         if (!hadStream && initialChunks === chunks) return;
         if (state.failed || !state.streamId) return;
+        const appendSequence = state.appendSeq = (state.appendSeq || 0) + 1;
         await chainAppend(state, async () => {
           if (!state.streamId) return;
-          await adapter.appendStream(state.streamId, chunks);
-          observeShadow(ctx, {
+          await ctx.orchestrator?.emit({
             turnId: msg.turnId,
+            attemptId: ctx?.task?.attemptId || '',
+            channel: ctx?.channel || ctx?.task?.channel || '',
+            threadTs: ctx?.effectiveThreadTs || ctx?.threadTs || ctx?.task?.threadTs || '',
+            platform: 'slack',
+            channelSemantics: ctx?.channelSemantics,
             intent: TASK_PROGRESS_APPEND,
-            deliveryChannel: 'stream',
             text: chunksText(chunks),
-            streamMessageTs: state.streamTs,
-            source: shadowSource,
-            meta: { streamId: state.streamId, chunkCount: chunks.length },
+            source: recordSource,
+            meta: { sequence: appendSequence, streamId: state.streamId, chunks, chunkCount: chunks.length },
           });
         }).catch((err) => {
           warn(TAG, `[cc_subscriber] append failed: ${err.message}`);
@@ -301,15 +267,17 @@ function createCcSubscriber(adapter, {
       const streamId = state.streamId;
       const chunks = onResult(msg, ctx, state);
       try {
-        await adapter.stopStream(streamId, { chunks });
-        observeShadow(ctx, {
+        await ctx.orchestrator?.emit({
           turnId: msg.turnId,
+          attemptId: ctx?.task?.attemptId || '',
+          channel: ctx?.channel || ctx?.task?.channel || '',
+          threadTs: ctx?.effectiveThreadTs || ctx?.threadTs || ctx?.task?.threadTs || '',
+          platform: 'slack',
+          channelSemantics: ctx?.channelSemantics,
           intent: TASK_PROGRESS_STOP,
-          deliveryChannel: 'stream',
           text: chunksText(chunks),
-          streamMessageTs: state.streamTs,
-          source: shadowSource,
-          meta: { streamId, chunkCount: Array.isArray(chunks) ? chunks.length : 0 },
+          source: recordSource,
+          meta: { streamId, chunks, chunkCount: Array.isArray(chunks) ? chunks.length : 0 },
         });
       } catch (err) {
         warn(TAG, `[cc_subscriber] stop failed: ${err.message}`);
@@ -325,7 +293,7 @@ function createCcSubscriber(adapter, {
 
 export function createSlackQiSubscriber(adapter) {
   return createCcSubscriber(adapter, {
-    shadowSource: 'subscriber.qi',
+    recordSource: 'subscriber.qi',
     makeState: makeQiTurnState,
     matchTool(msg, ctx) {
       const category = categorizeTool(msg.payload?.name);
@@ -350,7 +318,7 @@ export function createSlackQiSubscriber(adapter) {
 
 export function createSlackPlanSubscriber(adapter) {
   return createCcSubscriber(adapter, {
-    shadowSource: 'subscriber.qi',
+    recordSource: 'subscriber.qi',
     makeState: makePlanTurnState,
     matchTool: (msg) => msg.payload?.name === 'TodoWrite' && Array.isArray(msg.payload?.input?.todos),
     buildToolChunks(msg, ctx, state) {
@@ -389,21 +357,20 @@ export function createSlackTextSubscriber(adapter, { debounceMs = TEXT_DEBOUNCE_
     const taskCardState = turn?.taskCardState;
     const streamId = taskCardState?.streamId;
 
-    if (streamId && !taskCardState?.failed && typeof adapter.appendStream === 'function') {
+    if (streamId && !taskCardState?.failed && ctx?.orchestrator) {
       try {
-        await adapter.appendStream(streamId, [{ type: 'markdown_text', text }]);
-        observeShadow(ctx, {
+        await ctx.orchestrator.emit({
           turnId: key,
+          attemptId: ctx?.task?.attemptId || '',
+          channel: ctx?.channel || ctx?.task?.channel || '',
+          threadTs: ctx?.effectiveThreadTs || ctx?.threadTs || ctx?.task?.threadTs || '',
+          platform: 'slack',
+          channelSemantics: ctx?.channelSemantics,
           intent: ASSISTANT_TEXT_DELTA,
-          deliveryChannel: 'stream',
           text,
-          streamMessageTs: streamId.includes(':') ? streamId.split(':').slice(1).join(':') : null,
           source: 'subscriber.text',
-          meta: { streamId },
+          meta: { streamId, sequence: state.sequence = (state.sequence || 0) + 1 },
         });
-        if (turn) turn.intermediateDeliveredThisTurn = true;
-        if (turn?.egress) turn.egress.admit(text, 'intermediate');
-        ctx?.markStreamDelivered?.(text.length);
         return;
       } catch (err) {
         const code = err?.data?.error || err?.code || '';
@@ -948,6 +915,14 @@ export class SlackAdapter extends PlatformAdapter {
     return true;
   }
 
+  get capabilities() {
+    return {
+      stream: true,
+      edit: true,
+      metadata: true,
+    };
+  }
+
   // --- Dedup ---
 
   _isDuplicate(eventTs) {
@@ -1414,17 +1389,6 @@ export class SlackAdapter extends PlatformAdapter {
       blocks,
       text: this._approvalFallbackText(effectivePrompt),
     });
-    observePromptShadow(effectivePrompt, {
-      channel,
-      threadTs,
-      intent: CONTROL_PLANE_MESSAGE,
-      deliveryChannel: 'postMessage',
-      text: this._approvalFallbackText(effectivePrompt),
-      postMessageTs: msg.ts || null,
-      source: 'subscriber.approval',
-      meta: { approvalId, kind: effectivePrompt?.kind || 'approval' },
-    });
-
     return new Promise((resolve) => {
       const timeoutHandle = setTimeout(() => {
         if (this._pendingApprovals.has(approvalId)) {
@@ -1437,17 +1401,6 @@ export class SlackAdapter extends PlatformAdapter {
             ts: msg.ts,
             blocks: this._buildApprovalStatusBlocks(pending, label, reason),
             text: label,
-          }).then(() => {
-            observePromptShadow(effectivePrompt, {
-              channel,
-              threadTs,
-              intent: CONTROL_PLANE_UPDATE,
-              deliveryChannel: 'edit',
-              text: label,
-              postMessageTs: msg.ts || null,
-              source: 'subscriber.approval',
-              meta: { approvalId, reason, action: 'timeout' },
-            });
           }).catch((err) => {
             logError(TAG, `failed to update timed out approval: ${err.message}`);
           });
@@ -1499,16 +1452,6 @@ export class SlackAdapter extends PlatformAdapter {
           ts: pending.messageTs,
           blocks: updatedBlocks,
           text: label,
-        });
-        observePromptShadow(pending.prompt, {
-          channel: pending.channel,
-          threadTs: pending.threadTs,
-          intent: CONTROL_PLANE_UPDATE,
-          deliveryChannel: 'edit',
-          text: label,
-          postMessageTs: pending.messageTs || null,
-          source: 'subscriber.approval',
-          meta: { approvalId, action: actionId, approved, scope },
         });
       } catch (err) {
         logError(TAG, `failed to update approval message: ${err.message}`);
@@ -1758,6 +1701,83 @@ export class SlackAdapter extends PlatformAdapter {
 
   async editMessage(channel, ts, text, extra = {}) {
     return this._editMessage(channel, ts, text, extra);
+  }
+
+  async deliver(intent, { channel: deliveryChannel, turnState } = {}) {
+    const slackChannel = intent.channel || turnState?.channel;
+    const threadTs = intent.threadTs || turnState?.threadTs;
+    const text = String(intent.text || '');
+    const meta = intent.meta || {};
+
+    if (deliveryChannel === 'stream') {
+      if (intent.intent === TASK_PROGRESS_START) {
+        return this.startStream(slackChannel, threadTs, {
+          task_display_mode: meta.task_display_mode || 'plan',
+          initial_chunks: meta.chunks || [],
+          team_id: meta.teamId || null,
+        });
+      }
+      if (intent.intent === TASK_PROGRESS_APPEND) {
+        await this.appendStream(turnState.streamId, meta.chunks || [{ type: 'markdown_text', text }]);
+        return { streamId: turnState.streamId, ts: turnState.streamMessageTs || null };
+      }
+      if (intent.intent === TASK_PROGRESS_STOP) {
+        await this.stopStream(turnState.streamId, { chunks: meta.chunks || [] });
+        return { streamId: turnState.streamId, ts: turnState.streamMessageTs || null };
+      }
+      if (intent.intent === ASSISTANT_TEXT_DELTA) {
+        await this.appendStream(turnState.streamId, [{ type: 'markdown_text', text }]);
+        return { streamId: turnState.streamId, ts: turnState.streamMessageTs || null };
+      }
+      if (intent.intent === ASSISTANT_TEXT_FINAL) {
+        let finalBlocks = null;
+        if (meta.gitDiffSummary?.hasChanges) {
+          finalBlocks = this.buildPayloads('', { gitDiffSummary: meta.gitDiffSummary })
+            .flatMap((payload) => payload.blocks || []);
+        }
+        await this.stopStream(turnState.streamId, {
+          markdown_text: turnState.assistantStreamTextLen > 0 ? '' : text,
+          final_blocks: finalBlocks,
+        });
+        return { streamId: turnState.streamId, ts: turnState.streamMessageTs || null };
+      }
+    }
+
+    if (deliveryChannel === 'postMessage') {
+      if (Array.isArray(meta.blocks) && meta.blocks.length > 0) {
+        const result = await this.sendReply(slackChannel, threadTs, text, { blocks: meta.blocks });
+        return { ts: result?.ts || null };
+      }
+      const payloads = this.buildPayloads(text, { gitDiffSummary: meta.gitDiffSummary || null });
+      let lastTs = null;
+      for (const payload of payloads) {
+        const extra = payload.blocks ? { blocks: payload.blocks } : {};
+        const result = await this.sendReply(slackChannel, threadTs, payload.text, extra);
+        lastTs = result?.ts || lastTs;
+      }
+      return { ts: lastTs };
+    }
+
+    if (deliveryChannel === 'edit') {
+      if (!meta.ts) return { ts: null };
+      const result = await this.editMessage(slackChannel, meta.ts, text, meta.blocks ? { blocks: meta.blocks } : {});
+      return { ts: result?.ts || meta.ts };
+    }
+
+    if (deliveryChannel === 'metadata') {
+      if (intent.intent === METADATA_STATUS) {
+        await this.setThreadStatus(slackChannel, threadTs, text, meta.loadingMessages || null);
+      } else if (intent.intent === METADATA_TITLE) {
+        const title = text.split('\n')[0].trim().slice(0, 60);
+        if (title) await this.setThreadTitle(slackChannel, threadTs, title);
+        const prompts = Array.isArray(meta.suggestedPrompts) ? meta.suggestedPrompts : [];
+        if (prompts.length > 0) await this.setSuggestedPrompts(slackChannel, threadTs, prompts);
+      }
+      return { ts: null };
+    }
+
+    if (deliveryChannel === 'silent') return { ts: null };
+    throw new Error(`unknown delivery channel: ${deliveryChannel}`);
   }
 
   createQiSubscriber() {

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { createSlackQiSubscriber, createSlackTextSubscriber } from '../src/adapters/slack.js';
 import { categorizeTool } from '../src/adapters/slack-format.js';
 import { EventBus, Scheduler } from '../src/scheduler.js';
+import { TurnDeliveryOrchestrator } from '../src/turn-delivery/orchestrator.js';
 
 function createMockAdapter() {
   const calls = [];
@@ -21,10 +22,45 @@ function createMockAdapter() {
     async stopStream(streamId, payload) {
       calls.push(['stopStream', streamId, payload]);
     },
+    get capabilities() {
+      return { stream: true };
+    },
+    async deliver(intent, { channel, turnState }) {
+      if (channel !== 'stream') return { ts: null };
+      if (intent.intent === 'task_progress.start') {
+        return this.startStream(intent.channel, intent.threadTs, {
+          task_display_mode: intent.meta.task_display_mode,
+          initial_chunks: intent.meta.chunks,
+          team_id: intent.meta.teamId,
+        });
+      }
+      if (intent.intent === 'task_progress.append') {
+        await this.appendStream(turnState.streamId, intent.meta.chunks);
+      } else if (intent.intent === 'task_progress.stop') {
+        await this.stopStream(turnState.streamId, { chunks: intent.meta.chunks });
+      } else if (intent.intent === 'assistant_text.delta') {
+        await this.appendStream(turnState.streamId, [{ type: 'markdown_text', text: intent.text }]);
+      }
+      return { ts: turnState.streamMessageTs || null };
+    },
     createQiSubscriber() {
       return createSlackQiSubscriber(this);
     },
   };
+}
+
+function attachOrchestrator(adapter, ctx, turnId) {
+  const orchestrator = new TurnDeliveryOrchestrator({ adapter });
+  orchestrator.beginTurn({
+    turnId,
+    attemptId: 'attempt-1',
+    channel: ctx.channel,
+    threadTs: ctx.effectiveThreadTs || ctx.threadTs,
+    platform: 'slack',
+    taskCardState: ctx.turn?.taskCardState || null,
+  });
+  ctx.orchestrator = orchestrator;
+  ctx.task = { ...(ctx.task || {}), attemptId: 'attempt-1' };
 }
 
 function toolUse(turnId, name, input = {}) {
@@ -45,6 +81,7 @@ test('SlackQiSubscriber renders Qi stream from cc_event tool_use/result', async 
   const bus = new EventBus();
   bus.subscribe(createSlackQiSubscriber(adapter));
   const ctx = { channel: 'C1', threadTs: '111.222', effectiveThreadTs: '111.222', task: { teamId: 'T1' } };
+  attachOrchestrator(adapter, ctx, 'turn-1');
 
   await bus.publish(toolUse('turn-1', 'Bash', { command: 'npm test', description: 'Run tests' }), ctx);
   await bus.publish(toolUse('turn-1', 'WebSearch', { query: 'OpenAI docs' }), ctx);
@@ -89,11 +126,10 @@ test('SlackQiSubscriber exposes stream id for text subscriber appends', async ()
   bus.subscribe(createSlackQiSubscriber(adapter));
   bus.subscribe(createSlackTextSubscriber(adapter, { debounceMs: 10 }));
   const turn = {
-    intermediateDeliveredThisTurn: false,
     taskCardState: { enabled: true, deferred: false, streamId: null, failed: false },
-    egress: { admit: () => true },
   };
   const ctx = { channel: 'C1', threadTs: '111.222', effectiveThreadTs: '111.222', platform: 'slack', turn };
+  attachOrchestrator(adapter, ctx, 'turn-shared-stream');
 
   await bus.publish(toolUse('turn-shared-stream', 'Bash', { description: 'Run tests' }), ctx);
   assert.equal(turn.taskCardState.streamId, 'stream-1');
@@ -102,7 +138,6 @@ test('SlackQiSubscriber exposes stream id for text subscriber appends', async ()
   await new Promise((resolve) => setTimeout(resolve, 25));
 
   assert.deepEqual(adapter.calls.at(-1), ['appendStream', 'stream-1', [{ type: 'markdown_text', text: 'streamed text' }]]);
-  assert.equal(turn.intermediateDeliveredThisTurn, true);
 
   await bus.publish({ type: 'cc_event', turnId: 'turn-shared-stream', eventType: 'result', payload: { stop_reason: 'end_turn' } }, ctx);
   assert.equal(turn.taskCardState.streamId, null);
@@ -113,6 +148,7 @@ test('SlackQiSubscriber serializes concurrent tool_use appends', async () => {
   const bus = new EventBus();
   bus.subscribe(createSlackQiSubscriber(adapter));
   const ctx = { channel: 'C1', threadTs: '222.333', effectiveThreadTs: '222.333' };
+  attachOrchestrator(adapter, ctx, 'turn-serial');
 
   await Promise.all([
     bus.publish(toolUse('turn-serial', 'Bash', { description: 'first' }), ctx),

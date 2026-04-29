@@ -3,6 +3,7 @@ export class PlatformAdapter {
   async disconnect() { throw new Error('not implemented'); }
   async sendReply(channel, threadTs, text, extra) { throw new Error('not implemented'); }
   async editMessage(channel, ts, text, extra) { throw new Error('not implemented'); }
+  async deliver(intent, ctx) { throw new Error('not implemented'); }
   async uploadFile(channel, threadTs, filePath, filename) { throw new Error('not implemented'); }
   async setTyping(channel, threadTs, status) { throw new Error('not implemented'); }
   /**
@@ -29,5 +30,6 @@ export class PlatformAdapter {
 
   get botUserId() { throw new Error('not implemented'); }
   get platform() { return 'unknown'; }
+  get capabilities() { return { stream: false, edit: false, metadata: false }; }
   get supportsInteractiveApproval() { return false; }
 }

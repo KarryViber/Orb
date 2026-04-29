@@ -1,7 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { abandonTurnState } from '../src/scheduler.js';
-import { EgressGate } from '../src/egress.js';
 
 test('abandonTurnState clears active wechat thread status', async () => {
   const calls = [];
@@ -16,7 +15,6 @@ test('abandonTurnState clears active wechat thread status', async () => {
     pendingThreadStatus: 'Cooking...',
     pendingStatusLoadingMessages: ['Cooking...'],
     statusRefreshTimer: setTimeout(() => {}, 10_000),
-    egress: new EgressGate(),
   };
 
   await abandonTurnState({

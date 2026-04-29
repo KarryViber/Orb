@@ -1,99 +1,110 @@
-# Turn Delivery Architecture
+# Channel-Typed Egress Orchestrator
 
-Stage 1 implements typed egress shadow mode only. It records what the current scheduler and Slack subscribers already did, then computes what the future D orchestrator would have done. It does not change `sendReply`, `appendStream`, `emitPayloadWithCapabilityFallback`, `EgressGate.admit`, Slack formatting, Block Kit generation, worker IPC, or WeChat delivery.
-
-## Current Shape
-
-The audit in `profiles/karry/data/lessons/architecture/turn-text-egress-architecture-deep-audit-2026-04-29.md` describes the current double-owner problem:
+Orb uses `TurnDeliveryOrchestrator` as the single owner for user-visible turn output. Scheduler lifecycle handlers and Slack cc_event subscribers emit typed intents; adapters expose `deliver(intent, ctx)` as the only place where platform APIs are invoked.
 
 ```mermaid
 flowchart TD
-  U[Slack user message] --> SA[SlackAdapter._handleMessage]
-  SA --> SCH[Scheduler.submit / _spawnWorker]
-  SCH --> W[worker.js Claude stream-json]
-  W -->|cc_event text/tool_use/result| SCHMSG[Scheduler onMessage]
-  W -->|turn_complete text| SCHMSG
-
-  SCHMSG --> EB[EventBus.publish]
-  EB --> QI[Qi/Plan subscriber]
-  EB --> TXT[Text subscriber]
-
-  QI -->|tool_use| START[Slack chat.startStream]
-  START --> TCS[turn.taskCardState.streamId]
-  QI -->|tool_use| AST[Slack chat.appendStream task chunks]
-  QI -->|result| STOP[Slack chat.stopStream]
-
-  TXT -->|cc_event text + streamId| ATXT[Slack chat.appendStream markdown_text]
-  ATXT --> EG1[turn.egress.admit(text,'intermediate')]
-  ATXT --> TD1[markStreamDelivered -> turnDelivered=true]
-
-  SCHMSG -->|turn_complete| TC[Scheduler turn_complete handler]
-  TC --> EG2[turn.egress.admit(fullText,'final')]
-  EG2 -->|admitted| BUILD[adapter.buildPayloads]
-  BUILD --> EMIT[emitPayloadWithCapabilityFallback]
-  EMIT -->|normal| POST[Slack chat.postMessage]
+  W[worker IPC: cc_event / turn_complete / result] --> S[scheduler]
+  W --> SUB[Slack cc_event subscribers]
+  S -->|typed intent| O[TurnDeliveryOrchestrator]
+  SUB -->|typed intent| O
+  O --> STR[adapter strategy]
+  STR --> A[adapter.deliver]
+  A -->|stream| SL1[Slack chat.start/append/stopStream]
+  A -->|postMessage| SL2[Slack chat.postMessage or WeChat sendmessage]
+  A -->|edit| SL3[Slack chat.update]
+  A -->|metadata| SL4[thread status / title / prompts]
+  O --> L[TurnDeliveryLedger]
+  L --> ND[profiles/*/data/turn-delivery/*.ndjson]
 ```
 
-The important flaw is that Slack stream append and scheduler final postMessage are both user-visible assistant text egress paths. Legacy booleans and `EgressGate` are safety valves, not a typed delivery ledger.
+## Intent Schema
 
-## Typed Intents
+Every intent includes:
 
-Stage 1 records these intent strings:
+- `turnId`: stable turn identity, usually worker `turnId` or `threadTs#attemptId`
+- `attemptId`: scheduler attempt id, used for replay de-duplication
+- `channel`: platform channel or WeChat user id
+- `threadTs`: delivery thread timestamp or WeChat peer id
+- `platform`: `slack`, `wechat`, or another adapter platform
+- `channelSemantics`: `reply`, `broadcast`, or `silent`
+- `intent`: one of the typed intent names below
+- `text`: optional user-visible text
+- `source`: producer name such as `subscriber.text` or `scheduler.turn_complete`
+- `meta`: structured delivery metadata, including stream chunks, git diff summary, edit ts, loading messages, or local sequence ids
 
-- `assistant_text.delta`: assistant text appended to a stream.
-- `assistant_text.final`: scheduler final text candidate for postMessage/edit delivery.
-- `task_progress.start`: task/progress stream created.
-- `task_progress.append`: task/progress stream appended.
-- `task_progress.stop`: task/progress stream stopped.
-- `control_plane.message`: approval or control-plane message posted.
-- `control_plane.update`: approval or control-plane card updated.
-- `metadata.status`: non-delivery metadata or shadow assertion records.
-- `metadata.title`: thread title metadata.
-- `receipt.silent_suppressed`: successful silent turn suppressed by channel semantics.
+Intent types:
 
-Each `TurnDeliveryRecord` includes turn identity, platform, delivery channel, text length, stable fingerprint, Slack timestamps when known, source, and free-form metadata.
+- `assistant_text.delta`: streamed assistant text chunk
+- `assistant_text.final`: final assistant text for the turn
+- `task_progress.start`: create or attach the task progress stream
+- `task_progress.append`: append task progress chunks to the existing stream
+- `task_progress.stop`: settle the task progress stream
+- `control_plane.message`: independent operational message, approval card, warning, or continuation marker
+- `control_plane.update`: update an existing control-plane message
+- `metadata.status`: thread status bubble
+- `metadata.title`: thread title and suggested prompts
+- `receipt.silent_suppressed`: internal receipt for silent assistant text suppression
 
-## Slack Strategy
+## Strategy
 
-The future D orchestrator decision model shadowed in stage 1 is:
+The strategy is platform-agnostic and reads only adapter capabilities plus turn state:
 
-```mermaid
-flowchart TD
-  A[turn records] --> S{silent semantics?}
-  S -->|yes| N[wouldSend=false silent-semantics]
-  S -->|no| F{assistant final text?}
-  F -->|no| X[wouldSend=false no-final-text]
-  F -->|yes| W{platform wechat?}
-  W -->|yes| WP[wouldSend=true postMessage]
-  W -->|no| C{stream assistant text covers final?}
-  C -->|yes| SKIP[wouldSend=false stream-already-carries-final]
-  C -->|partial| PATCH[wouldSend=true postMessage stream-partial-coverage]
-  C -->|none| POST[wouldSend=true postMessage final-postMessage]
-```
+- `channelSemantics === "silent"` turns assistant text into `receipt.silent_suppressed`; no adapter API is called.
+- `control_plane.message` uses `postMessage`; `control_plane.update` uses `edit`.
+- `metadata.status` and `metadata.title` use `metadata`.
+- `task_progress.*` uses `stream` when `capabilities.stream` is true; otherwise it is recorded silently.
+- `assistant_text.delta` uses `stream` only when a stream exists.
+- `assistant_text.final` uses `stream` when a stream exists, otherwise `postMessage`.
+- If stream delivery fails, the final assistant text is delivered once via `postMessage`, followed by a `control_plane.message` continuation marker.
 
-Stream coverage is intentionally conservative in shadow mode: a stream delta must have matching first-1000-character fingerprint and high length coverage to suppress final postMessage. Partial stream output must still allow final postMessage.
+## Cross-Turn Cases
 
-## Cross Platform
+- Inject: each worker `turn_start` calls `beginTurn` with the new `attemptId`; same-thread follow-up turns get fresh state.
+- Cron silent: `channelSemantics: "silent"` produces only `receipt.silent_suppressed` ledger records for assistant text.
+- SIGTERM replay: delivered keys include `turnId`, `attemptId`, intent, channel, source, and sequence where needed, so a replayed attempt is skipped.
+- Stream failure: failed stream state is stored on the turn; final text falls back to one assistant post and an explicit continuation marker.
+- WeChat: `capabilities.stream` is false, task progress is not externally emitted, and final assistant text uses the same post-message path backed by `sendmessage`.
 
-Slack has both stream and postMessage channels, so assistant text can be represented as either `deliveryChannel='stream'` or `deliveryChannel='postMessage'`.
+## Ledger
 
-WeChat has no stream adapter path today. Stage 1 only observes final `postMessage`-style delivery for WeChat and does not report stream/postMessage consistency diffs for that platform.
+`TurnDeliveryLedger` is the authoritative delivery ledger and the production audit writer. Each record is written as one NDJSON line under:
 
-## Stage 1 Scope
+`profiles/{profile}/data/turn-delivery/turn-delivery-YYYY-MM-DD.ndjson`
 
-Stage 1 adds:
+Record fields:
 
-- `src/turn-delivery/intents.js`
-- `src/turn-delivery/shadow-recorder.js`
-- read-only `shadowRecorder.observe(...)` calls at existing scheduler and Slack subscriber/control-plane call sites
-- shadow consistency assertion after `turn_complete`
-- focused architecture tests
-- daily NDJSON output under `profiles/{name}/data/shadow-egress/`
+- `turnId`, `attemptId`, `channel`, `threadTs`, `platform`
+- `intent`, `deliveryChannel`
+- `textLen`
+- `streamMessageTs`, `postMessageTs`
+- `createdAt`, `source`, `meta`
 
-The recorder never throws into callers. Schema failures are warnings in non-production mode, and NDJSON append failures are logged only.
+The ledger stores delivered typed keys in memory and records every orchestrator decision that matters for auditing. It does not compare message text to decide whether delivery is allowed.
 
-## Roadmap
+## Removed Legacy Ownership
 
-Stage 2 can route real assistant text egress through a typed orchestrator after at least seven days of clean shadow observation.
+The previous split ownership had Slack subscribers appending stream text while scheduler independently posted final text. That made duplicate user-visible replies possible. The current architecture removes string-based delivery gates and per-turn delivery booleans from the delivery decision. Subscribers and scheduler no longer call Slack message APIs directly; they emit typed intents.
 
-Stage 3 can remove legacy bridge state and replace `EgressGate` as the final ownership mechanism once the typed orchestrator is authoritative.
+Kept pieces:
+
+- Worker IPC payloads stay unchanged.
+- Slack `startStream`, `appendStream`, `stopStream`, `sendReply`, and `editMessage` remain adapter methods, called from `SlackAdapter.deliver`.
+- `turn.taskCardState.streamId` remains adapter UI state and is synchronized by the orchestrator.
+- The scheduler keeps `userVisibleDeliveryObserved` only to suppress abnormal-exit warnings after visible delivery has been observed.
+
+## Test Invariants
+
+1. 1053/1062 stream/final sample does not create an assistant post duplicate.
+2. Short final without stream posts once.
+3. Silent cron turns emit a silent receipt and no message.
+4. Injected turns reset turn-level delivery state.
+5. Same-attempt replay is skipped.
+6. Stream failure falls back to final reply plus continuation marker.
+7. WeChat final output uses sendmessage and has no stream calls.
+8. Control-plane messages are physically separate from assistant text.
+9. Metadata updates do not create new messages.
+10. Duplicate final emits are skipped by typed record state.
+11. Abnormal-exit warnings are suppressed only after visible delivery.
+12. Scheduler routes turn output through the orchestrator.
+13. Slack subscribers route output through the orchestrator.

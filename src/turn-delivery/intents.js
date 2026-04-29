@@ -1,5 +1,3 @@
-import crypto from 'node:crypto';
-
 export const ASSISTANT_TEXT_DELTA = 'assistant_text.delta';
 export const ASSISTANT_TEXT_FINAL = 'assistant_text.final';
 export const TASK_PROGRESS_START = 'task_progress.start';
@@ -24,9 +22,7 @@ export const TURN_DELIVERY_INTENTS = new Set([
   RECEIPT_SILENT_SUPPRESSED,
 ]);
 
-export const TURN_DELIVERY_CHANNELS = new Set(['stream', 'postMessage', 'edit', 'silent']);
-
-const FINGERPRINT_SAMPLE = 1000;
+export const TURN_DELIVERY_CHANNELS = new Set(['stream', 'postMessage', 'edit', 'metadata', 'silent']);
 
 /**
  * @typedef {Object} TurnDeliveryRecord
@@ -40,17 +36,10 @@ const FINGERPRINT_SAMPLE = 1000;
  * @property {number} textLen Emitted character count when the intent carries text.
  * @property {string|null} streamMessageTs startStream-created ts, if applicable.
  * @property {string|null} postMessageTs chat.postMessage-returned ts, if applicable.
- * @property {string} fingerprint Invariant text fingerprint: trim + NFC + first 1k hash.
  * @property {string} createdAt ISO timestamp.
  * @property {string} source 'subscriber.text' | 'subscriber.qi' | 'scheduler.turn_complete' | ...
  * @property {Object} meta Free metadata such as gitDiffSummary, payloadIndex, or errorCode.
  */
-
-export function fingerprintText(text) {
-  const normalized = String(text || '').trim().normalize('NFC').slice(0, FINGERPRINT_SAMPLE);
-  if (!normalized) return '';
-  return crypto.createHash('sha1').update(normalized).digest('hex');
-}
 
 export function textLength(text) {
   return String(text || '').length;
@@ -75,7 +64,6 @@ export function createTurnDeliveryRecord({
   textLen = null,
   streamMessageTs = null,
   postMessageTs = null,
-  fingerprint = null,
   source,
   meta = {},
 }) {
@@ -91,9 +79,38 @@ export function createTurnDeliveryRecord({
     textLen: textLen != null && Number.isFinite(Number(textLen)) ? Number(textLen) : textLength(safeText),
     streamMessageTs: streamMessageTs == null ? null : String(streamMessageTs),
     postMessageTs: postMessageTs == null ? null : String(postMessageTs),
-    fingerprint: fingerprint == null ? fingerprintText(safeText) : String(fingerprint),
     createdAt: new Date().toISOString(),
     source: String(source || ''),
     meta: meta && typeof meta === 'object' ? meta : {},
   };
+}
+
+export function normalizeChannelSemantics(value) {
+  return value === 'silent' || value === 'broadcast' ? value : 'reply';
+}
+
+export function validateTurnDeliveryIntent(intent) {
+  if (!intent || typeof intent !== 'object') return 'intent must be an object';
+  if (!TURN_DELIVERY_INTENTS.has(intent.intent)) return `unknown intent ${intent.intent}`;
+  for (const field of ['channel', 'threadTs', 'platform']) {
+    if (intent[field] != null && typeof intent[field] !== 'string') return `${field} must be a string`;
+  }
+  if (intent.text != null && typeof intent.text !== 'string') return 'text must be a string';
+  if (intent.meta != null && (!intent.meta || typeof intent.meta !== 'object' || Array.isArray(intent.meta))) return 'meta must be an object';
+  return null;
+}
+
+export function validateTurnDeliveryRecord(record) {
+  if (!record || typeof record !== 'object') return 'record must be an object';
+  for (const field of ['turnId', 'attemptId', 'channel', 'threadTs', 'platform', 'intent', 'deliveryChannel', 'source']) {
+    if (typeof record[field] !== 'string') return `${field} must be a string`;
+  }
+  if (!TURN_DELIVERY_INTENTS.has(record.intent)) return `unknown intent ${record.intent}`;
+  if (!TURN_DELIVERY_CHANNELS.has(record.deliveryChannel)) return `unknown deliveryChannel ${record.deliveryChannel}`;
+  if (!Number.isFinite(Number(record.textLen))) return 'textLen must be a number';
+  if (record.streamMessageTs !== null && record.streamMessageTs !== undefined && typeof record.streamMessageTs !== 'string') return 'streamMessageTs must be string|null';
+  if (record.postMessageTs !== null && record.postMessageTs !== undefined && typeof record.postMessageTs !== 'string') return 'postMessageTs must be string|null';
+  if (record.createdAt !== undefined && typeof record.createdAt !== 'string') return 'createdAt must be a string';
+  if (record.meta !== undefined && (!record.meta || typeof record.meta !== 'object' || Array.isArray(record.meta))) return 'meta must be an object';
+  return null;
 }

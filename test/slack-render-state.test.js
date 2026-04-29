@@ -8,7 +8,7 @@ import {
 import {
   EventBus,
 } from '../src/scheduler.js';
-import { EgressGate } from '../src/egress.js';
+import { TurnDeliveryOrchestrator } from '../src/turn-delivery/orchestrator.js';
 
 function toolUse(turnId, name, input = {}) {
   return { type: 'cc_event', turnId, eventType: 'tool_use', payload: { type: 'tool_use', id: `${turnId}-${name}`, name, input } };
@@ -35,24 +35,50 @@ function createStreamingAdapter() {
     async stopStream(streamId, payload) {
       calls.push(['stopStream', streamId, payload]);
     },
+    get capabilities() {
+      return { stream: true };
+    },
+    async deliver(intent, { channel, turnState }) {
+      if (channel !== 'stream') return { ts: null };
+      if (intent.intent === 'task_progress.start') {
+        return this.startStream(intent.channel, intent.threadTs, {
+          task_display_mode: intent.meta.task_display_mode,
+          initial_chunks: intent.meta.chunks,
+          team_id: intent.meta.teamId,
+        });
+      }
+      if (intent.intent === 'task_progress.append') {
+        await this.appendStream(turnState.streamId, intent.meta.chunks);
+      } else if (intent.intent === 'task_progress.stop') {
+        await this.stopStream(turnState.streamId, { chunks: intent.meta.chunks });
+      }
+      return { ts: turnState.streamMessageTs || null };
+    },
   };
 }
 
+function attachOrchestrator(adapter, ctx) {
+  ctx.orchestrator = new TurnDeliveryOrchestrator({ adapter });
+  ctx.task = { ...(ctx.task || {}), attemptId: 'attempt-1' };
+}
+
 test('turn_complete duplicate delivery posts only once', async () => {
-  const chat = { posts: [], async postMessage(payload) { this.posts.push(payload); return { ok: true, ts: '1.000' }; } };
-  const turn = { egress: new EgressGate() };
+  const calls = [];
+  const adapter = {
+    capabilities: { stream: false },
+    async deliver(intent, { channel }) {
+      if (channel === 'postMessage') calls.push(['sendReply', intent.channel, intent.threadTs, intent.text]);
+      return { ts: '1.000' };
+    },
+  };
+  const orchestrator = new TurnDeliveryOrchestrator({ adapter });
+  orchestrator.beginTurn({ turnId: 'turn-dedupe', attemptId: 'attempt-1', channel: 'C1', threadTs: '111.222', platform: 'slack' });
 
-  async function deliverTurnComplete(deliveryText) {
-    if (!deliveryText.trim()) return;
-    if (!turn.egress.admit(deliveryText, 'final')) return;
-    await chat.postMessage({ channel: 'C1', thread_ts: '111.222', text: deliveryText });
-  }
+  await orchestrator.emit({ turnId: 'turn-dedupe', attemptId: 'attempt-1', channel: 'C1', threadTs: '111.222', platform: 'slack', intent: 'assistant_text.final', text: 'done', source: 'test' });
+  const second = await orchestrator.emit({ turnId: 'turn-dedupe', attemptId: 'attempt-1', channel: 'C1', threadTs: '111.222', platform: 'slack', intent: 'assistant_text.final', text: 'done', source: 'test' });
 
-  await deliverTurnComplete('done');
-  await deliverTurnComplete('done');
-
-  assert.equal(chat.posts.length, 1);
-  assert.equal(chat.posts[0].text, 'done');
+  assert.equal(calls.length, 1);
+  assert.equal(second.reason, 'already-delivered');
 });
 
 test('Qi stopStream settles existing chunks without repeating append details', async () => {
@@ -60,6 +86,7 @@ test('Qi stopStream settles existing chunks without repeating append details', a
   const bus = new EventBus();
   bus.subscribe(createSlackQiSubscriber(adapter));
   const ctx = { channel: 'C1', threadTs: '111.222', effectiveThreadTs: '111.222', task: { teamId: 'T1' } };
+  attachOrchestrator(adapter, ctx);
 
   await bus.publish(toolUse('turn-q', 'Bash', { description: 'one' }), ctx);
   await bus.publish(toolUse('turn-q', 'WebSearch', { query: 'two' }), ctx);
@@ -103,6 +130,7 @@ test('new turns allocate distinct Slack streams', async () => {
   const bus = new EventBus();
   bus.subscribe(createSlackQiSubscriber(adapter));
   const ctx = { channel: 'C1', threadTs: '111.222', effectiveThreadTs: '111.222', task: { teamId: 'T1' } };
+  attachOrchestrator(adapter, ctx);
 
   await bus.publish(toolUse('turn-a', 'Bash', { description: 'first turn' }), ctx);
   await bus.publish(result('turn-a'), ctx);
