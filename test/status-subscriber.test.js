@@ -7,6 +7,9 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function createMockAdapter() {
   return {
+    async deliver() {
+      return { ts: null };
+    },
     createStatusSubscriber() {
       return createSlackStatusSubscriber(this, { heartbeatMs: 10 });
     },

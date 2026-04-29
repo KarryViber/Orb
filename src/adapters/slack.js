@@ -848,7 +848,7 @@ function preserveStreamTaskField(fieldName, value) {
 }
 
 export class SlackAdapter extends PlatformAdapter {
-  constructor({ botToken, appToken, allowBots, replyBroadcast, freeResponseChannels, freeResponseUsers, dmRouting, getProfilePaths }) {
+  constructor({ botToken, appToken, allowBots, replyBroadcast, freeResponseChannels, freeResponseUsers, dmRouting, getProfilePaths, ledger }) {
     super();
     this._botToken = botToken;
     this._slack = new WebClient(botToken);
@@ -859,6 +859,7 @@ export class SlackAdapter extends PlatformAdapter {
     this._freeResponseUsers = freeResponseUsers || new Set();
     this._dmRouting = dmRouting || null;
     this._getProfilePaths = getProfilePaths || null;
+    this._ledger = ledger || null;
     this._botUserId = null;
     this._botId = null;
 
@@ -921,6 +922,20 @@ export class SlackAdapter extends PlatformAdapter {
       edit: true,
       metadata: true,
     };
+  }
+
+  _resolveAdapterEventLedger(hint = {}) {
+    if (typeof this._ledger !== 'function') return this._ledger || null;
+    try {
+      return this._ledger(hint) || null;
+    } catch (err) {
+      warn(TAG, `ledger resolve failed: ${err.message}`);
+      return null;
+    }
+  }
+
+  setAdapterEventLedgerResolver(ledger) {
+    this._ledger = ledger || null;
   }
 
   // --- Dedup ---
@@ -1389,6 +1404,19 @@ export class SlackAdapter extends PlatformAdapter {
       blocks,
       text: this._approvalFallbackText(effectivePrompt),
     });
+    const ledger = this._resolveAdapterEventLedger(effectivePrompt);
+    try {
+      ledger?.recordAdapterEvent({
+        source: 'slack.sendApproval',
+        eventType: 'adapter.approval.created',
+        channel,
+        ts: msg.ts,
+        platform: 'slack',
+        meta: { approvalId, kind: effectivePrompt?.kind },
+      });
+    } catch (err) {
+      warn(TAG, `ledger record failed: ${err.message}`);
+    }
     return new Promise((resolve) => {
       const timeoutHandle = setTimeout(() => {
         if (this._pendingApprovals.has(approvalId)) {
@@ -1401,6 +1429,19 @@ export class SlackAdapter extends PlatformAdapter {
             ts: msg.ts,
             blocks: this._buildApprovalStatusBlocks(pending, label, reason),
             text: label,
+          }).then((updated) => {
+            try {
+              pending.ledger?.recordAdapterEvent({
+                source: 'slack.sendApproval.timeout',
+                eventType: 'adapter.approval.timeout',
+                channel,
+                ts: updated?.ts || msg.ts,
+                platform: 'slack',
+                meta: { approvalId, kind: effectivePrompt?.kind, reason },
+              });
+            } catch (err) {
+              warn(TAG, `ledger record failed: ${err.message}`);
+            }
           }).catch((err) => {
             logError(TAG, `failed to update timed out approval: ${err.message}`);
           });
@@ -1416,6 +1457,7 @@ export class SlackAdapter extends PlatformAdapter {
         timeoutHandle,
         prompt: effectivePrompt,
         blocks,
+        ledger,
       });
     });
   }
@@ -1453,6 +1495,18 @@ export class SlackAdapter extends PlatformAdapter {
           blocks: updatedBlocks,
           text: label,
         });
+        try {
+          pending.ledger?.recordAdapterEvent({
+            source: 'slack.block_action',
+            eventType: 'adapter.approval.resolved',
+            channel: pending.channel,
+            ts: pending.messageTs,
+            platform: 'slack',
+            meta: { approvalId, approved, scope, userId },
+          });
+        } catch (err) {
+          warn(TAG, `ledger record failed: ${err.message}`);
+        }
       } catch (err) {
         logError(TAG, `failed to update approval message: ${err.message}`);
       }
@@ -1493,7 +1547,7 @@ export class SlackAdapter extends PlatformAdapter {
     info(TAG, `block_action released: message_ts=${messageTs}`);
   }
 
-  async _updateBlockActionCard(channel, messageTs, text, originalBlocks = null) {
+  async _updateBlockActionCard(channel, messageTs, text, originalBlocks = null, ledgerHint = {}) {
     const safeText = markdownToMrkdwn(String(text || ''));
     const statusBlock = {
       type: 'context',
@@ -1510,12 +1564,26 @@ export class SlackAdapter extends PlatformAdapter {
           text: { type: 'mrkdwn', text: safeText },
         },
       ];
-    return this._slack.chat.update({
+    const result = await this._slack.chat.update({
       channel,
       ts: messageTs,
       text: safeText,
       blocks,
     });
+    const ledger = this._resolveAdapterEventLedger(ledgerHint);
+    try {
+      ledger?.recordAdapterEvent({
+        source: 'slack._updateBlockActionCard',
+        eventType: 'adapter.handler.update',
+        channel,
+        ts: result?.ts || messageTs,
+        platform: 'slack',
+        meta: { messageTs },
+      });
+    } catch (err) {
+      warn(TAG, `ledger record failed: ${err.message}`);
+    }
+    return result;
   }
 
   _resolveHandlerScript(profilePaths, actionId) {
@@ -1555,6 +1623,7 @@ export class SlackAdapter extends PlatformAdapter {
           messageTs,
           `⚠️ 未注册 handler: ${formatSlackInlineCode(rawActionId || 'unknown')} · <@${userId || 'unknown'}>`,
           originalBlocks,
+          { userId },
         );
       } catch (err) {
         logError(TAG, `failed to update invalid handler message: ${err.message}`);
@@ -1579,6 +1648,7 @@ export class SlackAdapter extends PlatformAdapter {
           messageTs,
           `⚠️ 未注册 handler: ${formatSlackInlineCode(rawActionId)} · <@${userId || 'unknown'}>`,
           originalBlocks,
+          { userId },
         );
       } catch (err) {
         logError(TAG, `failed to update unregistered handler message: ${err.message}`);
@@ -1594,7 +1664,7 @@ export class SlackAdapter extends PlatformAdapter {
 
     const processingText = `⏳ 处理中… <@${userId}> clicked ${formatSlackInlineCode(rawActionId)}`;
     try {
-      await this._updateBlockActionCard(channel, messageTs, processingText, originalBlocks);
+      await this._updateBlockActionCard(channel, messageTs, processingText, originalBlocks, { userId });
     } catch (err) {
       logError(TAG, `failed to update handler processing message: ${err.message}`);
     }
@@ -1641,6 +1711,7 @@ export class SlackAdapter extends PlatformAdapter {
           messageTs,
           `⚠️ handler 启动失败: ${formatSlackInlineCode(rawActionId)}`,
           originalBlocks,
+          { userId },
         ).catch((updateErr) => {
           logError(TAG, `failed to update handler spawn error message: ${updateErr.message}`);
         });
@@ -1667,6 +1738,7 @@ export class SlackAdapter extends PlatformAdapter {
           messageTs,
           `⚠️ handler 启动失败: ${formatSlackInlineCode(rawActionId)}`,
           originalBlocks,
+          { userId },
         );
       } catch (updateErr) {
         logError(TAG, `failed to update handler launch error message: ${updateErr.message}`);
@@ -2281,6 +2353,19 @@ export class SlackAdapter extends PlatformAdapter {
         text: mainText,
         unfurl_links: false,
       });
+      const ledger = this._resolveAdapterEventLedger({ userId: event.user, event });
+      try {
+        ledger?.recordAdapterEvent({
+          source: 'slack.dm_routing',
+          eventType: 'adapter.dm_routing.target_card',
+          channel: rule.target.channel,
+          ts: mainMsg.ts,
+          platform: 'slack',
+          meta: { ruleName: rule.name, sourceTs: event.ts },
+        });
+      } catch (recordErr) {
+        warn(TAG, `ledger record failed: ${recordErr.message}`);
+      }
       if (!mainMsg.ts) throw new Error('postMessage returned no ts');
       this._trackBotMessage(mainMsg.ts);
       this._trackThread(mainMsg.ts);
@@ -2318,6 +2403,19 @@ export class SlackAdapter extends PlatformAdapter {
           text: pendingText,
           unfurl_links: false,
         });
+        const ledger = this._resolveAdapterEventLedger({ userId: event.user, event });
+        try {
+          ledger?.recordAdapterEvent({
+            source: 'slack.dm_routing',
+            eventType: 'adapter.dm_routing.fallback_card',
+            channel: rule.target.channel,
+            ts: pendingMsg.ts,
+            platform: 'slack',
+            meta: { ruleName: rule.name, sourceTs: event.ts },
+          });
+        } catch (recordErr) {
+          warn(TAG, `ledger record failed: ${recordErr.message}`);
+        }
         if (pendingMsg.ts) {
           this._trackBotMessage(pendingMsg.ts);
           this._trackThread(pendingMsg.ts);

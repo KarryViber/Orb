@@ -171,29 +171,8 @@ function makeTurnState(taskCardConfig) {
   };
 }
 
-function makeAdapterForDelivery(adapter) {
-  if (!adapter || typeof adapter.deliver === 'function') return adapter;
-  return {
-    ...adapter,
-    platform: adapter.platform || 'unknown',
-    capabilities: adapter.capabilities || { stream: false, edit: typeof adapter.editMessage === 'function', metadata: false },
-    async deliver(intent, { channel: deliveryChannel } = {}) {
-      if (deliveryChannel === 'edit' && typeof adapter.editMessage === 'function' && intent.meta?.ts) {
-        return adapter.editMessage(intent.channel, intent.meta.ts, intent.text, intent.meta?.blocks ? { blocks: intent.meta.blocks } : {});
-      }
-      if (deliveryChannel !== 'postMessage') return { ts: null };
-      const sender = adapter?.['sendReply']?.bind(adapter);
-      if (!sender) return { ts: null };
-      const extra = Array.isArray(intent.meta?.blocks) ? { blocks: intent.meta.blocks } : {};
-      const result = await sender(intent.channel, intent.threadTs, intent.text, extra);
-      return { ts: result?.ts || null };
-    },
-  };
-}
-
 async function emitEphemeralControlPlane({ adapter, channel, threadTs, platform, text, source = 'scheduler.control_plane' }) {
-  const deliveryAdapter = makeAdapterForDelivery(adapter);
-  const orchestrator = new TurnDeliveryOrchestrator({ adapter: deliveryAdapter, logger: (line) => warn(TAG, line) });
+  const orchestrator = new TurnDeliveryOrchestrator({ adapter, logger: (line) => warn(TAG, line) });
   const turnId = makeTurnId({ threadTs, attemptId: `control-${Date.now()}` });
   orchestrator.beginTurn({ turnId, channel, threadTs, platform, channelSemantics: 'reply' });
   return orchestrator.emit({
@@ -371,6 +350,14 @@ export class Scheduler {
   }
 
   addAdapter(name, adapter) {
+    if (typeof adapter?.deliver !== 'function') throw new Error('adapter must implement deliver()');
+    if (typeof adapter.setAdapterEventLedgerResolver === 'function') {
+      adapter.setAdapterEventLedgerResolver((hint = {}) => {
+        const userId = hint?.userId || hint?.user || null;
+        if (!userId || typeof this.getProfile !== 'function') return null;
+        return this._getTurnDeliveryLedger(this.getProfile(userId));
+      });
+    }
     this.adapters.set(name, adapter);
     if (name === 'slack' && typeof adapter?.createQiSubscriber === 'function' && !adapter.__orbQiSubscriberUnsubscribe) {
       adapter.__orbQiSubscriberUnsubscribe = this.eventBus.subscribe(adapter.createQiSubscriber());
@@ -539,6 +526,7 @@ export class Scheduler {
             toolInput: msg.toolInput,
             requestId,
             toolUseId: msg.toolUseId,
+            userId: activeEntry?.userId,
             timeoutMs: PERMISSION_APPROVAL_TIMEOUT_MS,
           });
         } catch (err) {
@@ -562,6 +550,7 @@ export class Scheduler {
       toolInput: msg.toolInput,
       requestId,
       toolUseId: msg.toolUseId,
+      userId: activeEntry?.userId,
       timeoutMs: PERMISSION_APPROVAL_TIMEOUT_MS,
     });
 
@@ -880,9 +869,8 @@ export class Scheduler {
     }
     info(TAG, `profile resolved: user=${userId} → ${profile.name} (${profile.workspaceDir})`);
     const ledger = this._getTurnDeliveryLedger(profile);
-    const deliveryAdapter = makeAdapterForDelivery(adapter);
     const orchestrator = new TurnDeliveryOrchestrator({
-      adapter: deliveryAdapter,
+      adapter,
       ledger,
       logger: (line) => warn(TAG, line),
     });
@@ -1599,6 +1587,7 @@ export class Scheduler {
       pendingInjects: new Map(),
       task: sanitizeTaskForPersistence(task),
       orchestrator,
+      ledger,
     });
     worker.on('error', (err) => {
       logError(TAG, `worker error event: pid=${worker.pid} err=${err.message}`);

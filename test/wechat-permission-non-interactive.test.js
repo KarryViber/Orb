@@ -24,6 +24,9 @@ test('wechat permission approval in slack mode denies without auto-approve', asy
     const adapter = {
       platform: 'wechat',
       supportsInteractiveApproval: false,
+      async deliver() {
+        return { ts: null };
+      },
       async sendApproval(channel, threadTs, prompt) {
         sent.push({ channel, threadTs, prompt });
         return { approved: true, userId: channel };

@@ -28,6 +28,11 @@ function makeAdapter() {
     async sendReply(channel, threadTs, text, extra = {}) {
       calls.push(['sendReply', channel, threadTs, text, extra]);
     },
+    async deliver(intent, { channel: deliveryChannel } = {}) {
+      if (deliveryChannel !== 'postMessage') return { ts: null };
+      calls.push(['sendReply', intent.channel, intent.threadTs, intent.text, intent.meta || {}]);
+      return { ts: 'reply-1' };
+    },
     async cleanupIndicator(channel, threadTs, typingSet, errorMsg) {
       calls.push(['cleanupIndicator', channel, threadTs, typingSet, errorMsg]);
     },

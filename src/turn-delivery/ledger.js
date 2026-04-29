@@ -37,6 +37,21 @@ export class TurnDeliveryLedger {
     return normalized;
   }
 
+  recordAdapterEvent({ source, eventType, channel, ts, platform, meta = {} }) {
+    const normalized = {
+      kind: 'adapter_event',
+      eventType,
+      source,
+      channel,
+      ts,
+      platform,
+      meta: meta && typeof meta === 'object' ? meta : {},
+      recordedAt: new Date().toISOString(),
+    };
+    this._appendNdjson(normalized);
+    return normalized;
+  }
+
   hasDeliveredKey(key) {
     return this._deliveredKeys.has(String(key || ''));
   }
