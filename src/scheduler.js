@@ -13,6 +13,13 @@ import { EgressGate } from './egress.js';
 import { extractSuggestedPrompts } from './adapters/slack-format.js';
 import { writeLessonCandidate, isUserCorrectionText } from './lesson-candidates.js';
 import { assessSkillReviewTrigger } from './skill-review-trigger.js';
+import {
+  ASSISTANT_TEXT_FINAL,
+  RECEIPT_SILENT_SUPPRESSED,
+  createTurnDeliveryRecord,
+  makeTurnId,
+} from './turn-delivery/intents.js';
+import { TurnDeliveryShadowRecorder, shadowRecorderPathForDataDir } from './turn-delivery/shadow-recorder.js';
 const TAG = 'scheduler';
 const DRAIN_TIMEOUT = 30_000;
 const SKILL_REVIEW_THRESHOLD = 10;   // cumulative tool uses before triggering review
@@ -190,12 +197,16 @@ export async function emitPayloadWithCapabilityFallback({
 
 function makeTurnState(log, taskCardConfig) {
   return {
+    // Deprecated: only suppresses abnormal warnings after subscriber delivery.
+    // Do not use as final delivery state; D orchestrator replaces this after stage 2.
     intermediateDeliveredThisTurn: false,
     typingActive: false,
     pendingThreadStatus: '',
     pendingStatusLoadingMessages: null,
     statusRefreshTimer: null,
     abandoned: false,
+    // Patch-style safety valve: first-1000-char hash gate.
+    // D orchestrator replaces this after stage 3.
     egress: new EgressGate(log),
     taskCardState: makeTaskCardState(taskCardConfig),
   };
@@ -349,6 +360,7 @@ export class Scheduler {
     this._maxBackgroundWorkers = 2;
     this._nextInjectId = 1;
     this._spawnWorkerFn = spawnWorkerFn;
+    this._turnDeliveryShadowRecorders = new Map();
     this._pendingPermissionRequests = new Map();
     this._permissionApprovalMode = process.env.ORB_PERMISSION_APPROVAL_MODE || 'auto-allow';
     this._permissionSocketPath = join(tmpdir(), `orb-permission-scheduler-${process.pid}.sock`);
@@ -399,6 +411,19 @@ export class Scheduler {
 
   _getAdapter(platform) {
     return this.adapters.get(platform) || null;
+  }
+
+  _getTurnDeliveryShadowRecorder(profile) {
+    const dataDir = profile?.dataDir;
+    if (!dataDir) return null;
+    const key = String(dataDir);
+    if (!this._turnDeliveryShadowRecorders.has(key)) {
+      this._turnDeliveryShadowRecorders.set(key, new TurnDeliveryShadowRecorder({
+        logger: (line) => warn(TAG, line),
+        ndjsonPath: shadowRecorderPathForDataDir(key),
+      }));
+    }
+    return this._turnDeliveryShadowRecorders.get(key);
   }
 
   _startPermissionServer() {
@@ -476,6 +501,14 @@ export class Scheduler {
     const activeEntry = this.activeWorkers.get(threadTs);
     const platform = activeEntry?.platform || 'slack';
     const adapter = this._getAdapter(platform);
+    const approvalShadow = activeEntry?.shadowRecorder
+      ? {
+          recorder: activeEntry.shadowRecorder,
+          turnId: makeTurnId({ threadTs, attemptId: activeEntry?.task?.attemptId }),
+          attemptId: activeEntry?.task?.attemptId || '',
+          platform,
+        }
+      : null;
     this._pendingPermissionRequests.set(key, {
       socket,
       requestId,
@@ -521,6 +554,7 @@ export class Scheduler {
             requestId,
             toolUseId: msg.toolUseId,
             timeoutMs: PERMISSION_APPROVAL_TIMEOUT_MS,
+            _turnDeliveryShadow: approvalShadow,
           });
         } catch (err) {
           warn(TAG, `failed to notify unsupported approval route: ${err.message}`);
@@ -544,6 +578,7 @@ export class Scheduler {
       requestId,
       toolUseId: msg.toolUseId,
       timeoutMs: PERMISSION_APPROVAL_TIMEOUT_MS,
+      _turnDeliveryShadow: approvalShadow,
     });
 
     const reason = decision?.approved
@@ -841,6 +876,7 @@ export class Scheduler {
       return;
     }
     info(TAG, `profile resolved: user=${userId} → ${profile.name} (${profile.workspaceDir})`);
+    const shadowRecorder = this._getTurnDeliveryShadowRecorder(profile);
 
     // 优先级最高：task 已显式指定（cron / executeTask 程序化调用）
     let effectiveModel = task.model || null;
@@ -875,6 +911,8 @@ export class Scheduler {
     if (!effectiveEffort) effectiveEffort = defaults.effort;
 
     let responded = false;
+    // Deprecated: only used for abnormal warning suppression in legacy paths.
+    // Do not use as final delivery state; D orchestrator replaces this after stage 2.
     let turnDelivered = false;
     let pendingAutoContinue = null;
     let effectiveThreadTs = task.deliveryThreadTs === undefined ? (threadTs || null) : task.deliveryThreadTs;
@@ -885,6 +923,8 @@ export class Scheduler {
     let workerFailure = null;
     let completionSettled = false;
     let currentCcTurnId = null;
+    let actualSendReplyPayloads = 0;
+    let actualAppendStreamLen = 0;
     const toolHistory = [];
     const toolResults = [];
     let worker;
@@ -927,6 +967,25 @@ export class Scheduler {
         stopReason: stopReason || null,
         textLength,
       });
+      try {
+        shadowRecorder?.observe(createTurnDeliveryRecord({
+          turnId: makeTurnId({ threadTs, attemptId: task.attemptId }),
+          attemptId: task.attemptId || '',
+          channel,
+          threadTs,
+          platform,
+          intent: RECEIPT_SILENT_SUPPRESSED,
+          deliveryChannel: 'silent',
+          text,
+          source: `scheduler.${phase}`,
+          meta: {
+            channelSemantics: effectiveChannelSemantics,
+            stopReason: stopReason || null,
+          },
+        }));
+      } catch (err) {
+        warn(TAG, `shadow observe failed: ${err.message}`);
+      }
       info(TAG, `silent ${phase} suppressed: thread=${threadTs} textLen=${textLength}`);
       return true;
     };
@@ -1054,12 +1113,68 @@ export class Scheduler {
       });
     };
 
+    const observeAssistantFinal = ({ text, msg = null, source, deliveryChannel = 'postMessage', meta = {} }) => {
+      try {
+        shadowRecorder?.observe(createTurnDeliveryRecord({
+          turnId: makeTurnId({ turnId: msg?.turnId, threadTs, attemptId: msg?.attemptId || task.attemptId }),
+          attemptId: msg?.attemptId || task.attemptId || '',
+          channel,
+          threadTs,
+          platform,
+          intent: ASSISTANT_TEXT_FINAL,
+          deliveryChannel,
+          text,
+          source,
+          meta,
+        }));
+      } catch (err) {
+        warn(TAG, `shadow observe failed: ${err.message}`);
+      }
+    };
+
+    const observeSilentSuppressed = ({ text, msg = null, source, meta = {} }) => {
+      try {
+        shadowRecorder?.observe(createTurnDeliveryRecord({
+          turnId: makeTurnId({ turnId: msg?.turnId, threadTs, attemptId: msg?.attemptId || task.attemptId }),
+          attemptId: msg?.attemptId || task.attemptId || '',
+          channel,
+          threadTs,
+          platform,
+          intent: RECEIPT_SILENT_SUPPRESSED,
+          deliveryChannel: 'silent',
+          text,
+          source,
+          meta: { channelSemantics, ...meta },
+        }));
+      } catch (err) {
+        warn(TAG, `shadow observe failed: ${err.message}`);
+      }
+    };
+
+    const assertTurnCompleteShadow = (msg, actualSemantics = 'turn_complete') => {
+      try {
+        const turnId = makeTurnId({ turnId: msg?.turnId, threadTs, attemptId: msg?.attemptId || task.attemptId });
+        shadowRecorder?.assertConsistency(turnId, {
+          actualSendReply: actualSendReplyPayloads > 0,
+          actualAppendStreamLen,
+          actualSemantics,
+          attemptId: msg?.attemptId || task.attemptId || '',
+          channel,
+          threadTs,
+          platform,
+        });
+      } catch (err) {
+        warn(TAG, `shadow assert failed: ${err.message}`);
+      }
+    };
+
     const deliverDeferredFinalResult = async (text) => {
       if (!text) return false;
       if (!turn.egress.admit(text, 'deferred')) return true;
       const payloads = adapter.buildPayloads(text);
       for (const payload of payloads) {
         await emitPayload(payload);
+        actualSendReplyPayloads += 1;
       }
       return true;
     };
@@ -1136,10 +1251,17 @@ export class Scheduler {
         if (!turnDelivered) {
           const finalText = '⚠️ 多次续接仍未生成回复，任务可能需要拆分。请用更小的指令重试。';
           if (turn.egress.admit(finalText, 'result-final')) {
+            observeAssistantFinal({
+              text: finalText,
+              msg,
+              source: 'scheduler.result',
+              meta: { stopReason: msg.stopReason || null },
+            });
             const payloads = adapter.buildPayloads(finalText);
             info(TAG, `sending ${payloads.length} payload(s) to thread=${threadTs}`);
             for (const payload of payloads) {
               await emitPayload(payload);
+              actualSendReplyPayloads += 1;
             }
           }
           turnDelivered = true;
@@ -1256,7 +1378,11 @@ export class Scheduler {
                 deferDeliveryUntilResult,
                 channelSemantics,
                 applyThreadStatus,
-                markStreamDelivered: () => { turnDelivered = true; },
+                shadowRecorder,
+                markStreamDelivered: (len = 0) => {
+                  turnDelivered = true;
+                  actualAppendStreamLen += Number(len) || 0;
+                },
               });
             } catch (err) {
               warn(TAG, `eventBus publish failed: ${err.message}`);
@@ -1316,6 +1442,8 @@ export class Scheduler {
             turn = makeTurnState(turnLog, taskCardConfig);
             turnDelivered = false;
             turn.intermediateDeliveredThisTurn = false;
+            actualSendReplyPayloads = 0;
+            actualAppendStreamLen = 0;
             metadataUpdatedForTurn = false;
             await startTyping();
             return;
@@ -1338,21 +1466,44 @@ export class Scheduler {
               if (deliveryText.trim() && suppressSuccessfulText('turn_complete', deliveryText, msg.stopReason, msg.channelSemantics)) {
                 turnDelivered = true;
                 resetTaskCardState();
+                assertTurnCompleteShadow(msg, 'silent');
                 return;
               }
               if (deferDeliveryUntilResult && isSilentResultText(deliveryText)) {
                 info(TAG, `silent deferred turn suppressed: thread=${threadTs}`);
+                observeSilentSuppressed({
+                  text: deliveryText,
+                  msg,
+                  source: 'scheduler.turn_complete',
+                  meta: { stopReason: msg.stopReason || null, deferred: true },
+                });
                 turnDelivered = true;
                 resetTaskCardState();
+                assertTurnCompleteShadow(msg, 'silent');
                 return;
               }
               if (deliveryText.trim()) {
                 turnDelivered = true;
-                if (deferDeliveryUntilResult) await deliverDeferredFinalResult(deliveryText);
+                if (deferDeliveryUntilResult) {
+                  observeAssistantFinal({
+                    text: deliveryText,
+                    msg,
+                    source: 'scheduler.turn_complete',
+                    meta: { gitDiffSummary: msg.gitDiffSummary || null, deferred: true },
+                  });
+                  await deliverDeferredFinalResult(deliveryText);
+                }
                 else if (turn.egress.admit(deliveryText, 'final')) {
+                  observeAssistantFinal({
+                    text: deliveryText,
+                    msg,
+                    source: 'scheduler.turn_complete',
+                    meta: { gitDiffSummary: msg.gitDiffSummary || null },
+                  });
                   const payloads = adapter.buildPayloads(deliveryText, { gitDiffSummary: msg.gitDiffSummary });
                   for (const payload of payloads) {
                     await emitPayload(payload);
+                    actualSendReplyPayloads += 1;
                   }
                 }
               } else if (metadataText?.trim()) {
@@ -1374,14 +1525,35 @@ export class Scheduler {
               const silentDeferredFallback = deferDeliveryUntilResult && isSilentResultText(fallbackText);
               if (silentDeferredFallback) {
                 info(TAG, `silent deferred turn suppressed after delivery failure: thread=${threadTs}`);
+                observeSilentSuppressed({
+                  text: fallbackText,
+                  msg,
+                  source: 'scheduler.fallback',
+                  meta: { stopReason: msg.stopReason || null, deferred: true },
+                });
                 turnDelivered = true;
               } else if (fallbackText.trim()) {
                 turnDelivered = true;
-                if (deferDeliveryUntilResult) await deliverDeferredFinalResult(fallbackText);
+                if (deferDeliveryUntilResult) {
+                  observeAssistantFinal({
+                    text: fallbackText,
+                    msg,
+                    source: 'scheduler.fallback',
+                    meta: { gitDiffSummary: msg.gitDiffSummary || null, deferred: true },
+                  });
+                  await deliverDeferredFinalResult(fallbackText);
+                }
                 else if (turn.egress.admit(fallbackText, 'fallback')) {
+                  observeAssistantFinal({
+                    text: fallbackText,
+                    msg,
+                    source: 'scheduler.fallback',
+                    meta: { gitDiffSummary: msg.gitDiffSummary || null },
+                  });
                   const payloads = adapter.buildPayloads(fallbackText, { gitDiffSummary: msg.gitDiffSummary });
                   for (const payload of payloads) {
                     await emitPayload(payload);
+                    actualSendReplyPayloads += 1;
                   }
                 }
               } else if (metadataText?.trim()) {
@@ -1398,6 +1570,7 @@ export class Scheduler {
               if (!silentDeferredFallback) await updateThreadMetadata(metadataText);
               resetTaskCardState();
             }
+            assertTurnCompleteShadow(msg, 'turn_complete');
             return;
           }
 
@@ -1452,7 +1625,11 @@ export class Scheduler {
                 deferDeliveryUntilResult,
                 channelSemantics,
                 applyThreadStatus,
-                markStreamDelivered: () => { turnDelivered = true; },
+                shadowRecorder,
+                markStreamDelivered: (len = 0) => {
+                  turnDelivered = true;
+                  actualAppendStreamLen += Number(len) || 0;
+                },
               });
             } catch (err) {
               warn(TAG, `eventBus turn_abort publish failed: ${err.message}`);
@@ -1520,6 +1697,7 @@ export class Scheduler {
       channelSemantics,
       pendingInjects: new Map(),
       task: sanitizeTaskForPersistence(task),
+      shadowRecorder,
     });
     worker.on('error', (err) => {
       logError(TAG, `worker error event: pid=${worker.pid} err=${err.message}`);

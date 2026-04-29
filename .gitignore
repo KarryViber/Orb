@@ -13,6 +13,7 @@ profiles/karry/
 profiles/eting/
 
 # Data (per-profile runtime data)
+profiles/*/data/shadow-egress/
 profiles/*/data/
 
 # Workspace contents (user-generated)
