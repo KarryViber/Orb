@@ -160,31 +160,6 @@ export function makeTaskCardState({ enabled = false, deferred = false } = {}) {
   };
 }
 
-export async function emitPayloadWithCapabilityFallback({
-  adapter,
-  channel,
-  effectiveThreadTs,
-  payload,
-  pendingEdit,
-  platform,
-}) {
-  const extra = payload.blocks ? { blocks: payload.blocks } : {};
-  if (pendingEdit && typeof adapter.editMessage === 'function' && platform === 'slack') {
-    await adapter.editMessage(channel, pendingEdit, payload.text, extra);
-    return null;
-  }
-  await makeAdapterForDelivery(adapter).deliver({
-    intent: CONTROL_PLANE_MESSAGE,
-    channel,
-    threadTs: effectiveThreadTs,
-    platform,
-    text: payload.text,
-    source: 'scheduler.payload',
-    meta: extra,
-  }, { channel: 'postMessage', reason: 'control-plane', turnState: { channel, threadTs: effectiveThreadTs, platform } });
-  return null;
-}
-
 function makeTurnState(taskCardConfig) {
   return {
     typingActive: false,
