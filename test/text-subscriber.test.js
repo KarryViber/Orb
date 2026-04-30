@@ -110,10 +110,17 @@ test('SlackTextSubscriber flushes pending text immediately on result', async () 
 });
 
 test('Scheduler registers Slack text subscriber when Slack adapter is added', () => {
-  const scheduler = new Scheduler({ getProfile: () => ({ name: 'test' }), startPermissionServer: false });
-  const adapter = createMockAdapter();
-  scheduler.addAdapter('slack', adapter);
+  const previous = process.env.ORB_TURN_DELIVERY_CC_EVENT;
+  delete process.env.ORB_TURN_DELIVERY_CC_EVENT;
+  try {
+    const scheduler = new Scheduler({ getProfile: () => ({ name: 'test' }), startPermissionServer: false });
+    const adapter = createMockAdapter();
+    scheduler.addAdapter('slack', adapter);
 
-  assert.equal(typeof adapter.__orbTextSubscriberUnsubscribe, 'function');
-  adapter.__orbTextSubscriberUnsubscribe();
+    assert.equal(typeof adapter.__orbTextSubscriberUnsubscribe, 'function');
+    adapter.__orbTextSubscriberUnsubscribe();
+  } finally {
+    if (previous == null) delete process.env.ORB_TURN_DELIVERY_CC_EVENT;
+    else process.env.ORB_TURN_DELIVERY_CC_EVENT = previous;
+  }
 });

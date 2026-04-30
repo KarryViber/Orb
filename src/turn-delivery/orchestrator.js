@@ -2,6 +2,7 @@ import {
   ASSISTANT_TEXT_DELTA,
   ASSISTANT_TEXT_FINAL,
   CONTROL_PLANE_MESSAGE,
+  METADATA_STATUS,
   RECEIPT_SILENT_SUPPRESSED,
   TASK_PROGRESS_APPEND,
   TASK_PROGRESS_START,
@@ -13,6 +14,7 @@ import {
 } from './intents.js';
 import { resolveDeliveryChannel } from './adapter-strategy.js';
 import { TurnDeliveryLedger } from './ledger.js';
+import { createTurnDeliveryCcEventSubscriber } from './cc-event-subscriber.js';
 
 const STREAM_INTERRUPTED_TEXT = 'stream interrupted, continuing here';
 
@@ -52,6 +54,7 @@ export class TurnDeliveryOrchestrator {
     this.ledger = ledger || new TurnDeliveryLedger();
     this.logger = typeof logger === 'function' ? logger : () => {};
     this._turns = new Map();
+    this._ccEventSubscriber = null;
   }
 
   beginTurn(seed = {}) {
@@ -71,6 +74,13 @@ export class TurnDeliveryOrchestrator {
 
   getTurnState(turnId) {
     return this._turns.get(String(turnId || '')) || null;
+  }
+
+  async handleCcEvent(msg, ctx = {}) {
+    if (!this._ccEventSubscriber) this._ccEventSubscriber = createTurnDeliveryCcEventSubscriber();
+    if (!this._ccEventSubscriber.match(msg, ctx)) return false;
+    await this._ccEventSubscriber.handle(msg, { ...ctx, orchestrator: ctx.orchestrator || this });
+    return true;
   }
 
   hasUserVisibleDelivery(turnId) {
@@ -158,6 +168,7 @@ export class TurnDeliveryOrchestrator {
   }
 
   _deliveredKey(intent, deliveryChannel) {
+    if (intent.intent === METADATA_STATUS) return null;
     const base = [
       intent.turnId,
       intent.attemptId,

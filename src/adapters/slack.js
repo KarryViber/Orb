@@ -1709,18 +1709,22 @@ export class SlackAdapter extends PlatformAdapter {
   }
 
   createQiSubscriber() {
+    /** @deprecated Default fallback path; turn-delivery owns cc_event when ORB_TURN_DELIVERY_CC_EVENT=1. */
     return createSlackQiSubscriber(this);
   }
 
   createPlanSubscriber() {
+    /** @deprecated Default fallback path; turn-delivery owns cc_event when ORB_TURN_DELIVERY_CC_EVENT=1. */
     return createSlackPlanSubscriber(this);
   }
 
   createTextSubscriber() {
+    /** @deprecated Default fallback path; turn-delivery owns cc_event when ORB_TURN_DELIVERY_CC_EVENT=1. */
     return createSlackTextSubscriber(this);
   }
 
   createStatusSubscriber() {
+    /** @deprecated Default fallback path; turn-delivery owns cc_event when ORB_TURN_DELIVERY_CC_EVENT=1. */
     if (!this._statusSubscriber) {
       this._statusSubscriber = createSlackStatusSubscriber(this);
     }

@@ -33,6 +33,7 @@ import {
 } from './turn-delivery/intents.js';
 import { TurnDeliveryLedger, ledgerPathForDataDir } from './turn-delivery/ledger.js';
 import { TurnDeliveryOrchestrator } from './turn-delivery/orchestrator.js';
+import { createTurnDeliveryCcEventSubscriber } from './turn-delivery/cc-event-subscriber.js';
 import { makeCcEvent, makeInject, makeTask } from './ipc-schema.js';
 import {
   ORB_EVENTBUS_SMOKE_LOG,
@@ -381,17 +382,24 @@ export class Scheduler {
       });
     }
     this.adapters.set(name, adapter);
-    if (name === 'slack' && typeof adapter?.createQiSubscriber === 'function' && !adapter.__orbQiSubscriberUnsubscribe) {
-      adapter.__orbQiSubscriberUnsubscribe = this.eventBus.subscribe(adapter.createQiSubscriber());
-    }
-    if (name === 'slack' && typeof adapter?.createPlanSubscriber === 'function' && !adapter.__orbPlanSubscriberUnsubscribe) {
-      adapter.__orbPlanSubscriberUnsubscribe = this.eventBus.subscribe(adapter.createPlanSubscriber());
-    }
-    if (name === 'slack' && typeof adapter?.createTextSubscriber === 'function' && !adapter.__orbTextSubscriberUnsubscribe) {
-      adapter.__orbTextSubscriberUnsubscribe = this.eventBus.subscribe(adapter.createTextSubscriber());
-    }
-    if (name === 'slack' && typeof adapter?.createStatusSubscriber === 'function' && !adapter.__orbStatusSubscriberUnsubscribe) {
-      adapter.__orbStatusSubscriberUnsubscribe = this.eventBus.subscribe(adapter.createStatusSubscriber());
+    if (name === 'slack' && process.env.ORB_TURN_DELIVERY_CC_EVENT === '1') {
+      if (!adapter.__orbTurnDeliveryCcEventUnsubscribe) {
+        adapter.__orbTurnDeliveryCcEventSubscriber = createTurnDeliveryCcEventSubscriber();
+        adapter.__orbTurnDeliveryCcEventUnsubscribe = this.eventBus.subscribe(adapter.__orbTurnDeliveryCcEventSubscriber);
+      }
+    } else if (name === 'slack') {
+      if (typeof adapter?.createQiSubscriber === 'function' && !adapter.__orbQiSubscriberUnsubscribe) {
+        adapter.__orbQiSubscriberUnsubscribe = this.eventBus.subscribe(adapter.createQiSubscriber());
+      }
+      if (typeof adapter?.createPlanSubscriber === 'function' && !adapter.__orbPlanSubscriberUnsubscribe) {
+        adapter.__orbPlanSubscriberUnsubscribe = this.eventBus.subscribe(adapter.createPlanSubscriber());
+      }
+      if (typeof adapter?.createTextSubscriber === 'function' && !adapter.__orbTextSubscriberUnsubscribe) {
+        adapter.__orbTextSubscriberUnsubscribe = this.eventBus.subscribe(adapter.createTextSubscriber());
+      }
+      if (typeof adapter?.createStatusSubscriber === 'function' && !adapter.__orbStatusSubscriberUnsubscribe) {
+        adapter.__orbStatusSubscriberUnsubscribe = this.eventBus.subscribe(adapter.createStatusSubscriber());
+      }
     }
     setImmediate(() => {
       this.replayQueuedTasks().catch((err) => {

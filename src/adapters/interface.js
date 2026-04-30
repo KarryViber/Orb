@@ -45,10 +45,16 @@ export class PlatformAdapter {
   /** Settle a stream with final chunks. */
   async stopStream(_streamId, _payload) { /* no-op */ }
 
-  /** cc_event rendering subscriber factories. Return null when not supported. */
+  /** Clear adapter-owned status bookkeeping for a thread, if any. */
+  clearStatusByContext(_context) { /* no-op */ }
+
+  /** @deprecated Legacy Slack cc_event rendering factories. Return null when not supported. */
   createQiSubscriber() { return null; }
+  /** @deprecated Legacy Slack cc_event rendering factories. Return null when not supported. */
   createPlanSubscriber() { return null; }
+  /** @deprecated Legacy Slack cc_event rendering factories. Return null when not supported. */
   createTextSubscriber() { return null; }
+  /** @deprecated Legacy Slack cc_event rendering factories. Return null when not supported. */
   createStatusSubscriber() { return null; }
 
   get botUserId() { throw new Error('not implemented'); }
