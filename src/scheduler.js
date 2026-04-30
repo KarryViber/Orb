@@ -11,7 +11,11 @@ import { spawnWorker } from './spawn.js';
 import { getDefaults } from './config.js';
 import { extractSuggestedPrompts } from './adapters/slack-format.js';
 import { writeLessonCandidate, isUserCorrectionText } from './lesson-candidates.js';
-import { assessSkillReviewTrigger } from './skill-review-trigger.js';
+import {
+  checkSkillReview,
+  scanExistingSkills,
+  spawnSkillReview,
+} from './scheduler-skill-review.js';
 import {
   ASSISTANT_TEXT_FINAL,
   CONTROL_PLANE_MESSAGE,
@@ -22,7 +26,6 @@ import { TurnDeliveryLedger, ledgerPathForDataDir } from './turn-delivery/ledger
 import { TurnDeliveryOrchestrator } from './turn-delivery/orchestrator.js';
 const TAG = 'scheduler';
 const DRAIN_TIMEOUT = 30_000;
-const SKILL_REVIEW_THRESHOLD = 10;   // cumulative tool uses before triggering review
 const MEMORY_SYNC_THRESHOLD = 20;    // cumulative tool uses before memory/user sync
 const MEMORY_SYNC_INTERVAL = 6 * 60 * 60 * 1000;  // min 6h between syncs per profile
 const MAX_AUTO_CONTINUE = 2;  // max auto-retries on empty result (context overflow)
@@ -1732,160 +1735,32 @@ export class Scheduler {
   // --- Skill auto-extraction ---
 
   _checkSkillReview(profileName, toolCount, task, resultText, toolHistory = [], toolResults = []) {
-    if (!toolCount || toolCount === 0) return;
-
-    const prev = this._skillToolCounts.get(profileName) || 0;
-    const next = prev + toolCount;
-    this._skillToolCounts.set(profileName, next);
-
-    const profile = task?.profile || this.getProfile(task?.userId);
-    const agentsDir = join(profile.workspaceDir, '.claude', 'skills');
-    const existingSkillText = this._scanExistingSkills(agentsDir)
-      .map((skill) => `${skill.file}\n${skill.summary}`)
-      .join('\n');
-    const assessment = assessSkillReviewTrigger(toolHistory, {
-      userText: task?.userText || '',
-      resultText: resultText || '',
-      threadText: [task?.threadHistory || '', task?.userText || '', resultText || ''].join('\n'),
-      existingSkillText,
+    return checkSkillReview({
+      profileName,
+      toolCount,
+      task,
+      resultText,
+      toolHistory,
       toolResults,
+      skillToolCounts: this._skillToolCounts,
+      getProfile: (userId) => this.getProfile(userId),
+      backgroundWorkers: this._backgroundWorkers,
+      maxBackgroundWorkers: this._maxBackgroundWorkers,
     });
-
-    if (assessment.should || next >= SKILL_REVIEW_THRESHOLD) {
-      info(TAG, `skill review triggered: profile=${profileName} tools=${next} pattern=${assessment.pattern} reason=${assessment.reason}`);
-      this._skillToolCounts.set(profileName, 0);
-      // Package the just-completed turn as priorConversation so the review
-      // worker has actual context to extract skills from.
-      const priorMessages = [];
-      if (task?.userText) priorMessages.push({ role: 'user', content: String(task.userText) });
-      if (resultText) priorMessages.push({ role: 'assistant', content: String(resultText) });
-      if (toolHistory.length > 0) {
-        priorMessages.push({ role: 'assistant', content: `Skill trigger: ${assessment.pattern} — ${assessment.reason}\nTools: ${toolHistory.map((item) => item.name).filter(Boolean).join(' -> ')}` });
-      }
-      this._spawnSkillReview(task, priorMessages);
-    }
   }
 
   _scanExistingSkills(agentsDir) {
-    if (!existsSync(agentsDir)) return [];
-    try {
-      return readdirSync(agentsDir, { withFileTypes: true })
-        .filter((entry) => entry.isDirectory() && !entry.name.startsWith('_'))
-        .map((entry) => {
-          try {
-            const content = readFileSync(join(agentsDir, entry.name, 'SKILL.md'), 'utf8');
-            // Extract first 5 lines as summary
-            const summary = content.split('\n').slice(0, 5).join('\n');
-            return { file: `${entry.name}/SKILL.md`, summary };
-          } catch { return { file: `${entry.name}/SKILL.md`, summary: '(read error)' }; }
-        });
-    } catch { return []; }
+    return scanExistingSkills(agentsDir);
   }
 
   _spawnSkillReview(task, priorMessages = []) {
-    const { userId, platform } = task;
-    const profile = this.getProfile(userId);
-    const agentsDir = join(profile.workspaceDir, '.claude', 'skills');
-    const draftsDir = join(agentsDir, '_drafts');
-
-    // Pre-scan existing skills for iteration context
-    const existing = this._scanExistingSkills(agentsDir);
-    const existingSection = existing.length > 0
-      ? [
-          '',
-          '## Existing Skills',
-          'These skills already exist. If the conversation improved or extended one, UPDATE it instead of creating a duplicate.',
-          '',
-          ...existing.map(s => `### ${s.file}\n${s.summary}\n`),
-        ].join('\n')
-      : '\n## Existing Skills\nNone yet.\n';
-
-    const reviewPrompt = [
-      'You are a skill extraction agent. Review the conversation that just completed.',
-      '',
-      '## Decision Flow',
-      '1. Was a non-trivial, multi-step, reusable approach demonstrated?',
-      '   - If NO → respond "No skill extracted." and exit',
-      '   - If YES → continue',
-      '2. Does it match an existing skill below?',
-      '   - If YES → read that file, merge new learnings, write updated version back',
-      '   - If NO → create a new skill file',
-      '',
-      '## Extraction Criteria',
-      '- Multi-step approach requiring domain knowledge or trial-and-error',
-      '- Reusable across different contexts (not one-off)',
-      '- Worth documenting (saves future time)',
-      '',
-      existingSection,
-      '',
-      `## Output Location: ${draftsDir}/{kebab-case-name}/SKILL.md`,
-      '',
-      '## Skill File Format (Claude Code agent .md):',
-      '```',
-      '---',
-      'name: skill-name',
-      'description: One-line description of when/why to use this',
-      'stage: draft',
-      `created_at: ${new Date().toISOString()}`,
-      `source_thread_id: ${task.threadTs || 'unknown'}`,
-      '---',
-      '# Skill Title',
-      '',
-      '## When to Use',
-      'Trigger conditions...',
-      '',
-      '## Steps',
-      '1. ...',
-      '2. ...',
-      '',
-      '## Notes',
-      'Gotchas, edge cases, lessons learned...',
-      '```',
-      '',
-      'When UPDATING: preserve existing content that\'s still valid, add new learnings, bump any version notes.',
-      'Be concise. One skill per directory. Directory name = kebab-case skill name; file name must be SKILL.md.',
-    ].join('\n');
-
-    if (this._backgroundWorkers.size >= this._maxBackgroundWorkers) {
-      info(TAG, 'background worker limit reached, skipping skill review');
-      return;
-    }
-
-    let worker;
-    ({ worker } = spawnWorker({
-      task: {
-        type: 'task',
-        userText: reviewPrompt,
-        fileContent: '',
-        threadTs: `skill-review-${Date.now()}`,
-        channel: null,
-        userId: null,
-        platform: 'system',
-        threadHistory: null,
-        model: 'haiku',
-        effort: 'low',
-        maxTurns: null,
-        disablePermissionPrompt: true,
-        mode: 'skill-review',
-        priorConversation: priorMessages,
-        fragments: [],
-        profile: {
-          name: profile.name,
-          scriptsDir: profile.scriptsDir,
-          workspaceDir: profile.workspaceDir,
-          dataDir: profile.dataDir,
-        },
-      },
-      timeout: 120_000,
-      label: `skill-review:${profile.name}`,
-      onMessage: () => {},
-      onExit: (code) => {
-        this._backgroundWorkers.delete(worker);
-        info(TAG, `skill review worker exited: code=${code} profile=${profile.name}`);
-      },
-    }));
-    this._backgroundWorkers.add(worker);
-    info(TAG, `skill review dispatched: profile=${profile.name} priorMessages=${priorMessages.length}`);
+    return spawnSkillReview({
+      task,
+      priorMessages,
+      getProfile: (userId) => this.getProfile(userId),
+      backgroundWorkers: this._backgroundWorkers,
+      maxBackgroundWorkers: this._maxBackgroundWorkers,
+    });
   }
 
   // --- Memory + User profile sync ---
