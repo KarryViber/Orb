@@ -9,7 +9,6 @@ import {
   DOC_PROJECTS_ROOT,
   DOC_REGISTRY_PATH,
   ORB_PROMPT_SOURCE_LABELING,
-  ORB_PROMPT_TOKEN_BUDGET,
 } from './runtime-env.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -212,8 +211,13 @@ function fileContentToFragments(fileContent, retrievedAt) {
 }
 
 function promptBudgetTokens() {
-  if (ORB_PROMPT_TOKEN_BUDGET == null) return null;
-  return ORB_PROMPT_TOKEN_BUDGET > 0 ? ORB_PROMPT_TOKEN_BUDGET : 60000;
+  // Read process.env directly so tests and emergency hot-fixes can override
+  // the prompt budget between turns without reloading this module.
+  const raw = process.env.ORB_PROMPT_TOKEN_BUDGET;
+  if (raw == null || raw === '') return null;
+  const parsed = parseInt(raw, 10);
+  if (Number.isNaN(parsed)) return null;
+  return parsed > 0 ? parsed : 60000;
 }
 
 function estimateTokens(text) {

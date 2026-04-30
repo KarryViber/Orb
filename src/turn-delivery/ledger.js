@@ -27,11 +27,12 @@ export function ledgerPathForDataDir(dataDir) {
 }
 
 export class TurnDeliveryLedger {
-  constructor({ logger, ndjsonPath } = {}) {
+  constructor({ logger, ndjsonPath, hydrate = ORB_LEDGER_HYDRATE } = {}) {
     this._logger = typeof logger === 'function' ? logger : () => {};
     this._ndjsonPath = ndjsonPath || null;
     this._recordsByTurn = new Map();
     this._deliveredKeys = new Set();
+    this._hydrateEnabled = hydrate;
     this._hydrateDeliveredKeys();
   }
 
@@ -97,7 +98,7 @@ export class TurnDeliveryLedger {
   }
 
   _hydrateDeliveredKeys() {
-    if (!ORB_LEDGER_HYDRATE) return;
+    if (!this._hydrateEnabled) return;
     const filePath = this._resolveNdjsonPath();
     if (!filePath || !existsSync(filePath)) return;
     try {

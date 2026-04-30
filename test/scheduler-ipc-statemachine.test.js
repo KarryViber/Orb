@@ -2,7 +2,6 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   abandonTurnState,
-  buildQiSettledChunks,
   EventBus,
   makeTaskCardState,
   Scheduler,
@@ -31,10 +30,6 @@ function createMockAdapter({ appendFails = false } = {}) {
     },
   };
 }
-
-test('Qi settled chunks keep the subscriber final state shape', () => {
-  assert.equal(buildQiSettledChunks(3).at(-1).details, 'Distilled from 3 probes');
-});
 
 test('turn abandon clears scheduler-owned turn state', async () => {
   const adapter = createMockAdapter();

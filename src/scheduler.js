@@ -9,7 +9,6 @@ import { sanitizeErrorText } from './format-utils.js';
 import { listFacts, storeLesson, storeCorrectionLesson } from './memory.js';
 import { spawnWorker } from './spawn.js';
 import { getDefaults } from './config.js';
-import { extractSuggestedPrompts } from './adapters/slack-format.js';
 import { writeLessonCandidate, isUserCorrectionText } from './lesson-candidates.js';
 import {
   checkSkillReview,
@@ -69,7 +68,6 @@ const ESCALATE_KEYWORDS = [
   '代码审查',
   '战略判断',
 ];
-
 // 英文 review 单独处理（太常见，需要更严格的上下文）
 const ENGLISH_REVIEW_PATTERNS = [
   /\breview\s+一下\b/i,
@@ -78,7 +76,6 @@ const ENGLISH_REVIEW_PATTERNS = [
   /\breview\s+(这段|这个|下面|代码|PR)\b/i,
   /\b深度\s*review\b/i,
 ];
-
 function shouldEscalateEffort(text) {
   if (!text || text.length < 20) return false;
   for (const kw of ESCALATE_KEYWORDS) {
@@ -93,7 +90,6 @@ function shouldEscalateEffort(text) {
 function makeAttemptId() {
   return `attempt-${randomUUID()}`;
 }
-
 function ensureAttemptId(task) {
   if (!task || typeof task !== 'object') return task;
   if (!task.attemptId) task.attemptId = makeAttemptId();
@@ -113,7 +109,6 @@ function normalizeOrigin(origin) {
       : String(origin.parentAttemptId),
   };
 }
-
 function inferTaskOrigin(task, fallbackKind = 'user') {
   const existing = normalizeOrigin(task?.origin);
   if (existing) return existing;
@@ -130,7 +125,6 @@ function inferTaskOrigin(task, fallbackKind = 'user') {
   }
   return { kind: 'user', name: 'first-touch', parentAttemptId: null };
 }
-
 function injectOriginForTask(task, parentAttemptId) {
   return {
     kind: 'inject',
@@ -138,15 +132,12 @@ function injectOriginForTask(task, parentAttemptId) {
     parentAttemptId: parentAttemptId || task?.attemptId || null,
   };
 }
-
 function isSilentResultText(text) {
   return typeof text === 'string' && text.startsWith(SILENT_PREFIX);
 }
-
 function normalizeChannelSemantics(value) {
   return value === 'silent' || value === 'broadcast' ? value : 'reply';
 }
-
 function isSuccessfulStopReason(stopReason) {
   return !stopReason || stopReason === 'success' || stopReason === 'stop' || stopReason === 'end_turn';
 }
@@ -222,18 +213,6 @@ async function emitEphemeralControlPlane({ adapter, channel, threadTs, platform,
     text,
     source,
   });
-}
-
-export function buildQiSettledChunks(toolCount = 0, reason = '') {
-  const details = reason
-    ? `Settled: ${reason}`
-    : `Distilled from ${Number.isFinite(Number(toolCount)) ? Number(toolCount) : 0} probes`;
-  return [
-    { type: 'plan_update', title: 'Settled' },
-    { type: 'task_update', id: 'qi-exec', title: 'Probe', status: 'complete' },
-    { type: 'task_update', id: 'qi-other', title: 'Delegate', status: 'complete' },
-    { type: 'task_update', id: 'qi-summary', title: 'Distill', status: 'complete', details },
-  ];
 }
 
 export async function abandonTurnState({
@@ -1038,7 +1017,6 @@ export class Scheduler {
       if (metadataUpdatedForTurn) return;
       if (platform !== 'slack' || !channel || !effectiveThreadTs || !text) return;
       metadataUpdatedForTurn = true;
-      const prompts = extractSuggestedPrompts(text);
       if (turnCount === 0) {
         await orchestrator.emit({
           turnId: currentCcTurnId || makeTurnId({ threadTs, attemptId: task.attemptId }),
@@ -1050,7 +1028,6 @@ export class Scheduler {
           intent: METADATA_TITLE,
           text,
           source: 'scheduler.metadata',
-          meta: { suggestedPrompts: prompts },
         }).catch((err) => warn(TAG, `metadata delivery failed: ${err.message}`));
       }
       turnCount += 1;

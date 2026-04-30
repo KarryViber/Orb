@@ -11,6 +11,7 @@ import {
   buildPlanSnapshotTitle,
   buildSendPayloads,
   categorizeTool,
+  extractSuggestedPrompts,
   markdownToMrkdwn,
 } from './slack-format.js';
 import { PlatformAdapter } from './interface.js';
@@ -1697,7 +1698,7 @@ export class SlackAdapter extends PlatformAdapter {
       } else if (intent.intent === METADATA_TITLE) {
         const title = text.split('\n')[0].trim().slice(0, 60);
         if (title) await this.setThreadTitle(slackChannel, threadTs, title);
-        const prompts = Array.isArray(meta.suggestedPrompts) ? meta.suggestedPrompts : [];
+        const prompts = extractSuggestedPrompts(text);
         if (prompts.length > 0) await this.setSuggestedPrompts(slackChannel, threadTs, prompts);
       }
       return { ts: null };

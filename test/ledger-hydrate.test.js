@@ -117,19 +117,15 @@ test('TurnDeliveryLedger hydrate skips corrupt ndjson lines without throwing', a
   assert.match(logs.join('\n'), /skipped=1/);
 });
 
-test('TurnDeliveryLedger hydrate can be disabled by env', async () => {
+test('TurnDeliveryLedger hydrate can be disabled by option', async () => {
   const dataDir = await mkdtemp(join(tmpdir(), 'orb-ledger-disabled-'));
   await writeLedgerFile(dataDir, todayIsoDate(), [JSON.stringify(record())]);
-  const old = process.env.ORB_LEDGER_HYDRATE;
-  process.env.ORB_LEDGER_HYDRATE = '0';
-  try {
-    const ledger = new TurnDeliveryLedger({ ndjsonPath: ledgerPathForDataDir(dataDir) });
-    assert.equal(
-      ledger.hasDeliveredKey('turn-1|attempt-1|assistant_text.final|postMessage|test'),
-      false,
-    );
-  } finally {
-    if (old == null) delete process.env.ORB_LEDGER_HYDRATE;
-    else process.env.ORB_LEDGER_HYDRATE = old;
-  }
+  const ledger = new TurnDeliveryLedger({
+    ndjsonPath: ledgerPathForDataDir(dataDir),
+    hydrate: false,
+  });
+  assert.equal(
+    ledger.hasDeliveredKey('turn-1|attempt-1|assistant_text.final|postMessage|test'),
+    false,
+  );
 });

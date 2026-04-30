@@ -13,5 +13,5 @@ test('worker result IPC never carries final text', () => {
 
   assert.equal(source.includes(removedDiffHelper), false);
   assert.equal(source.includes(removedTurnTextMarker), false);
-  assert.match(source, /type:\s*'result',\s*\n\s*text:\s*''/);
+  assert.match(source, /makeResult\(\{\s*\n?\s*text:\s*''/);
 });
