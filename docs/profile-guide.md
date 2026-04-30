@@ -98,6 +98,23 @@ Anything outside that allowlist can still trigger the permission flow when the w
 
 Keep this directory out of git.
 
+## Scripts Layout
+
+Orb has two script layers with different ownership.
+
+Use `~/Orb/scripts/` for runtime utilities that are shared across profiles. Examples include helpers such as `slack-blockkit.py` and delivery/runtime glue such as `cron-deliver.sh`. A script belongs here when it is platform infrastructure, profile-agnostic, or expected to be reused by more than one profile.
+
+Use `~/Orb/profiles/{name}/scripts/` for profile-private workflows and persona-specific tools. A script belongs here when it encodes one profile's preferences, private automation, local data paths, or one user's workflow shortcuts.
+
+Migration rule of thumb:
+
+- Start profile-specific scripts under `profiles/{name}/scripts/`.
+- Promote a script to repo-level `scripts/` only after at least two profiles need the same behavior or the script becomes runtime infrastructure.
+- Keep repo-level scripts free of profile-private assumptions; pass profile paths or runtime context explicitly.
+- Keep profile-level scripts allowed to be opinionated, private, and workflow-specific.
+
+Commit `da9a1f8` is the precedent for this split: it promoted 20 cross-profile scripts to the repo-level `scripts/` layer after they became shared runtime utilities.
+
 ## Persistent Memory Model
 
 Orb uses two persistence layers:
