@@ -73,6 +73,31 @@ mkdir -p "$(dirname "$LOG")"
   set +e
   start=$(date +%s)
 
+  # 心跳子进程：每 600s 推一条「⏳ 仍在跑」给 thread。
+  # codex 跑完后 kill 它，所以 <10 分钟的短程任务不会触发心跳——直接 ✅。
+  HEARTBEAT_INTERVAL=600
+  (
+    while true; do
+      sleep "$HEARTBEAT_INTERVAL"
+      elapsed=$(( $(date +%s) - start ))
+      mins=$(( elapsed / 60 ))
+      log_lines=$(wc -l <"$LOG" 2>/dev/null | tr -d ' ' || echo "0")
+      hb_text="⏳ ${ENGINE} 仍在跑｜${LABEL}｜elapsed ${mins}m｜log ${log_lines} 行"
+      python3 - <<HBPY 2>/dev/null
+import json, urllib.request
+try:
+    urllib.request.urlopen(urllib.request.Request(
+        "https://slack.com/api/chat.postMessage",
+        data=json.dumps({"channel": "${CHANNEL}", "thread_ts": "${THREAD}", "text": ${hb_text@Q}}).encode("utf-8"),
+        headers={"Authorization": "Bearer ${SLACK_BOT_TOKEN}", "Content-Type": "application/json; charset=utf-8"},
+    ), timeout=10).read()
+except Exception:
+    pass
+HBPY
+    done
+  ) &
+  HEARTBEAT_PID=$!
+
   if [[ "$ENGINE" == "codex" ]]; then
     cd ~/Orb
     codex exec \
@@ -93,6 +118,10 @@ mkdir -p "$(dirname "$LOG")"
   rc=$?
   end=$(date +%s)
   took=$((end - start))
+
+  # codex/claude 跑完，立即 kill 心跳子进程
+  kill "$HEARTBEAT_PID" 2>/dev/null
+  wait "$HEARTBEAT_PID" 2>/dev/null
 
   # 失败时取 stderr/stdout 末 10 行做诊断
   tail_excerpt=""
