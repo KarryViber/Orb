@@ -1226,13 +1226,16 @@ export class SlackAdapter extends PlatformAdapter {
   // --- Incoming file processing ---
 
   async _processIncomingFiles(files) {
-    if (!files || files.length === 0) return { text: '', imagePaths: [] };
+    if (!files || files.length === 0) return { text: '', imagePaths: [], fragments: [] };
 
     const parts = [];
     const imagePaths = [];
+    const fragments = [];
+    const retrievedAt = new Date().toISOString();
     for (const file of files) {
       const ext = (file.name || '').split('.').pop()?.toLowerCase() || '';
       const isText = TEXT_EXTENSIONS.has(ext) || file.mimetype?.startsWith('text/');
+      const fileOrigin = `slack:file:${file.id || file.name || 'unknown'}`;
 
       if (!isText) {
         const mimeIsImage = file.mimetype?.startsWith('image/');
@@ -1247,6 +1250,17 @@ export class SlackAdapter extends PlatformAdapter {
               file.url_private, this._botToken, this._imageCacheDir
             );
             imagePaths.push(imgPath);
+            fragments.push({
+              source_type: 'image_attachment',
+              trusted: 'semi',
+              origin: fileOrigin,
+              source_path: imgPath,
+              content: `[图片: ${file.name || file.id || 'unknown'}]`,
+              retrieved_at: retrievedAt,
+              mime_type: file.mimetype || null,
+              platform: 'slack',
+              metadata: { file_id: file.id || null, name: file.name || null, size: file.size || null },
+            });
             parts.push(`[图片: ${file.name} — 已传递给模型]`);
             info(TAG, `cached image: ${file.name} → ${imgPath}`);
           } catch (err) {
@@ -1280,18 +1294,38 @@ export class SlackAdapter extends PlatformAdapter {
           if (!resp2.ok) throw new Error(`HTTP ${resp2.status}`);
           const text = await resp2.text();
           parts.push(`--- 文件: ${file.name} ---\n${text}\n--- EOF ---`);
+          fragments.push({
+            source_type: 'attachment',
+            trusted: 'semi',
+            origin: fileOrigin,
+            content: text,
+            retrieved_at: retrievedAt,
+            mime_type: file.mimetype || null,
+            platform: 'slack',
+            metadata: { file_id: file.id || null, name: file.name || null, size: file.size || null },
+          });
           info(TAG, `ingested file: ${file.name} (${text.length} chars)`);
           continue;
         }
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         const text = await resp.text();
         parts.push(`--- 文件: ${file.name} ---\n${text}\n--- EOF ---`);
+        fragments.push({
+          source_type: 'attachment',
+          trusted: 'semi',
+          origin: fileOrigin,
+          content: text,
+          retrieved_at: retrievedAt,
+          mime_type: file.mimetype || null,
+          platform: 'slack',
+          metadata: { file_id: file.id || null, name: file.name || null, size: file.size || null },
+        });
         info(TAG, `ingested file: ${file.name} (${text.length} chars)`);
       } catch (err) {
         parts.push(`[附件: ${file.name} — 下载失败: ${err.message}]`);
       }
     }
-    return { text: parts.join('\n\n'), imagePaths };
+    return { text: parts.join('\n\n'), imagePaths, fragments };
   }
 
   // --- Approval buttons ---
@@ -2546,15 +2580,16 @@ export class SlackAdapter extends PlatformAdapter {
     // Process incoming file attachments
     let fileContent = '';
     let imagePaths = [];
+    const fragments = [];
     if (event.files && event.files.length > 0) {
       const result = await this._processIncomingFiles(event.files);
       fileContent = result.text;
       imagePaths = result.imagePaths;
+      fragments.push(...(result.fragments || []));
       info(TAG, `processed ${event.files.length} incoming file(s), ${imagePaths.length} image(s)`);
     }
 
     // Resolve Slack thread URLs → fetch referenced conversation context
-    let linkedContext = '';
     const linkedUrls = extractSlackThreadUrls(userText);
     if (linkedUrls.length > 0) {
       const seen = new Set();
@@ -2565,7 +2600,16 @@ export class SlackAdapter extends PlatformAdapter {
         try {
           const history = await this.fetchThreadHistory(linkTs, linkCh);
           if (history) {
-            linkedContext += `\n--- 引用对话 (${linkCh}/${linkTs}) ---\n${history}\n--- END ---\n`;
+            fragments.push({
+              source_type: 'linked_thread',
+              trusted: false,
+              origin: `slack:${linkCh}/${linkTs}`,
+              content: history,
+              retrieved_at: new Date().toISOString(),
+              platform: 'slack',
+              channel: linkCh,
+              thread_ts: linkTs,
+            });
             info(TAG, `fetched linked thread: ${linkCh}/${linkTs}`);
           }
         } catch (err) {
@@ -2578,7 +2622,7 @@ export class SlackAdapter extends PlatformAdapter {
 
     const task = {
       userText,
-      fileContent: fileContent + linkedContext,
+      fileContent,
       imagePaths,
       threadTs,
       channel,
@@ -2587,6 +2631,7 @@ export class SlackAdapter extends PlatformAdapter {
       teamId: event.team || event.team_id || null,
       threadHistory: null,
       channelMeta,
+      fragments,
       origin: { kind: 'user', name: 'first-touch', parentAttemptId: null },
     };
 
