@@ -62,6 +62,7 @@ const PERSISTED_TASK_FIELDS = [
   'enableTaskCard',
   'channelSemantics',
   'attemptId',
+  'origin',
 ];
 
 // --- Effort escalation keywords ---
@@ -120,6 +121,45 @@ function ensureAttemptId(task) {
   return task.attemptId;
 }
 
+function normalizeOrigin(origin) {
+  if (!origin || typeof origin !== 'object') return null;
+  const allowed = new Set(['cron', 'inject', 'user', 'system']);
+  const kind = allowed.has(origin.kind) ? origin.kind : null;
+  if (!kind) return null;
+  return {
+    kind,
+    name: origin.name == null || origin.name === '' ? null : String(origin.name),
+    parentAttemptId: origin.parentAttemptId == null || origin.parentAttemptId === ''
+      ? null
+      : String(origin.parentAttemptId),
+  };
+}
+
+function inferTaskOrigin(task, fallbackKind = 'user') {
+  const existing = normalizeOrigin(task?.origin);
+  if (existing) return existing;
+  const threadTs = String(task?.threadTs || '');
+  if (task?.cronName || threadTs.startsWith('cron:')) {
+    return {
+      kind: 'cron',
+      name: String(task?.cronName || threadTs.slice('cron:'.length) || 'unknown'),
+      parentAttemptId: null,
+    };
+  }
+  if (task?.platform === 'system' || fallbackKind === 'system') {
+    return { kind: 'system', name: task?.mode || null, parentAttemptId: null };
+  }
+  return { kind: 'user', name: 'first-touch', parentAttemptId: null };
+}
+
+function injectOriginForTask(task, parentAttemptId) {
+  return {
+    kind: 'inject',
+    name: 'replay',
+    parentAttemptId: parentAttemptId || task?.attemptId || null,
+  };
+}
+
 function taskDedupKey(task, fallbackThreadTs = null) {
   const attemptId = task?.attemptId;
   if (!attemptId) return null;
@@ -158,7 +198,9 @@ function formatJstMonthDay(date = new Date()) {
 
 function buildFailureReceiptText({ task, threadTs, stopReason, stderrSummary, exitCode }) {
   const reason = shortFailureReason(stderrSummary || stopReason || (exitCode != null ? `exitCode=${exitCode}` : 'worker failed'));
-  const cronName = task?.cronName || (String(threadTs || '').startsWith('cron:') ? String(threadTs).slice('cron:'.length) : '');
+  const cronName = task?.origin?.kind === 'cron'
+    ? task.origin.name
+    : (task?.cronName || (String(threadTs || '').startsWith('cron:') ? String(threadTs).slice('cron:'.length) : ''));
   if (cronName) {
     return `⚠️ ${cronName} ${formatJstMonthDay()}｜失败：LLM｜${reason}`;
   }
@@ -285,6 +327,8 @@ export function buildRespawnTaskForInjectFailed({
     deferDeliveryUntilResult: failedTask?.deferDeliveryUntilResult ?? deferDeliveryUntilResult,
     channelSemantics: normalizeChannelSemantics(failedTask?.channelSemantics ?? task.channelSemantics ?? channelSemantics),
     attemptId: failedTask?.attemptId ?? msg.attemptId ?? task.attemptId ?? makeAttemptId(),
+    origin: normalizeOrigin(failedTask?.origin)
+      || injectOriginForTask(task, task?.attemptId ?? msg.attemptId ?? null),
   };
 }
 
@@ -701,6 +745,7 @@ export class Scheduler {
   async submit(task) {
     const { threadTs, channel, platform } = task;
     ensureAttemptId(task);
+    task.origin = normalizeOrigin(task.origin) || inferTaskOrigin(task);
     const adapter = this._getAdapter(platform);
     if (!adapter) {
       logError(TAG, `submit failed: no adapter for platform=${platform} thread=${threadTs}`);
@@ -730,6 +775,7 @@ export class Scheduler {
       const injectTask = {
         ...task,
         attemptId: task.attemptId,
+        origin: injectOriginForTask(task, entry?.task?.attemptId || task.attemptId),
         deliveryThreadTs: task.deliveryThreadTs === undefined
           ? (entry?.deliveryThreadTs ?? threadTs ?? null)
           : task.deliveryThreadTs,
@@ -747,6 +793,8 @@ export class Scheduler {
           fileContent: task.fileContent,
           imagePaths: task.imagePaths,
           attemptId: injectTask.attemptId,
+          origin: injectTask.origin,
+          channelMeta: task.channelMeta,
         });
         info(TAG, `injected into active worker: thread=${threadTs}`);
         return;
@@ -868,6 +916,7 @@ export class Scheduler {
     const deferDeliveryUntilResult = task.deferDeliveryUntilResult === true;
     const channelSemantics = normalizeChannelSemantics(task.channelSemantics);
     task.channelSemantics = channelSemantics;
+    task.origin = normalizeOrigin(task.origin) || inferTaskOrigin(task);
     const adapter = this._getAdapter(platform);
     if (!adapter && platform !== 'system') {
       logError(TAG, `spawn failed: no adapter for platform=${platform} thread=${threadTs}`);
@@ -1223,6 +1272,7 @@ export class Scheduler {
             enableTaskCard: task.enableTaskCard,
             deferDeliveryUntilResult,
             channelSemantics,
+            origin: task.origin,
             _autoContinue: true,
             _completion: task._completion,
           };
@@ -1274,9 +1324,10 @@ export class Scheduler {
             writeLessonCandidate(profile.dataDir, {
               source: 'user-correction',
               stopReason: 'user correction keyword',
-              errorContext: String(task.userText || '').slice(0, 500),
+              errorContext: JSON.stringify({ userText: task.userText || '', origin: task.origin }).slice(0, 500),
               threadId: threadTs,
               kind: 'user',
+              origin: task.origin,
             });
           } catch (candidateErr) {
             warn(TAG, `failed to write user-correction lesson candidate: ${candidateErr.message}`);
@@ -1318,6 +1369,7 @@ export class Scheduler {
           teamId: task.teamId || null,
           attemptId: task.attemptId,
           channelSemantics,
+          origin: task.origin,
           threadHistory: task.threadHistory,
           model: effectiveModel,
           effort: effectiveEffort,
@@ -1374,19 +1426,24 @@ export class Scheduler {
           }
           if (msg.type === 'inject_failed') {
             responded = true;
+            const activeEntry = this.activeWorkers.get(threadTs);
+            const failedTask = activeEntry?.pendingInjects?.get(msg.injectId) || null;
             try {
               writeLessonCandidate(profile.dataDir, {
                 source: 'inject-failed',
                 stopReason: 'inject_failed',
-                errorContext: JSON.stringify({ userText: msg.userText || '', injectId: msg.injectId || null }).slice(0, 500),
+                errorContext: JSON.stringify({
+                  userText: msg.userText || '',
+                  injectId: msg.injectId || null,
+                  origin: failedTask?.origin || msg.origin || null,
+                }).slice(0, 500),
                 threadId: threadTs,
                 kind: 'inject',
+                origin: failedTask?.origin || msg.origin || null,
               });
             } catch (err) {
               warn(TAG, `failed to write inject_failed lesson candidate: ${err.message}`);
             }
-            const activeEntry = this.activeWorkers.get(threadTs);
-            const failedTask = activeEntry?.pendingInjects?.get(msg.injectId) || null;
             if (activeEntry?.pendingInjects && msg.injectId) {
               activeEntry.pendingInjects.delete(msg.injectId);
             }
@@ -1528,9 +1585,10 @@ export class Scheduler {
               writeLessonCandidate(profile.dataDir, {
                 source: 'worker-error',
                 stopReason: safeError,
-                errorContext: JSON.stringify(msg.errorContext || {}).slice(0, 500),
+                errorContext: JSON.stringify({ ...(msg.errorContext || {}), origin: task.origin }).slice(0, 500),
                 threadId: threadTs,
                 kind: 'worker',
+                origin: task.origin,
               });
             } catch (err) {
               warn(TAG, `failed to write worker-error lesson candidate: ${err.message}`);
@@ -1566,6 +1624,7 @@ export class Scheduler {
                 type: 'cc_event',
                 eventType: 'turn_abort',
                 turnId: currentCcTurnId,
+                origin: task.origin,
                 synthetic: true,
               }, {
                 task,

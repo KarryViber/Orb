@@ -15,21 +15,21 @@ import { storeConversation } from './memory.js';
  * Scheduler -> Worker:
  *   { type: 'task', userText, fileContent, imagePaths, threadTs, channel,
  *                   userId, platform, threadHistory, profile, model, effort,
- *                   channelSemantics?, attemptId?, mode?, priorConversation?, disablePermissionPrompt?, maxTurns? }
+ *                   channelSemantics?, channelMeta?, origin?, attemptId?, mode?, priorConversation?, disablePermissionPrompt?, maxTurns? }
  *     - channelSemantics: 'reply' (default) delivers turn text to the thread;
  *       'silent' suppresses successful worker text delivery in the scheduler;
  *       'broadcast' is reserved for top-level channel delivery.
  *     - mode: 'skill-review' enters a dedicated branch that requires
  *       priorConversation; context.js injects it as "## 待审查会话".
  *     - priorConversation: [{role: 'user'|'assistant', content: string}, ...]
- *   { type: 'inject', injectId?, attemptId?, userText, fileContent?, imagePaths? }
+ *   { type: 'inject', injectId?, attemptId?, userText, fileContent?, imagePaths?, channelMeta?, origin? }
  *
  * Worker -> Scheduler:
  *   { type: 'turn_start', injectId?, attemptId? }  — explicit turn ownership start on task/inject receipt
  *   { type: 'turn_end' }  — explicit turn ownership end when Claude emits result
  *   { type: 'turn_complete', text, toolCount, lastTool, stopReason, channelSemantics, deliveredTexts, undeliveredText?, gitDiffSummary? }
  *     - one Claude turn finished; scheduler may deliver text while keeping the worker alive for injects.
- *   { type: 'cc_event', turnId, attemptId?, eventType, payload }  — raw Claude Code event forwarded to scheduler subscribers
+ *   { type: 'cc_event', turnId, attemptId?, origin?, eventType, payload }  — raw Claude Code event forwarded to scheduler subscribers
  *   { type: 'inject_failed', injectId?, attemptId?, userText, fileContent?, imagePaths? }  — follow-up inject could not reach CLI;
  *     scheduler should respawn a fresh worker and replay the user payload.
  *   { type: 'error', error, errorContext? }
@@ -77,6 +77,11 @@ let _currentThreadTs = null;
 let _currentAttemptId = null;
 let _currentProfileName = null;
 let _currentDataDir = null;
+let _currentChannel = null;
+let _currentUserId = null;
+let _currentScriptsDir = null;
+let _currentChannelMeta = null;
+let _currentOrigin = null;
 let _currentChannelSemantics = 'reply';
 let _currentTurnModifiedPaths = new Set();
 let _currentMemoryManifest = [];
@@ -84,8 +89,30 @@ let _currentMemoryManifest = [];
 process.on('message', async (msg) => {
   if (msg.type === 'inject') {
     if (_activeCli) {
-      beginCcTurn({ attemptId: msg.attemptId || null });
-      const injected = _activeCli.inject(msg.userText, msg.fileContent, msg.imagePaths);
+      beginCcTurn({ attemptId: msg.attemptId || null, origin: msg.origin || _currentOrigin || null });
+      let injectText = msg.userText;
+      if (_currentDataDir) {
+        const prompt = await buildPrompt({
+          userText: msg.userText,
+          fileContent: msg.fileContent,
+          threadTs: _currentThreadTs,
+          userId: _currentUserId,
+          channel: _currentChannel,
+          scriptsDir: _currentScriptsDir,
+          threadHistory: msg.threadHistory || null,
+          dataDir: _currentDataDir,
+          channelMeta: msg.channelMeta || _currentChannelMeta,
+        });
+        injectText = prompt.userPrompt || String(prompt);
+        _currentMemoryManifest = Array.isArray(prompt.memoryManifest) ? prompt.memoryManifest : [];
+        recordMemoryInjection({
+          dataDir: _currentDataDir,
+          threadId: _currentThreadTs,
+          turnId: _currentTurnId,
+          items: _currentMemoryManifest,
+        }).catch((err) => console.warn(`[worker] memory injection record failed: ${err.message}`));
+      }
+      const injected = _activeCli.inject(injectText, null, msg.imagePaths);
       if (injected) {
         await ipcSend({ type: 'turn_start', injectId: msg.injectId || null, attemptId: msg.attemptId || null }).catch(() => {});
         console.log(`[worker] injected: "${(msg.userText || '').slice(0, 60)}"`);
@@ -99,6 +126,8 @@ process.on('message', async (msg) => {
           userText: msg.userText,
           fileContent: msg.fileContent,
           imagePaths: msg.imagePaths,
+          channelMeta: msg.channelMeta,
+          origin: msg.origin || _currentOrigin || null,
         }).catch(() => {});
         _activeCli.close();
       }
@@ -111,6 +140,8 @@ process.on('message', async (msg) => {
         userText: msg.userText,
         fileContent: msg.fileContent,
         imagePaths: msg.imagePaths,
+        channelMeta: msg.channelMeta,
+        origin: msg.origin || _currentOrigin || null,
       }).catch(() => {});
       setImmediate(() => process.exit(0));
     }
@@ -118,11 +149,12 @@ process.on('message', async (msg) => {
   }
   if (msg.type !== 'task') return;
 
-  let { userText, fileContent, imagePaths, threadTs, channel, userId, platform, profile, threadHistory, model, effort, mode, priorConversation, disablePermissionPrompt, maxTurns, attemptId } = msg;
+  let { userText, fileContent, imagePaths, threadTs, channel, userId, platform, profile, threadHistory, model, effort, mode, priorConversation, disablePermissionPrompt, maxTurns, attemptId, channelMeta, origin } = msg;
   _currentChannelSemantics = normalizeChannelSemantics(msg.channelSemantics);
   beginCcTurn({
     threadTs,
     attemptId,
+    origin,
     profileName: profile?.name,
     dataDir: profile?.dataDir || process.cwd(),
   });
@@ -171,6 +203,12 @@ process.on('message', async (msg) => {
   try {
     console.log(`[worker] starting task: thread=${threadTs} profile=${profile?.name || 'default'} text="${(userText || '[files]').slice(0, 80)}"`);
     const dataDir = profile?.dataDir || process.cwd();
+    _currentDataDir = dataDir;
+    _currentChannel = channel || null;
+    _currentUserId = userId || null;
+    _currentScriptsDir = profile?.scriptsDir || null;
+    _currentChannelMeta = channelMeta || null;
+    _currentOrigin = origin || null;
     let sessionId = getSessionId(dataDir, sessionKey);
     // Validate sessionId format before passing to CLI
     if (sessionId && !/^[a-f0-9-]{20,}$/.test(sessionId)) {
@@ -184,6 +222,7 @@ process.on('message', async (msg) => {
       dataDir,
       mode,
       priorConversation,
+      channelMeta,
     });
     _currentMemoryManifest = Array.isArray(prompt.memoryManifest) ? prompt.memoryManifest : [];
     recordMemoryInjection({
@@ -540,12 +579,13 @@ export async function collectGitDiffSummary(cwd, modifiedPaths = new Set()) {
   }
 }
 
-function beginCcTurn({ threadTs, attemptId, profileName, dataDir } = {}) {
+function beginCcTurn({ threadTs, attemptId, origin, profileName, dataDir } = {}) {
   if (threadTs !== undefined) {
     _currentThreadTs = threadTs;
     _currentJobId = typeof threadTs === 'string' && threadTs.startsWith('cron:') ? threadTs : null;
   }
   if (attemptId !== undefined) _currentAttemptId = attemptId || null;
+  if (origin !== undefined) _currentOrigin = origin || null;
   if (profileName !== undefined) _currentProfileName = profileName || 'default';
   if (dataDir !== undefined) _currentDataDir = dataDir;
   _currentTurnModifiedPaths.clear();
@@ -648,6 +688,7 @@ function writeCcEvent({ event_type, payload }) {
       job_id: _currentJobId,
       profile: _currentProfileName || 'default',
       attempt_id: _currentAttemptId || null,
+      origin: _currentOrigin || null,
       event_type,
       payload: payload || {},
     })}\n`);
@@ -662,6 +703,7 @@ function sendCcEvent(eventType, payload) {
     type: 'cc_event',
     turnId: _currentTurnId,
     attemptId: _currentAttemptId || null,
+    origin: _currentOrigin || null,
     eventType,
     payload,
   }).catch(() => {});

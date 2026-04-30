@@ -886,6 +886,8 @@ export class SlackAdapter extends PlatformAdapter {
     this._threadCtxCache = new Map();
     this._assistantThreadRootCache = new Map();
     this._THREAD_CTX_TTL = 60 * 1000;
+    this._channelMetaCache = new Map();
+    this._CHANNEL_META_TTL = 5 * 60 * 1000;
     this._cleanupInterval = null;
 
     // Pending approvals
@@ -1185,6 +1187,26 @@ export class SlackAdapter extends PlatformAdapter {
     const content = folded.length > 0 ? folded.join('\n') : null;
     this._threadCtxCache.set(cacheKey, { content, fetchedAt: Date.now() });
     return content;
+  }
+
+  async fetchChannelMeta(channelId) {
+    if (!channelId) return { topic: '', purpose: '' };
+
+    const hit = this._channelMetaCache.get(channelId);
+    if (hit && Date.now() - hit.fetchedAt < this._CHANNEL_META_TTL) {
+      return { topic: hit.topic, purpose: hit.purpose };
+    }
+
+    try {
+      const result = await this._slack.conversations.info({ channel: channelId });
+      const topic = result.channel?.topic?.value || '';
+      const purpose = result.channel?.purpose?.value || '';
+      this._channelMetaCache.set(channelId, { topic, purpose, fetchedAt: Date.now() });
+      return { topic, purpose };
+    } catch (err) {
+      warn(TAG, `fetchChannelMeta failed channel=${channelId}: ${err.message}`);
+      return { topic: '', purpose: '' };
+    }
   }
 
   // --- Incoming file processing ---
@@ -2373,6 +2395,7 @@ export class SlackAdapter extends PlatformAdapter {
       const workerPrompt = buildWorkerPrompt();
 
       if (this.onMessage) {
+        const channelMeta = await this.fetchChannelMeta(rule.target.channel);
         const task = {
           userText: workerPrompt,
           fileContent: '',
@@ -2384,6 +2407,8 @@ export class SlackAdapter extends PlatformAdapter {
           teamId: event.team || event.team_id || null,
           channelSemantics: 'silent',
           threadHistory: null,
+          channelMeta,
+          origin: { kind: 'user', name: 'first-touch', parentAttemptId: null },
         };
         this.onMessage(task);
       }
@@ -2495,6 +2520,7 @@ export class SlackAdapter extends PlatformAdapter {
 
     const channel = event.channel;
     const userId = event.user;
+    const channelMeta = await this.fetchChannelMeta(channel);
 
     // Process incoming file attachments
     let fileContent = '';
@@ -2539,6 +2565,8 @@ export class SlackAdapter extends PlatformAdapter {
       platform: 'slack',
       teamId: event.team || event.team_id || null,
       threadHistory: null,
+      channelMeta,
+      origin: { kind: 'user', name: 'first-touch', parentAttemptId: null },
     };
 
     // Fetch thread history (only for thread replies, not new conversations)
@@ -2603,6 +2631,7 @@ export class SlackAdapter extends PlatformAdapter {
         teamId: event.team || event.team_id || null,
         threadHistory: null,
         rerun: true,
+        origin: { kind: 'user', name: 'rerun', parentAttemptId: null },
       });
     }
   }

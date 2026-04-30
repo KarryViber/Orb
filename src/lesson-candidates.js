@@ -6,6 +6,11 @@ function yamlValue(value) {
   return JSON.stringify(String(value));
 }
 
+function yamlObject(value) {
+  if (!value || typeof value !== 'object') return 'null';
+  return JSON.stringify(value);
+}
+
 function safePart(value) {
   return String(value || 'unknown').toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48) || 'unknown';
 }
@@ -22,6 +27,7 @@ export function writeLessonCandidate(dataDir, {
   threadId = '',
   cronName = '',
   kind = '',
+  origin = null,
 } = {}) {
   if (!dataDir || !source) return null;
   const dir = join(dataDir, 'lesson-candidates');
@@ -36,6 +42,7 @@ export function writeLessonCandidate(dataDir, {
     `errorContext: ${yamlValue(truncate(errorContext))}`,
     `thread_id: ${yamlValue(threadId)}`,
     `cron_name: ${yamlValue(cronName)}`,
+    `origin: ${yamlObject(origin)}`,
     `created_at: ${yamlValue(new Date().toISOString())}`,
     '---',
     '',

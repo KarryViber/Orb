@@ -423,15 +423,17 @@ export class CronScheduler {
 
     this._inflightJobs.add(inflightKey);
     info(TAG, `executing job ${job.id} "${job.name}" (profile=${job.profileName})`);
+    const origin = { kind: 'cron', name: job.id, parentAttemptId: null };
     const recordFailureLesson = (reason, errorContext = '') => {
       try {
         writeLessonCandidate(paths.dataDir, {
           source: 'cron-failure',
           stopReason: reason,
-          errorContext,
+          errorContext: JSON.stringify({ error: errorContext, origin }).slice(0, 500),
           threadId: `cron:${job.id}`,
           cronName: job.name || job.id,
           kind: 'cron',
+          origin,
         });
       } catch (err) {
         warn(TAG, `failed to write cron failure lesson candidate: ${err.message}`);
@@ -466,6 +468,7 @@ export class CronScheduler {
         forceNewWorker: true,
         jobRunId,
         cronName: job.name || job.id,
+        origin,
         profile: {
           name: job.profileName,
           workspaceDir: paths.workspaceDir,

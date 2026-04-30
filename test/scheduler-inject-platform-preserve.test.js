@@ -65,3 +65,60 @@ test('startup replay dedupes shutdown tasks by thread and attempt id', () => {
   assert.deepEqual(restored.globalQueue.map((task) => task.userText), ['first', 'other']);
   assert.deepEqual(restored.threadQueues.T1.map((task) => task.userText), ['next turn']);
 });
+
+test('scheduler tags first-touch and same-thread inject origins', async () => {
+  const spawnedTasks = [];
+  const sentMessages = [];
+  const scheduler = new Scheduler({
+    maxWorkers: 1,
+    startPermissionServer: false,
+    getProfile: () => ({ name: 'test', workspaceDir: '/tmp/ws', dataDir: '/tmp/data', scriptsDir: '/tmp/scripts' }),
+    spawnWorkerFn({ task }) {
+      spawnedTasks.push(task);
+      return {
+        worker: {
+          pid: 1234,
+          send(msg) { sentMessages.push(msg); },
+          kill() {},
+          on() {},
+        },
+      };
+    },
+  });
+  scheduler.addAdapter('slack', { async deliver() {} });
+
+  await scheduler.submit({
+    userText: 'first',
+    fileContent: '',
+    imagePaths: [],
+    threadTs: '111.222',
+    channel: 'C1',
+    userId: 'U1',
+    platform: 'slack',
+  });
+
+  assert.equal(spawnedTasks.length, 1);
+  assert.deepEqual(spawnedTasks[0].origin, {
+    kind: 'user',
+    name: 'first-touch',
+    parentAttemptId: null,
+  });
+
+  await scheduler.submit({
+    userText: 'follow up',
+    fileContent: '',
+    imagePaths: [],
+    threadTs: '111.222',
+    channel: 'C1',
+    userId: 'U1',
+    platform: 'slack',
+  });
+
+  assert.equal(sentMessages.length, 1);
+  assert.equal(sentMessages[0].type, 'inject');
+  assert.deepEqual(sentMessages[0].origin, {
+    kind: 'inject',
+    name: 'replay',
+    parentAttemptId: spawnedTasks[0].attemptId,
+  });
+});

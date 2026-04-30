@@ -163,7 +163,7 @@ function inferSlugFromThread(threadHistory) {
  *   4. Thread history (from adapter)
  *   5. Thread metadata + file attachments + user message
  */
-export async function buildPrompt({ userText, fileContent, threadTs, userId, channel, scriptsDir, threadHistory, dataDir, mode, priorConversation }) {
+export async function buildPrompt({ userText, fileContent, threadTs, userId, channel, scriptsDir, threadHistory, dataDir, mode, priorConversation, channelMeta }) {
   const systemParts = [];
   const userParts = [];
   const memoryManifest = [];
@@ -182,6 +182,13 @@ export async function buildPrompt({ userText, fileContent, threadTs, userId, cha
   // Layer 2d: Scripts path (so agent knows where user scripts live)
   if (scriptsDir && existsSync(scriptsDir)) {
     systemParts.push(`## Scripts\nUser scripts are at: ${scriptsDir}/`);
+  }
+
+  if (channelMeta && (channelMeta.topic || channelMeta.purpose)) {
+    const lines = ['## 频道约束（来自 Slack topic/purpose，优先级 > 全局基线）'];
+    if (channelMeta.topic) lines.push(`**Topic**: ${channelMeta.topic}`);
+    if (channelMeta.purpose) lines.push(`**Purpose**: ${channelMeta.purpose}`);
+    systemParts.push(lines.join('\n'));
   }
 
   // Memory guidance directive retired — CLI auto-memory handles this natively.

@@ -272,4 +272,9 @@ test('cron non-success stopReason records stderr summary as failed status', asyn
   assert.equal(job.lastError, 'api_error: API Error: 500 Internal server error');
   assert.equal(job.lastDeliveryError, null);
   assert.equal(executed[0].cronName, 'skill-promotion-tick');
+  assert.deepEqual(executed[0].origin, {
+    kind: 'cron',
+    name: 'skill-promotion-tick',
+    parentAttemptId: null,
+  });
 });
