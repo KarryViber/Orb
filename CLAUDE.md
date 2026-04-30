@@ -12,19 +12,41 @@ src/
   worker.js            — Fork child process, invoke Claude CLI
   cron.js              — Cron scheduled tasks (60s tick, job persistence, schedule parsing)
   context.js           — Prompt assembly (CLI-native layers + Orb recall/docs/thread injection)
+  dm-routing-schema.js — DM inbound routing schema validation
+  docstore.js          — DocStore Node-side wrapper / Python bridge calls
   session.js           — thread↔session persistence (per-profile isolation)
   memory.js            — Holographic memory retrieval + conversation storage (via Python bridge)
   format-utils.js      — Platform-agnostic text utilities (sanitize, split)
+  ipc-schema.js        — Worker IPC message schema definitions and validation
   log.js               — Console + file dual-write, 50MB auto-rotation
   queue.js             — Global task FIFO queue
+  runtime-env.js       — Runtime environment loading and validation
+  scheduler-memory-maintenance.js — Scheduler-side memory maintenance tasks
+  scheduler-shutdown-persistence.js — Scheduler shutdown state persistence
+  scheduler-skill-review.js — skill-review mode scheduler dispatch
   spawn.js             — Claude CLI subprocess spawn helper
   mcp-permission-server.js — In-process MCP server backing CLI permission prompts
   skill-review-trigger.js — Skill-review mode dispatch hook
   lesson-candidates.js — Lesson candidate detection / persistence
-  turn-delivery/       — Per-turn delivery orchestrator (intents/ledger/adapter-strategy/orchestrator)
+  worker-git-diff.js   — Worker-side git diff summary collection
+  worker-image-blocks.js — Worker-side image attachment → content block conversion
+  worker-mcp-boot.js   — Worker-side MCP server startup
+  worker-turn-text.js  — Worker-side turn text buffering and deduplication
+  turn-delivery/       — Per-turn delivery orchestration
+    adapter-strategy.js — Adapter delivery strategy selection
+    cc-event-format.js — Claude Code event formatting helpers
+    cc-event-subscriber.js — Claude Code event subscriber registry
+    intents.js         — Delivery intent classification
+    ledger.js          — Delivery ledger and attempt correlation
+    orchestrator.js    — Turn delivery orchestration
+    status.js          — Turn status derivation
+    task-card-streams.js — Task card stream lifecycle helpers
+    text-stream.js     — Assistant text stream delivery
   adapters/
     interface.js       — PlatformAdapter abstract base class
     slack.js           — Slack Socket Mode implementation
+    slack-block-actions.js — Slack block action (button click) routing
+    slack-dm-routing.js — Slack DM inbound routing implementation
     slack-format.js    — Markdown→mrkdwn, Block Kit builder
     wechat.js          — WeChat adapter
     wechat-format.js   — WeChat plain-text formatter (Markdown unsupported)
@@ -166,7 +188,7 @@ Scheduler ↔ Worker communication via Node IPC (process.send/on('message')):
 | Worker → Scheduler | `turn_end` | `{ type: 'turn_end' }` | Emitted when Claude CLI produces a `result` event for the current turn; scheduler stops typing immediately. |
 | Worker → Scheduler | `turn_complete` | `{ type: 'turn_complete', text, toolCount, lastTool, stopReason, channelSemantics, gitDiffSummary? }` | Signals that one Claude turn finished; scheduler can deliver final text while keeping the worker alive for future `inject` messages. `text` comes from worker `turnBuffer` (all assistant text blocks in this turn, in order, joined by `\n`); CLI `result.result` is only a last-resort fallback when the buffer is empty. Block-level dedup prevents repeated `result` lines in one turn from emitting duplicates. Scheduler drops successful text when `channelSemantics === 'silent'` and records a receipt. `gitDiffSummary` is included when the worker detected source-tree changes during the turn. |
 | Worker → Scheduler | `cc_event` | `{ type: 'cc_event', turnId, attemptId?, origin?, eventType, payload }` | Raw Claude Code event forwarded to scheduler subscribers. Slack Qi, plan, text, and status rendering is driven from this stream. |
-| Worker → Scheduler | `inject_failed` | `{ type: 'inject_failed', injectId?, attemptId?, userText, fileContent?, imagePaths?, fragments?: LabeledFragment[] }` | Follow-up inject could not reach the live CLI session (for example the session already closed). Scheduler must fail forward by replaying that payload through a fresh worker on the same thread. |
+| Worker → Scheduler | `inject_failed` | `{ type: 'inject_failed', injectId?, attemptId?, userText, fileContent?, imagePaths?, fragments?: LabeledFragment[] }` | Follow-up inject could not reach the live CLI session (for example the session already closed). Scheduler must fail forward by replaying that payload through a fresh worker on the same thread. `fragments?: LabeledFragment[]` carries prompt source labeled data blocks per `specs/prompt-source-labeling-DESIGN.md`. |
 | Worker → Scheduler | `error` | `{ type: 'error', error, errorContext? }` | Terminal failure payload. |
 | Worker → Scheduler | `result` | `{ type: 'result', text, stopReason?, channelSemantics, exitOnly: true, toolCount?, lastTool?, exitCode?, stderrSummary? }` | Worker process-exit completion signal. `text` is usually empty because final-text delivery already happened via `turn_complete`. `result` is kept for lifecycle / auto-continue / non-success `stopReason` surfacing; non-zero CLI exits set a non-success stopReason such as `api_error` / `cli_error`. |
 
