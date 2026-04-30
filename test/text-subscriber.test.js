@@ -111,7 +111,7 @@ test('SlackTextSubscriber flushes pending text immediately on result', async () 
 
 test('Scheduler registers Slack text subscriber when Slack adapter is added', () => {
   const previous = process.env.ORB_TURN_DELIVERY_CC_EVENT;
-  delete process.env.ORB_TURN_DELIVERY_CC_EVENT;
+  process.env.ORB_TURN_DELIVERY_CC_EVENT = '0';
   try {
     const scheduler = new Scheduler({ getProfile: () => ({ name: 'test' }), startPermissionServer: false });
     const adapter = createMockAdapter();

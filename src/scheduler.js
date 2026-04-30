@@ -382,7 +382,7 @@ export class Scheduler {
       });
     }
     this.adapters.set(name, adapter);
-    if (name === 'slack' && process.env.ORB_TURN_DELIVERY_CC_EVENT === '1') {
+    if (name === 'slack' && process.env.ORB_TURN_DELIVERY_CC_EVENT !== '0') {
       if (!adapter.__orbTurnDeliveryCcEventUnsubscribe) {
         adapter.__orbTurnDeliveryCcEventSubscriber = createTurnDeliveryCcEventSubscriber();
         adapter.__orbTurnDeliveryCcEventUnsubscribe = this.eventBus.subscribe(adapter.__orbTurnDeliveryCcEventSubscriber);

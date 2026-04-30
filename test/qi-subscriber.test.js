@@ -167,7 +167,7 @@ test('SlackQiSubscriber serializes concurrent tool_use appends', async () => {
 
 test('Scheduler registers Slack Qi subscriber when Slack adapter is added', () => {
   const previous = process.env.ORB_TURN_DELIVERY_CC_EVENT;
-  delete process.env.ORB_TURN_DELIVERY_CC_EVENT;
+  process.env.ORB_TURN_DELIVERY_CC_EVENT = '0';
   try {
     const scheduler = new Scheduler({ getProfile: () => ({ name: 'test' }), startPermissionServer: false });
     const adapter = createMockAdapter();

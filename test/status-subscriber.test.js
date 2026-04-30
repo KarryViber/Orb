@@ -82,7 +82,7 @@ test('SlackStatusSubscriber clearByContext stops orphaned heartbeat without appl
 
 test('Scheduler registers Slack status subscriber when Slack adapter is added', () => {
   const previous = process.env.ORB_TURN_DELIVERY_CC_EVENT;
-  delete process.env.ORB_TURN_DELIVERY_CC_EVENT;
+  process.env.ORB_TURN_DELIVERY_CC_EVENT = '0';
   try {
     const scheduler = new Scheduler({ getProfile: () => ({ name: 'test' }), startPermissionServer: false });
     const adapter = createMockAdapter();

@@ -34,7 +34,7 @@ function createAdapter() {
 
 test('Scheduler addAdapter uses legacy Slack 4 subscriber factories when flag is off', () => {
   const previous = process.env.ORB_TURN_DELIVERY_CC_EVENT;
-  delete process.env.ORB_TURN_DELIVERY_CC_EVENT;
+  process.env.ORB_TURN_DELIVERY_CC_EVENT = '0';
   try {
     const scheduler = new Scheduler({ getProfile: () => ({ name: 'test' }), startPermissionServer: false });
     const adapter = createAdapter();
