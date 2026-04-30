@@ -160,6 +160,13 @@ The following rules are invariants established during architecture evolution. An
 
 Single-layer (workspace/CLAUDE.md) + CLI auto-memory: persona, decision principles, and runtime constraints all live in `workspace/CLAUDE.md`; persistent user preferences are captured by Claude CLI's native auto-memory keyed on cwd.
 
+### Context Provider 不变量
+
+- 任何要进 user-prompt 的「外部上下文」必须注册为 `src/context-providers/*.js`，实现 `name + prefetch` 接口
+- 禁止在 `context.js` 直接拼接外部上下文字符串
+- CLI 已原生覆盖的（auto-memory / cwd-discovered CLAUDE.md / cwd-discovered skills）禁止注册为 provider——避免重复注入
+- provider 输出必须是 `LabeledFragment[]`（见 `specs/prompt-source-labeling-DESIGN.md`），不允许返回原始字符串
+
 ### Profile Isolation
 
 - Each profile uses independent `scripts/`, `workspace/` (with `workspace/.claude/skills/` for per-cwd skill isolation), and `data/` paths under `profiles/{name}/`
