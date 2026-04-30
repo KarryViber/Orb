@@ -1,11 +1,14 @@
 import { spawn } from 'node:child_process';
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, copyFileSync, readFileSync, existsSync, rmSync, writeFileSync, readdirSync, appendFileSync } from 'node:fs';
-import { tmpdir, homedir } from 'node:os';
-import { join, dirname, resolve, relative, isAbsolute, normalize } from 'node:path';
+import { mkdirSync, readFileSync, existsSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildPrompt } from './context.js';
+import { collectGitDiffSummary, isFileModifyingTool } from './worker-git-diff.js';
+import { buildImageBlocks } from './worker-image-blocks.js';
+import { buildWorkerMcpConfig, collectWorkspaceMcpServers } from './worker-mcp-boot.js';
 import { getSessionId, updateSession } from './session.js';
 import { storeConversation } from './memory.js';
 import { resolveTurnCompleteText } from './worker-turn-text.js';
@@ -23,7 +26,6 @@ import {
   CLAUDE_MODEL,
   CLAUDE_PATH,
   MAX_TURNS,
-  ORB_MCP_PERMISSION_LOG,
   ORB_PERMISSION_TIMEOUT_MS,
   PYTHON_PATH,
   WORKER_IDLE_TIMEOUT_MS,
@@ -88,9 +90,6 @@ const TASK_CARD_TOOLS = new Set([
   'Bash', 'Read', 'Edit', 'Write', 'Grep', 'Glob',
   'WebFetch', 'WebSearch', 'NotebookEdit',
 ]);
-const GIT_DIFF_TIMEOUT_MS = 2_000;
-const GIT_DIFF_MAX_FILES = 20;
-const FILE_MODIFYING_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
 
 let _activeCli = null;   // reference to active interactive CLI session
 let _currentTurnId = null;
@@ -176,12 +175,18 @@ process.on('message', async (msg) => {
 
   let { userText, fileContent, imagePaths, threadTs, channel, userId, platform, profile, threadHistory, model, effort, mode, priorConversation, disablePermissionPrompt, maxTurns, attemptId, channelMeta, fragments, origin } = msg;
   _currentChannelSemantics = normalizeChannelSemantics(msg.channelSemantics);
+  if (!profile?.dataDir) {
+    await ipcSend(makeError({ error: 'profile.dataDir is required' })).catch(() => {});
+    process.exit(1);
+    return;
+  }
+  const profileDataDir = profile.dataDir;
   beginCcTurn({
     threadTs,
     attemptId,
     origin,
     profileName: profile?.name,
-    dataDir: profile?.dataDir || process.cwd(),
+    dataDir: profileDataDir,
   });
   await ipcSend(makeTurnStart({ attemptId: attemptId || null })).catch(() => {});
 
@@ -216,8 +221,13 @@ process.on('message', async (msg) => {
     }
   }
 
-  // Use profile-specific workspace, fallback to env/cwd
-  const WORKSPACE = profile?.workspaceDir || WORKSPACE_DIR || process.cwd();
+  // Use profile-specific workspace, with env fallback for local development.
+  const WORKSPACE = profile?.workspaceDir || WORKSPACE_DIR;
+  if (!WORKSPACE) {
+    await ipcSend(makeError({ error: 'no workspace path: profile.workspaceDir + WORKSPACE_DIR both empty' })).catch(() => {});
+    process.exit(1);
+    return;
+  }
 
   // Session key includes platform to avoid collisions
   const sessionKey = platform ? `${platform}:${threadTs}` : threadTs;
@@ -225,7 +235,7 @@ process.on('message', async (msg) => {
 
   try {
     console.log(`[worker] starting task: thread=${threadTs} profile=${profile?.name || 'default'} text="${(userText || '[files]').slice(0, 80)}"`);
-    const dataDir = profile?.dataDir || process.cwd();
+    const dataDir = profileDataDir;
     _currentDataDir = dataDir;
     _currentChannel = channel || null;
     _currentUserId = userId || null;
@@ -440,96 +450,9 @@ function normalizeChannelSemantics(value) {
   return value === 'silent' || value === 'broadcast' ? value : 'reply';
 }
 
-function runGit(args, cwd) {
-  return new Promise((resolve, reject) => {
-    execFile(
-      'git',
-      args,
-      { cwd, timeout: GIT_DIFF_TIMEOUT_MS, maxBuffer: 256 * 1024 },
-      (err, stdout) => {
-        if (err) reject(err);
-        else resolve(String(stdout || ''));
-      },
-    );
-  });
-}
-
-function parseGitStatusPorcelain(output) {
-  const files = [];
-  for (const line of String(output || '').split('\n')) {
-    if (!line) continue;
-    const status = line.slice(0, 2);
-    const rawPath = line.slice(3);
-    const renameIndex = rawPath.indexOf(' -> ');
-    files.push({
-      path: renameIndex >= 0 ? rawPath.slice(renameIndex + 4) : rawPath,
-      status: status.trim() || status,
-      linesAdded: 0,
-      linesDeleted: 0,
-    });
-  }
-  return files;
-}
-
-function normalizeStatPath(rawPath) {
-  const path = String(rawPath || '').trim();
-  if (!path.includes(' => ')) return path;
-  const collapsed = path.replace(/[{}]/g, '');
-  const parts = collapsed.split(' => ');
-  return parts[parts.length - 1].trim();
-}
-
-function parseGitStat(output) {
-  const stats = new Map();
-  const totals = { insertions: 0, deletions: 0 };
-  for (const line of String(output || '').split('\n')) {
-    if (!line) continue;
-    const totalMatch = line.match(/(\d+)\s+insertion(?:s)?\(\+\)/);
-    const deleteMatch = line.match(/(\d+)\s+deletion(?:s)?\(-\)/);
-    if (totalMatch || deleteMatch) {
-      totals.insertions = totalMatch ? Number.parseInt(totalMatch[1], 10) : 0;
-      totals.deletions = deleteMatch ? Number.parseInt(deleteMatch[1], 10) : 0;
-      continue;
-    }
-    const pipeIndex = line.indexOf('|');
-    if (pipeIndex < 0) continue;
-    const path = normalizeStatPath(line.slice(0, pipeIndex));
-    const graph = line.slice(pipeIndex + 1);
-    const added = (graph.match(/\+/g) || []).length;
-    const deleted = (graph.match(/-/g) || []).length;
-    stats.set(path, {
-      linesAdded: added,
-      linesDeleted: deleted,
-    });
-  }
-  return { stats, totals };
-}
-
-function normalizeGitRelativePath(filePath) {
-  const normalized = normalize(String(filePath || '').trim()).replace(/\\/g, '/');
-  return normalized === '.' ? '' : normalized.replace(/^\.\//, '');
-}
-
-function normalizeModifiedPath(cwd, filePath) {
-  if (!filePath || typeof filePath !== 'string') return null;
-  const absolutePath = isAbsolute(filePath) ? normalize(filePath) : resolve(cwd, filePath);
-  const relativePath = relative(cwd, absolutePath);
-  if (!relativePath || relativePath.startsWith('..') || isAbsolute(relativePath)) return null;
-  return normalizeGitRelativePath(relativePath);
-}
-
-function normalizeModifiedPathSet(cwd, modifiedPaths) {
-  const normalized = new Set();
-  for (const filePath of modifiedPaths || []) {
-    const relativePath = normalizeModifiedPath(cwd, filePath);
-    if (relativePath) normalized.add(relativePath);
-  }
-  return normalized;
-}
-
 export function recordModifiedPathFromToolUse(toolUse, modifiedPaths = _currentTurnModifiedPaths) {
   const toolName = toolUse?.name;
-  if (!FILE_MODIFYING_TOOLS.has(toolName)) return false;
+  if (!isFileModifyingTool(toolName)) return false;
   const input = parseToolInput(toolUse?.input);
   const filePath = toolName === 'NotebookEdit' ? input?.notebook_path : input?.file_path;
   if (!filePath || typeof filePath !== 'string') return false;
@@ -537,70 +460,7 @@ export function recordModifiedPathFromToolUse(toolUse, modifiedPaths = _currentT
   return true;
 }
 
-export async function collectGitDiffSummary(cwd, modifiedPaths = new Set()) {
-  try {
-    if (!cwd || !existsSync(cwd)) return null;
-    await runGit(['rev-parse', '--is-inside-work-tree'], cwd);
-    const normalizedModifiedPaths = normalizeModifiedPathSet(cwd, modifiedPaths);
-    if (normalizedModifiedPaths.size === 0) {
-      return {
-        cwd,
-        hasChanges: false,
-        files: [],
-        totals: { filesChanged: 0, insertions: 0, deletions: 0 },
-        truncated: false,
-      };
-    }
-
-    const statusOutput = await runGit(['status', '--porcelain'], cwd);
-    const files = parseGitStatusPorcelain(statusOutput)
-      .map((file) => ({ ...file, path: normalizeGitRelativePath(file.path) }))
-      .filter((file) => normalizedModifiedPaths.has(file.path));
-    const hasChanges = files.length > 0;
-    if (!hasChanges) {
-      return {
-        cwd,
-        hasChanges: false,
-        files: [],
-        totals: { filesChanged: 0, insertions: 0, deletions: 0 },
-        truncated: false,
-      };
-    }
-
-    const statOutputs = await Promise.all(files.map((file) => runGit(['diff', '--stat', 'HEAD', '--', file.path], cwd)));
-    const statsByPath = new Map();
-    const totals = { insertions: 0, deletions: 0 };
-    for (const statOutput of statOutputs) {
-      const parsed = parseGitStat(statOutput);
-      totals.insertions += parsed.totals.insertions;
-      totals.deletions += parsed.totals.deletions;
-      for (const [path, stat] of parsed.stats) {
-        statsByPath.set(normalizeGitRelativePath(path), stat);
-      }
-    }
-    for (const file of files) {
-      const stat = statsByPath.get(file.path);
-      if (stat && file.status !== '??') {
-        file.linesAdded = stat.linesAdded;
-        file.linesDeleted = stat.linesDeleted;
-      }
-    }
-
-    return {
-      cwd,
-      hasChanges,
-      files: files.slice(0, GIT_DIFF_MAX_FILES),
-      totals: {
-        filesChanged: files.length,
-        insertions: totals.insertions,
-        deletions: totals.deletions,
-      },
-      truncated: files.length > GIT_DIFF_MAX_FILES,
-    };
-  } catch (_) {
-    return null;
-  }
-}
+export { collectGitDiffSummary };
 
 function beginCcTurn({ threadTs, attemptId, origin, profileName, dataDir } = {}) {
   if (threadTs !== undefined) {
@@ -1156,10 +1016,6 @@ function ipcSend(msg) {
   });
 }
 
-function sanitizeFileToken(value) {
-  return String(value || 'unknown').replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 80) || 'unknown';
-}
-
 function buildUserContent({ userText, fileContent, imagePaths, workspace }) {
   let text = userText || '';
   if (fileContent) {
@@ -1171,110 +1027,7 @@ function buildUserContent({ userText, fileContent, imagePaths, workspace }) {
   ];
 }
 
-function buildImageBlocks(imagePaths, workspace) {
-  if (!Array.isArray(imagePaths) || imagePaths.length === 0) return [];
-  const imgDir = join(workspace, '.images');
-  mkdirSync(imgDir, { recursive: true });
-  const blocks = [];
-  for (const imgPath of imagePaths) {
-    const name = imgPath.split('/').pop();
-    const dest = join(imgDir, name);
-    copyFileSync(imgPath, dest);
-    const ext = name.split('.').pop().toLowerCase();
-    const mimeMap = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp' };
-    const mediaType = mimeMap[ext] || 'image/png';
-    const b64 = readFileSync(dest, 'base64');
-    blocks.push({ type: 'image', source: { type: 'base64', media_type: mediaType, data: b64 } });
-    console.log(`[worker] attached image: ${name} (${mediaType}, ${Math.round(b64.length / 1024)}KB b64)`);
-  }
-  return blocks;
-}
-
-function schedulerSocketPathForPid(pid) {
-  return join(tmpdir(), `orb-permission-scheduler-${pid}.sock`);
-}
-
-function buildWorkerMcpConfig({ threadTs, channel, userId, permissionTimeoutMs, workspace }) {
-  const workspaceDir = workspace || WORKSPACE_DIR || process.cwd();
-  const configPath = join(
-    tmpdir(),
-    `orb-mcp-${process.pid}-${sanitizeFileToken(threadTs)}.json`,
-  );
-  const serverPath = join(dirname(fileURLToPath(import.meta.url)), 'mcp-permission-server.js');
-  const baseServers = {
-    orb_permission: {
-      type: 'stdio',
-      command: process.execPath,
-      args: [serverPath],
-      env: {
-        ORB_SCHEDULER_SOCKET: schedulerSocketPathForPid(process.ppid),
-        ORB_THREAD_TS: String(threadTs || ''),
-        ORB_CHANNEL: String(channel || ''),
-        ORB_USER_ID: String(userId || ''),
-        ORB_PERMISSION_TIMEOUT_MS: String(permissionTimeoutMs || DEFAULT_PERMISSION_TIMEOUT_MS),
-        ...(ORB_MCP_PERMISSION_LOG ? { ORB_MCP_PERMISSION_LOG } : {}),
-      },
-    },
-  };
-  const extServers = collectWorkspaceMcpServers(workspaceDir, {
-    ORB_THREAD_TS: String(threadTs || ''),
-    ORB_CHANNEL: String(channel || ''),
-    ORB_USER_ID: String(userId || ''),
-    ORB_WORKSPACE_DIR: workspaceDir,
-  });
-  const mergedServers = { ...extServers, ...baseServers };
-  const config = {
-    mcpServers: mergedServers,
-  };
-  writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`);
-  console.log(`[worker] wrote MCP config: ${configPath}`);
-  return configPath;
-}
-
-export function collectWorkspaceMcpServers(workspace, extraEnv) {
-  const dir = join(workspace, '.claude', 'mcp-servers');
-  if (!existsSync(dir)) return {};
-
-  let fnames;
-  try {
-    fnames = readdirSync(dir);
-  } catch (err) {
-    console.warn(`[worker] failed to scan MCP registrations dir: ${err.message}`);
-    return {};
-  }
-
-  const looksRelativePath = (s) => (
-    typeof s === 'string' && (s.startsWith('./') || s.startsWith('../'))
-  );
-
-  const result = {};
-  for (const fname of fnames) {
-    if (!fname.endsWith('.json')) continue;
-    try {
-      const raw = JSON.parse(readFileSync(join(dir, fname), 'utf8'));
-      for (const [name, def] of Object.entries(raw)) {
-        if (!def || typeof def !== 'object' || !def.command) continue;
-        const args = Array.isArray(def.args)
-          ? def.args.map((arg) => (looksRelativePath(arg) ? join(workspace, arg) : arg))
-          : [];
-        // Workspace MCP runs inside the worker child process and can access Orb env.
-        const entry = {
-          type: def.type || 'stdio',
-          command: def.command,
-          args,
-          env: { ...(def.env || {}), ...extraEnv },
-        };
-        if (def.alwaysLoad === true) entry.alwaysLoad = true;
-        result[name] = entry;
-      }
-    } catch (err) {
-      console.warn(`[worker] failed to load MCP registration ${fname}: ${err.message}`);
-    }
-  }
-  return result;
-}
-
-const writePermissionMcpConfig = buildWorkerMcpConfig;
+export { collectWorkspaceMcpServers };
 
 function cleanupTempFile(filePath) {
   if (!filePath) return;
