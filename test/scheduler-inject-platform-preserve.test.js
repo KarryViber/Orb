@@ -18,6 +18,7 @@ test('inject_failed respawn preserves wechat routing fields', () => {
     profile,
     deferDeliveryUntilResult: false,
     attemptId: 'attempt-follow-up',
+    fragments: [{ source_type: 'attachment', trusted: 'semi', origin: 'test', content: 'fragment' }],
   };
 
   const respawnTask = buildRespawnTaskForInjectFailed({
@@ -40,6 +41,7 @@ test('inject_failed respawn preserves wechat routing fields', () => {
   assert.equal(respawnTask.userText, 'from worker');
   assert.equal(respawnTask.attemptId, 'attempt-follow-up');
   assert.deepEqual(respawnTask.imagePaths, ['a.png']);
+  assert.deepEqual(respawnTask.fragments, failedTask.fragments);
 });
 
 test('startup replay dedupes shutdown tasks by thread and attempt id', () => {
@@ -95,6 +97,7 @@ test('scheduler tags first-touch and same-thread inject origins', async () => {
     channel: 'C1',
     userId: 'U1',
     platform: 'slack',
+    fragments: [{ source_type: 'linked_thread', trusted: false, origin: 'slack:C2/1', content: 'linked' }],
   });
 
   assert.equal(spawnedTasks.length, 1);
@@ -112,6 +115,7 @@ test('scheduler tags first-touch and same-thread inject origins', async () => {
     channel: 'C1',
     userId: 'U1',
     platform: 'slack',
+    fragments: [{ source_type: 'linked_thread', trusted: false, origin: 'slack:C2/1', content: 'linked' }],
   });
 
   assert.equal(sentMessages.length, 1);
@@ -121,4 +125,7 @@ test('scheduler tags first-touch and same-thread inject origins', async () => {
     name: 'replay',
     parentAttemptId: spawnedTasks[0].attemptId,
   });
+  assert.deepEqual(sentMessages[0].fragments, [
+    { source_type: 'linked_thread', trusted: false, origin: 'slack:C2/1', content: 'linked' },
+  ]);
 });

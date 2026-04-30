@@ -259,6 +259,52 @@ test('DM routing mainText converts mainTemplate placeholders', async () => {
   assert.equal(posts[0].text, '卡片：\u200b*acme/orb*');
 });
 
+test('DM routing sends original text and URL as labeled fragments', async () => {
+  const routedTasks = [];
+  const adapter = new SlackAdapter({
+    botToken: 'xoxb-test',
+    appToken: 'xapp-test',
+    dmRouting: {
+      enabled: true,
+      rules: [{
+        name: 'repo',
+        match: { urlPattern: 'https://github\\.com/[^\\s]+' },
+        target: {
+          channel: 'C-target',
+          mainTemplate: '卡片：{repo_slug}',
+          workerPrompt: 'worker {url_matched} {original_text} {repo_slug}',
+        },
+      }],
+    },
+  });
+  adapter.onMessage = (task) => routedTasks.push(task);
+  adapter._slack = {
+    chat: {
+      async postMessage(payload) {
+        return { ok: true, ts: '222.333', payload };
+      },
+    },
+  };
+
+  await adapter._routeDMMessage({
+    text: 'please inspect https://github.com/acme/orb',
+    files: [],
+    user: 'U1',
+    ts: '111.222',
+  });
+
+  assert.equal(routedTasks.length, 1);
+  assert.doesNotMatch(routedTasks[0].userText, /please inspect/);
+  assert.doesNotMatch(routedTasks[0].userText, /https:\/\/github.com\/acme\/orb/);
+  assert.match(routedTasks[0].userText, /\[routed_dm_payload:url_matched\]/);
+  assert.match(routedTasks[0].userText, /\[routed_dm_payload:original_text\]/);
+  assert.deepEqual(routedTasks[0].fragments.map((fragment) => fragment.source_type), [
+    'routed_dm_payload',
+    'routed_dm_payload',
+  ]);
+  assert.equal(routedTasks[0].fragments.find((fragment) => fragment.metadata.key === 'url_matched').trusted, false);
+});
+
 test('thread history keeps emoji-prefixed bot messages when blocks contain content', async () => {
   const adapter = new SlackAdapter({ botToken: 'xoxb-test', appToken: 'xapp-test' });
   adapter._slack = {
