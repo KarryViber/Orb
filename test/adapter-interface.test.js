@@ -9,11 +9,7 @@ test('PlatformAdapter optional capabilities default to no-op or null', async () 
   assert.equal(await adapter.startStream('C1', '111.222', {}), null);
   assert.equal(await adapter.appendStream('stream-1', []), undefined);
   assert.equal(await adapter.stopStream('stream-1', {}), undefined);
-
-  assert.equal(adapter.createQiSubscriber(), null);
-  assert.equal(adapter.createPlanSubscriber(), null);
-  assert.equal(adapter.createTextSubscriber(), null);
-  assert.equal(adapter.createStatusSubscriber(), null);
+  assert.equal(adapter.clearStatusByContext({ channel: 'C1', threadTs: '111.222' }), undefined);
   assert.deepEqual(adapter.capabilities, { stream: false, edit: false, metadata: false });
 });
 

@@ -3,7 +3,6 @@ import assert from 'node:assert/strict';
 import { mkdtempSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { createSlackTextSubscriber } from '../src/adapters/slack.js';
 import { Scheduler } from '../src/scheduler.js';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -41,9 +40,6 @@ function makeAdapter() {
     },
     clearStatusByContext(ctx) {
       calls.push(['clearStatusByContext', ctx]);
-    },
-    createTextSubscriber() {
-      return createSlackTextSubscriber(this, { debounceMs: 0 });
     },
   };
 }

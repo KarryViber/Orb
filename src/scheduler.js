@@ -382,23 +382,10 @@ export class Scheduler {
       });
     }
     this.adapters.set(name, adapter);
-    if (name === 'slack' && process.env.ORB_TURN_DELIVERY_CC_EVENT !== '0') {
+    if (name === 'slack') {
       if (!adapter.__orbTurnDeliveryCcEventUnsubscribe) {
         adapter.__orbTurnDeliveryCcEventSubscriber = createTurnDeliveryCcEventSubscriber();
         adapter.__orbTurnDeliveryCcEventUnsubscribe = this.eventBus.subscribe(adapter.__orbTurnDeliveryCcEventSubscriber);
-      }
-    } else if (name === 'slack') {
-      if (typeof adapter?.createQiSubscriber === 'function' && !adapter.__orbQiSubscriberUnsubscribe) {
-        adapter.__orbQiSubscriberUnsubscribe = this.eventBus.subscribe(adapter.createQiSubscriber());
-      }
-      if (typeof adapter?.createPlanSubscriber === 'function' && !adapter.__orbPlanSubscriberUnsubscribe) {
-        adapter.__orbPlanSubscriberUnsubscribe = this.eventBus.subscribe(adapter.createPlanSubscriber());
-      }
-      if (typeof adapter?.createTextSubscriber === 'function' && !adapter.__orbTextSubscriberUnsubscribe) {
-        adapter.__orbTextSubscriberUnsubscribe = this.eventBus.subscribe(adapter.createTextSubscriber());
-      }
-      if (typeof adapter?.createStatusSubscriber === 'function' && !adapter.__orbStatusSubscriberUnsubscribe) {
-        adapter.__orbStatusSubscriberUnsubscribe = this.eventBus.subscribe(adapter.createStatusSubscriber());
       }
     }
     setImmediate(() => {

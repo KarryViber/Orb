@@ -34,9 +34,6 @@ export const ORB_PROMPT_SOURCE_LABELING = parseBoolEnv(process.env.ORB_PROMPT_SO
 export const ORB_PROMPT_TOKEN_BUDGET = parseIntEnv(process.env.ORB_PROMPT_TOKEN_BUDGET, null);
 export const ORB_LEDGER_HYDRATE = parseBoolEnv(process.env.ORB_LEDGER_HYDRATE, true);
 export const ORB_STREAM_TRACE = parseBoolEnv(process.env.ORB_STREAM_TRACE, false);
-// ORB_TURN_DELIVERY_CC_EVENT is intentionally read directly by scheduler.addAdapter
-// so tests and daemon runtime overrides can flip the dual-track cc_event routing.
-export const ORB_TURN_DELIVERY_CC_EVENT = parseBoolEnv(process.env.ORB_TURN_DELIVERY_CC_EVENT, true);
 export const ORB_MEMORY_RECALL_LIMIT = parseIntEnv(process.env.ORB_MEMORY_RECALL_LIMIT, 10);
 export const ORB_MEMORY_MIN_TRUST = parseFloatEnv(process.env.ORB_MEMORY_MIN_TRUST, 0.3);
 export const ORB_DOC_RECALL_LIMIT = parseIntEnv(process.env.ORB_DOC_RECALL_LIMIT, 8);

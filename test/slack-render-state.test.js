@@ -1,13 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  createSlackQiSubscriber,
-  createSlackStatusSubscriber,
   SlackAdapter,
 } from '../src/adapters/slack.js';
 import {
   EventBus,
 } from '../src/scheduler.js';
+import { createTurnDeliveryCcEventSubscriber } from '../src/turn-delivery/cc-event-subscriber.js';
 import { TurnDeliveryOrchestrator } from '../src/turn-delivery/orchestrator.js';
 
 function toolUse(turnId, name, input = {}) {
@@ -84,7 +83,7 @@ test('turn_complete duplicate delivery posts only once', async () => {
 test('Qi stopStream settles existing chunks without repeating append details', async () => {
   const adapter = createStreamingAdapter();
   const bus = new EventBus();
-  bus.subscribe(createSlackQiSubscriber(adapter));
+  bus.subscribe(createTurnDeliveryCcEventSubscriber({ textDebounceMs: 10, statusHeartbeatMs: 10_000 }));
   const ctx = { channel: 'C1', threadTs: '111.222', effectiveThreadTs: '111.222', task: { teamId: 'T1' } };
   attachOrchestrator(adapter, ctx);
 
@@ -114,7 +113,7 @@ test('Qi stopStream settles existing chunks without repeating append details', a
 
 test('status bubble clears on turn_abort after tool_use', async () => {
   const bus = new EventBus();
-  bus.subscribe(createSlackStatusSubscriber({}, { heartbeatMs: 10_000 }));
+  bus.subscribe(createTurnDeliveryCcEventSubscriber({ textDebounceMs: 10, statusHeartbeatMs: 10_000 }));
   const statuses = [];
   const ctx = { async applyThreadStatus(status) { statuses.push(status); } };
 
@@ -128,7 +127,7 @@ test('status bubble clears on turn_abort after tool_use', async () => {
 test('new turns allocate distinct Slack streams', async () => {
   const adapter = createStreamingAdapter();
   const bus = new EventBus();
-  bus.subscribe(createSlackQiSubscriber(adapter));
+  bus.subscribe(createTurnDeliveryCcEventSubscriber({ textDebounceMs: 10, statusHeartbeatMs: 10_000 }));
   const ctx = { channel: 'C1', threadTs: '111.222', effectiveThreadTs: '111.222', task: { teamId: 'T1' } };
   attachOrchestrator(adapter, ctx);
 
