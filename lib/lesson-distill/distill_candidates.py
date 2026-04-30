@@ -6,6 +6,10 @@ import re
 import urllib.request
 from pathlib import Path
 
+import sys as _sys  # noqa: E402
+_sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "profiles" / "karry" / "scripts"))
+from cron_run_log import RunLog  # noqa: E402
+
 
 FM_RE = re.compile(r"\A---\n(.*?)\n---\n", re.S)
 MAX_BLOCKS = 50
@@ -140,6 +144,7 @@ def card(candidate_path, meta, lesson, apply):
 
 
 def main():
+  log = RunLog("failure-lesson-distill")
   parser = argparse.ArgumentParser()
   parser.add_argument("--data-dir", required=True)
   parser.add_argument("--channel", default=os.environ.get("LESSON_DISTILL_CHANNEL", "CXXXXXXXXXX"))
@@ -176,26 +181,40 @@ def main():
         updated = updated.rstrip() + f"\n\n## Distilled Lesson\n{lesson}\n\n## How to apply\n{apply}\n"
       updated += f"\n\n<!-- lesson_distill_slack_ts: {result['ts']} -->\n"
       path.write_text(updated, encoding="utf-8")
+      log.add_change("updated", path, "status=approval_sent")
       posted += 1
     except Exception as err:
       failed += 1
       message = f"{path}: {err}"
+      log.add_error(f"candidate={path}", str(err))
       if first_error is None:
         first_error = message
       print(f"candidate_failed={json.dumps({'candidate': str(path), 'error': str(err)}, ensure_ascii=False)}")
 
+  log.add_metric("processed", processed)
+  log.add_metric("posted", posted)
+  log.add_metric("failed", failed)
   if args.dry_run:
     print(f"dry_run processed={processed} failed={failed}")
+    log.finish("partial" if failed else "ok")
     if failed:
       raise SystemExit(1)
     return
 
   if failed:
     print(f"failed: lesson-distill processed={processed} posted={posted} failed={failed}; first_error={first_error}")
+    log.finish("partial" if posted else "failed")
     raise SystemExit(1)
 
+  log.finish("ok")
   print("[SILENT]")
 
 
 if __name__ == "__main__":
-  main()
+  try:
+    main()
+  except Exception as err:
+    fallback_log = RunLog("failure-lesson-distill")
+    fallback_log.add_error("distill_candidates", str(err))
+    fallback_log.finish("failed")
+    raise
