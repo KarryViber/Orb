@@ -99,7 +99,7 @@ The authoritative reference for payload fields lives in [`/CLAUDE.md`](../CLAUDE
 | --- | --- | --- |
 | `turn_start` | optional `injectId`, `attemptId` | Worker received a task or accepted inject; scheduler owns typing from this point |
 | `turn_end` | none | Claude CLI produced a `result` event for the current turn; scheduler stops typing |
-| `turn_complete` | `text`, `toolCount`, `lastTool`, `stopReason`, `channelSemantics`, `deliveredTexts`, optional `undeliveredText`, `gitDiffSummary` | One Claude turn finished; scheduler delivers final text while keeping the worker alive for follow-up `inject` |
+| `turn_complete` | `text`, `toolCount`, `lastTool`, `stopReason`, `channelSemantics`, optional `gitDiffSummary` | One Claude turn finished; scheduler delivers final text while keeping the worker alive for follow-up `inject`. `text` comes from worker `turnBuffer` (all assistant text blocks in this turn, in order, joined by `\n`); CLI `result.result` is only a last-resort fallback when the buffer is empty. Block-level dedup prevents repeated `result` lines in one turn from emitting duplicates |
 | `cc_event` | `turnId`, `eventType`, `payload`, optional `attemptId`, `origin` | Raw Claude Code event forwarded to scheduler subscribers; drives Slack Qi/plan/text/status rendering |
 | `inject_failed` | `userText`, optional `injectId`, `attemptId`, `fileContent`, `imagePaths`, `fragments?: LabeledFragment[]` | Follow-up inject could not reach the live CLI session; scheduler fails forward by replaying through a fresh worker |
 | `error` | `error`, optional `errorContext` | Terminal failure |

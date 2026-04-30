@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { buildPrompt } from './context.js';
 import { getSessionId, updateSession } from './session.js';
 import { storeConversation } from './memory.js';
+import { resolveTurnCompleteText } from './worker-turn-text.js';
 
 /**
  * Worker IPC Protocol
@@ -27,8 +28,10 @@ import { storeConversation } from './memory.js';
  * Worker -> Scheduler:
  *   { type: 'turn_start', injectId?, attemptId? }  — explicit turn ownership start on task/inject receipt
  *   { type: 'turn_end' }  — explicit turn ownership end when Claude emits result
- *   { type: 'turn_complete', text, toolCount, lastTool, stopReason, channelSemantics, deliveredTexts, undeliveredText?, gitDiffSummary? }
- *     - one Claude turn finished; scheduler may deliver text while keeping the worker alive for injects.
+ *   { type: 'turn_complete', text, toolCount, lastTool, stopReason, channelSemantics, gitDiffSummary? }
+ *     - one Claude turn finished; text comes from worker turnBuffer assistant text blocks
+ *       joined with "\n"; CLI result text is only a fallback when the buffer is empty.
+ *       Block-level dedup suppresses repeated result lines within the same turn.
  *   { type: 'cc_event', turnId, attemptId?, origin?, eventType, payload }  — raw Claude Code event forwarded to scheduler subscribers
  *   { type: 'inject_failed', injectId?, attemptId?, userText, fileContent?, imagePaths?, fragments? }  — follow-up inject could not reach CLI;
  *     scheduler should respawn a fresh worker and replay the user payload.
@@ -302,7 +305,7 @@ process.on('message', async (msg) => {
           turnId: _currentTurnId,
           manifest: _currentMemoryManifest,
           toolInputs: turn.toolInputs || [],
-          finalText: turn.text || turn.undeliveredText || '',
+          finalText: turn.text || '',
         }).catch((err) => console.warn(`[worker] memory usage record failed: ${err.message}`));
         if (turn.text?.trim()) {
           const gitDiffSummary = await collectGitDiffSummary(WORKSPACE, _currentTurnModifiedPaths);
@@ -884,6 +887,8 @@ function runClaudeInteractive(args, initialContent, workspace) {
   let lastStopReason = null;
   let lastSessionId = null;
   let lastTurnText = '';
+  let lastEmittedTurnText = '';
+  let blocksSinceLastEmit = 0;
   let onTurnComplete = null;
   let onTurnEnd = null;
   let closed = false;
@@ -904,6 +909,12 @@ function runClaudeInteractive(args, initialContent, workspace) {
     turnStopReasonOverride = null;
     pendingTaskCards.clear();
     inProgressTaskCards.clear();
+  };
+
+  const resetTurnTextDedupState = () => {
+    lastEmittedTurnText = '';
+    blocksSinceLastEmit = 0;
+    turnBuffer = [];
   };
 
   // ── stdout: incremental NDJSON parse ──
@@ -941,6 +952,7 @@ function runClaudeInteractive(args, initialContent, workspace) {
       for (const block of msg.message.content) {
         if (block.type === 'text') {
           turnBuffer.push(block.text);
+          blocksSinceLastEmit++;
           writeCcEvent({
             event_type: 'text',
             payload: { text_summary: truncateText(block.text, 300) },
@@ -1010,7 +1022,6 @@ function runClaudeInteractive(args, initialContent, workspace) {
     if (msg.type === 'result') {
       lastSessionId = msg.session_id || lastSessionId;
       lastStopReason = turnStopReasonOverride || msg.stop_reason || msg.subtype || null;
-      const turnText = msg.result || turnBuffer.join('\n');
       writeCcEvent({
         event_type: 'result',
         payload: {
@@ -1025,20 +1036,29 @@ function runClaudeInteractive(args, initialContent, workspace) {
         await onTurnEnd();
       }
 
-      // 防止同一段文本重复触发（CLI 可能输出多个 result 行）
-      if (turnText && turnText !== lastTurnText) {
-        lastTurnText = turnText;
+      const resolvedTurn = resolveTurnCompleteText({
+        turnBuffer,
+        msgResult: msg.result,
+        lastEmittedText: lastEmittedTurnText,
+        blocksSinceLastEmit,
+      });
+      if (resolvedTurn.mismatch) {
+        console.warn(`[worker] turn_complete text mismatch: bufferLen=${turnBuffer.join('\n').length} resultLen=${String(msg.result || '').length} stopReason=${lastStopReason || 'unknown'} toolCount=${turnToolCount}`);
+      }
+
+      if (resolvedTurn.shouldEmit) {
+        lastTurnText = resolvedTurn.text;
+        lastEmittedTurnText = resolvedTurn.text;
+        blocksSinceLastEmit = 0;
         if (onTurnComplete) {
           onTurnComplete({
-            text: turnText,
+            text: resolvedTurn.text,
             toolCount: totalToolCount,
             lastTool,
             stopReason: lastStopReason,
             toolInputs: [...turnToolInputs],
           });
         }
-      } else if (!lastTurnText && turnText) {
-        lastTurnText = turnText;
       }
       resetTurnStreamingState();
       turnBuffer = [];
@@ -1058,6 +1078,7 @@ function runClaudeInteractive(args, initialContent, workspace) {
     try {
       if (closed || !child?.stdin?.writable) return false;
       resetTurnStreamingState();
+      resetTurnTextDedupState();
       const content = buildUserContent({ userText, fileContent, imagePaths, workspace });
       const msg = JSON.stringify({ type: 'user', message: { role: 'user', content } });
       child.stdin.write(msg + '\n');
@@ -1100,6 +1121,7 @@ function runClaudeInteractive(args, initialContent, workspace) {
 
   // Send initial message (do NOT close stdin)
   resetTurnStreamingState();
+  resetTurnTextDedupState();
   const initMsg = JSON.stringify({ type: 'user', message: { role: 'user', content: initialContent } });
   child.stdin.write(initMsg + '\n');
   resetIdleTimer();
