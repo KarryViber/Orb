@@ -62,6 +62,7 @@ const PERSISTED_TASK_FIELDS = [
   'enableTaskCard',
   'channelSemantics',
   'attemptId',
+  'fragments',
   'origin',
 ];
 
@@ -312,6 +313,9 @@ export function buildRespawnTaskForInjectFailed({
     imagePaths: Array.isArray(msg.imagePaths)
       ? msg.imagePaths
       : (failedTask?.imagePaths || []),
+    fragments: Array.isArray(msg.fragments)
+      ? msg.fragments
+      : (Array.isArray(failedTask?.fragments) ? failedTask.fragments : []),
     threadTs,
     deliveryThreadTs: failedTask?.deliveryThreadTs === undefined
       ? effectiveThreadTs
@@ -792,6 +796,7 @@ export class Scheduler {
           userText: task.userText,
           fileContent: task.fileContent,
           imagePaths: task.imagePaths,
+          fragments: task.fragments || [],
           attemptId: injectTask.attemptId,
           origin: injectTask.origin,
           channelMeta: task.channelMeta,
@@ -1267,6 +1272,7 @@ export class Scheduler {
             teamId: task.teamId || null,
             attemptId: task.attemptId,
             threadHistory: task.threadHistory,
+            fragments: task.fragments || [],
             profile,
             maxTurns: task.maxTurns || null,
             enableTaskCard: task.enableTaskCard,
@@ -1374,6 +1380,7 @@ export class Scheduler {
           model: effectiveModel,
           effort: effectiveEffort,
           maxTurns: task.maxTurns || null,
+          fragments: task.fragments || [],
           profile: {
             name: profile.name,
             scriptsDir: profile.scriptsDir,
@@ -1861,6 +1868,7 @@ export class Scheduler {
         disablePermissionPrompt: true,
         mode: 'skill-review',
         priorConversation: priorMessages,
+        fragments: [],
         profile: {
           name: profile.name,
           scriptsDir: profile.scriptsDir,

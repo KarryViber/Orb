@@ -88,10 +88,10 @@ The authoritative reference for payload fields lives in [`/CLAUDE.md`](../CLAUDE
 
 | Type | Payload | Purpose |
 | --- | --- | --- |
-| `task` | `userText`, `fileContent`, `imagePaths`, `threadTs`, `channel`, `userId`, `platform`, `threadHistory`, `profile`, `model`, `effort`, `attemptId`, optional `channelSemantics`, `channelMeta`, `origin`, `maxTurns`, `mode`, `priorConversation`, `disablePermissionPrompt` | Start a new turn for a thread |
-| `inject` | `userText`, optional `injectId`, `attemptId`, `fileContent`, `imagePaths`, `channelMeta`, `origin` | Continue an active same-thread Claude session without forking a new worker |
+| `task` | `userText`, `fileContent`, `imagePaths`, `threadTs`, `channel`, `userId`, `platform`, `threadHistory`, `profile`, `model`, `effort`, `attemptId`, optional `channelSemantics`, `channelMeta`, `fragments?: LabeledFragment[]`, `origin`, `maxTurns`, `mode`, `priorConversation`, `disablePermissionPrompt` | Start a new turn for a thread |
+| `inject` | `userText`, optional `injectId`, `attemptId`, `fileContent`, `imagePaths`, `channelMeta`, `fragments?: LabeledFragment[]`, `origin` | Continue an active same-thread Claude session without forking a new worker |
 
-`attemptId` threads through every downstream IPC payload for delivery-ledger correlation. `origin` (`{ kind: 'cron' | 'inject' | 'user' | 'system', name, parentAttemptId }`) tags the trigger source for replay/debug attribution. `channelSemantics` is `'reply'` (default), `'silent'` (suppress successful worker text delivery), or reserved `'broadcast'`. See [turn-delivery-architecture.md](turn-delivery-architecture.md) for how these flow through the egress orchestrator.
+`attemptId` threads through every downstream IPC payload for delivery-ledger correlation. `origin` (`{ kind: 'cron' | 'inject' | 'user' | 'system', name, parentAttemptId }`) tags the trigger source for replay/debug attribution. `fragments?: LabeledFragment[]` carries prompt source labeled data blocks as defined in [prompt-source-labeling-DESIGN.md](../specs/prompt-source-labeling-DESIGN.md). `channelSemantics` is `'reply'` (default), `'silent'` (suppress successful worker text delivery), or reserved `'broadcast'`. See [turn-delivery-architecture.md](turn-delivery-architecture.md) for how these flow through the egress orchestrator.
 
 ### Worker -> Scheduler
 

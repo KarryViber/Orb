@@ -15,14 +15,14 @@ import { storeConversation } from './memory.js';
  * Scheduler -> Worker:
  *   { type: 'task', userText, fileContent, imagePaths, threadTs, channel,
  *                   userId, platform, threadHistory, profile, model, effort,
- *                   channelSemantics?, channelMeta?, origin?, attemptId?, mode?, priorConversation?, disablePermissionPrompt?, maxTurns? }
+ *                   channelSemantics?, channelMeta?, fragments?, origin?, attemptId?, mode?, priorConversation?, disablePermissionPrompt?, maxTurns? }
  *     - channelSemantics: 'reply' (default) delivers turn text to the thread;
  *       'silent' suppresses successful worker text delivery in the scheduler;
  *       'broadcast' is reserved for top-level channel delivery.
  *     - mode: 'skill-review' enters a dedicated branch that requires
  *       priorConversation; context.js injects it as "## 待审查会话".
  *     - priorConversation: [{role: 'user'|'assistant', content: string}, ...]
- *   { type: 'inject', injectId?, attemptId?, userText, fileContent?, imagePaths?, channelMeta?, origin? }
+ *   { type: 'inject', injectId?, attemptId?, userText, fileContent?, imagePaths?, channelMeta?, fragments?, origin? }
  *
  * Worker -> Scheduler:
  *   { type: 'turn_start', injectId?, attemptId? }  — explicit turn ownership start on task/inject receipt
@@ -30,7 +30,7 @@ import { storeConversation } from './memory.js';
  *   { type: 'turn_complete', text, toolCount, lastTool, stopReason, channelSemantics, deliveredTexts, undeliveredText?, gitDiffSummary? }
  *     - one Claude turn finished; scheduler may deliver text while keeping the worker alive for injects.
  *   { type: 'cc_event', turnId, attemptId?, origin?, eventType, payload }  — raw Claude Code event forwarded to scheduler subscribers
- *   { type: 'inject_failed', injectId?, attemptId?, userText, fileContent?, imagePaths? }  — follow-up inject could not reach CLI;
+ *   { type: 'inject_failed', injectId?, attemptId?, userText, fileContent?, imagePaths?, fragments? }  — follow-up inject could not reach CLI;
  *     scheduler should respawn a fresh worker and replay the user payload.
  *   { type: 'error', error, errorContext? }
  *   { type: 'result', text, stopReason?, channelSemantics, exitOnly: true, toolCount?, lastTool?, exitCode?, stderrSummary? }
@@ -81,6 +81,7 @@ let _currentChannel = null;
 let _currentUserId = null;
 let _currentScriptsDir = null;
 let _currentChannelMeta = null;
+let _currentFragments = [];
 let _currentOrigin = null;
 let _currentChannelSemantics = 'reply';
 let _currentTurnModifiedPaths = new Set();
@@ -102,6 +103,8 @@ process.on('message', async (msg) => {
           threadHistory: msg.threadHistory || null,
           dataDir: _currentDataDir,
           channelMeta: msg.channelMeta || _currentChannelMeta,
+          fragments: msg.fragments || _currentFragments,
+          origin: msg.origin || _currentOrigin || null,
         });
         injectText = prompt.userPrompt || String(prompt);
         _currentMemoryManifest = Array.isArray(prompt.memoryManifest) ? prompt.memoryManifest : [];
@@ -127,6 +130,7 @@ process.on('message', async (msg) => {
           fileContent: msg.fileContent,
           imagePaths: msg.imagePaths,
           channelMeta: msg.channelMeta,
+          fragments: msg.fragments || _currentFragments,
           origin: msg.origin || _currentOrigin || null,
         }).catch(() => {});
         _activeCli.close();
@@ -141,6 +145,7 @@ process.on('message', async (msg) => {
         fileContent: msg.fileContent,
         imagePaths: msg.imagePaths,
         channelMeta: msg.channelMeta,
+        fragments: msg.fragments || _currentFragments,
         origin: msg.origin || _currentOrigin || null,
       }).catch(() => {});
       setImmediate(() => process.exit(0));
@@ -149,7 +154,7 @@ process.on('message', async (msg) => {
   }
   if (msg.type !== 'task') return;
 
-  let { userText, fileContent, imagePaths, threadTs, channel, userId, platform, profile, threadHistory, model, effort, mode, priorConversation, disablePermissionPrompt, maxTurns, attemptId, channelMeta, origin } = msg;
+  let { userText, fileContent, imagePaths, threadTs, channel, userId, platform, profile, threadHistory, model, effort, mode, priorConversation, disablePermissionPrompt, maxTurns, attemptId, channelMeta, fragments, origin } = msg;
   _currentChannelSemantics = normalizeChannelSemantics(msg.channelSemantics);
   beginCcTurn({
     threadTs,
@@ -208,6 +213,7 @@ process.on('message', async (msg) => {
     _currentUserId = userId || null;
     _currentScriptsDir = profile?.scriptsDir || null;
     _currentChannelMeta = channelMeta || null;
+    _currentFragments = Array.isArray(fragments) ? fragments : [];
     _currentOrigin = origin || null;
     let sessionId = getSessionId(dataDir, sessionKey);
     // Validate sessionId format before passing to CLI
@@ -223,6 +229,8 @@ process.on('message', async (msg) => {
       mode,
       priorConversation,
       channelMeta,
+      fragments: _currentFragments,
+      origin,
     });
     _currentMemoryManifest = Array.isArray(prompt.memoryManifest) ? prompt.memoryManifest : [];
     recordMemoryInjection({
