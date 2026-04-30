@@ -2347,6 +2347,55 @@ export class SlackAdapter extends PlatformAdapter {
     });
   }
 
+  _renderDmRoutingPrompt(rule, ctx, event) {
+    const payloadKeys = new Set(['original_text', 'url_matched', 'urlMatched', 'filename']);
+    const keyAlias = { urlMatched: 'url_matched' };
+    const payloadFragments = [];
+    const seen = new Set();
+    const retrievedAt = new Date().toISOString();
+    const addPayload = (rawKey) => {
+      const key = keyAlias[rawKey] || rawKey;
+      if (seen.has(key)) return;
+      const value = ctx[rawKey] ?? ctx[key];
+      if (value == null || value === '') return;
+      seen.add(key);
+      payloadFragments.push({
+        source_type: 'routed_dm_payload',
+        trusted: false,
+        origin: key === 'url_matched'
+          ? String(value)
+          : `slack:dm:${event.ts || 'unknown'}:${key}`,
+        content: String(value),
+        retrieved_at: retrievedAt,
+        platform: 'slack',
+        author_id: event.user || null,
+        metadata: {
+          key,
+          repo_slug: key === 'url_matched' ? (ctx.repo_slug || '') : undefined,
+        },
+      });
+    };
+
+    const tpl = rule.target.workerPrompt || rule.target.threadBootstrap || '';
+    let instructionText = String(tpl || '').replace(/\{(\w+)\}/g, (_, key) => {
+      if (payloadKeys.has(key)) {
+        addPayload(key);
+        return `[routed_dm_payload:${keyAlias[key] || key}]`;
+      }
+      const v = ctx[key];
+      return v == null ? '' : String(v);
+    });
+
+    for (const key of payloadKeys) addPayload(key);
+
+    if (ctx.file) {
+      instructionText += ctx.localPath
+        ? `\n\n[附件已下载到: ${ctx.localPath}]`
+        : '\n\n[附件下载失败，请手动从 Slack 获取。]';
+    }
+    return { instructionText, payloadFragments };
+  }
+
   async _downloadDMFile(file, event, userId) {
     if (!file?.url_private) throw new Error('no url_private');
     if (!isSafeUrl(file.url_private)) throw new Error('unsafe URL');
@@ -2412,17 +2461,6 @@ export class SlackAdapter extends PlatformAdapter {
     }
     ctx.date_mmdd = this._dateMMDD();
 
-    const buildWorkerPrompt = () => {
-      const tpl = rule.target.workerPrompt || rule.target.threadBootstrap || '';
-      let workerPrompt = this._interpRuleTemplate(tpl, ctx);
-      if (ctx.file) {
-        workerPrompt += ctx.localPath
-          ? `\n\n[附件已下载到: ${ctx.localPath}]`
-          : `\n\n[附件下载失败，请手动从 Slack 获取：${ctx.file.name}]`;
-      }
-      return workerPrompt;
-    };
-
     try {
       const mainText = markdownToMrkdwn(this._interpRuleTemplate(rule.target.mainTemplate, ctx));
       const mainMsg = await this._slack.chat.postMessage({
@@ -2447,12 +2485,12 @@ export class SlackAdapter extends PlatformAdapter {
       this._trackBotMessage(mainMsg.ts);
       this._trackThread(mainMsg.ts);
 
-      const workerPrompt = buildWorkerPrompt();
+      const { instructionText, payloadFragments } = this._renderDmRoutingPrompt(rule, ctx, event);
 
       if (this.onMessage) {
         const channelMeta = await this.fetchChannelMeta(rule.target.channel);
         const task = {
-          userText: workerPrompt,
+          userText: instructionText,
           fileContent: '',
           imagePaths: [],
           threadTs: mainMsg.ts,
@@ -2463,6 +2501,7 @@ export class SlackAdapter extends PlatformAdapter {
           channelSemantics: 'silent',
           threadHistory: null,
           channelMeta,
+          fragments: payloadFragments,
           origin: { kind: 'user', name: 'first-touch', parentAttemptId: null },
         };
         this.onMessage(task);
