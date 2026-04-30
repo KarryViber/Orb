@@ -17,6 +17,13 @@ import {
 import { PlatformAdapter } from './interface.js';
 import { downloadAndCacheImage, cleanImageCache, IMAGE_EXTENSIONS } from './image-cache.js';
 import {
+  formatDmRoutingDate,
+  interpolateDmRoutingTemplate,
+  matchDmRule,
+  renderDmRoutingMainText,
+  renderDmRoutingPrompt,
+} from './slack-dm-routing.js';
+import {
   ASSISTANT_TEXT_DELTA,
   ASSISTANT_TEXT_FINAL,
   CONTROL_PLANE_MESSAGE,
@@ -540,27 +547,6 @@ function extractBlockKitText(blocks) {
     // divider / image / actions ignored
   }
   return parts.join('\n');
-}
-
-// Compile a regex from config. Returns null on invalid input rather than
-// throwing, so a bad rule disables just that rule instead of crashing routing.
-// Accepts leading `(?i)` / `(?im)` inline flag prefix (PCRE-style, common in
-// human-authored configs) and rewrites it to JS RegExp flags.
-function safeRegex(pattern, flags = '') {
-  if (pattern == null) return null;
-  try {
-    let p = String(pattern);
-    let f = String(flags || '');
-    const m = p.match(/^\(\?([a-z]+)\)/);
-    if (m) {
-      const inline = m[1].toLowerCase();
-      for (const ch of inline) if (!f.includes(ch) && 'gimsuy'.includes(ch)) f += ch;
-      p = p.slice(m[0].length);
-    }
-    return new RegExp(p, f);
-  } catch {
-    return null;
-  }
 }
 
 function parsePermissionToolInput(toolInput) {
@@ -2278,124 +2264,6 @@ export class SlackAdapter extends PlatformAdapter {
   //   4. DM stays silent (iron rule from v1 spec)
   // Returns true if routed (caller should skip normal worker dispatch).
 
-  _matchDMRule(rule, text, files) {
-    const m = rule.match || {};
-
-    if (m.hasFile) {
-      if (!files || files.length === 0) return null;
-      const fileRe = m.filenamePattern ? safeRegex(m.filenamePattern) : null;
-      const wantType = m.filetype ? String(m.filetype).toLowerCase() : null;
-      for (const f of files) {
-        const name = f.name || '';
-        const ext = (name.split('.').pop() || '').toLowerCase();
-        const ftype = (f.filetype || '').toLowerCase();
-        if (wantType && ext !== wantType && ftype !== wantType) continue;
-        if (fileRe && !fileRe.test(name)) continue;
-        return {
-          file: f,
-          filename: name,
-          preview: name,
-          original_text: text || '',
-        };
-      }
-      return null;
-    }
-
-    if (m.urlPattern) {
-      const re = safeRegex(m.urlPattern);
-      if (!re) return null;
-      const found = text ? text.match(re) : null;
-      if (!found) return null;
-      const url = found[0];
-      return {
-        urlMatched: url,
-        url_matched: url,
-        preview: this._makePreview(url),
-        repo_slug: this._extractRepoSlug(url),
-        original_text: text || '',
-      };
-    }
-
-    return null;
-  }
-
-  _extractRepoSlug(url) {
-    if (!url) return '';
-    const m = String(url).match(/github\.com\/([^/\s]+)\/([^/\s?#]+)/);
-    if (!m) return '';
-    const owner = m[1];
-    const name = m[2].replace(/\.git$/, '');
-    return `${owner}/${name}`;
-  }
-
-  _dateMMDD(d = new Date()) {
-    const mm = String(d.getMonth() + 1).padStart(2, '0');
-    const dd = String(d.getDate()).padStart(2, '0');
-    return `${mm}/${dd}`;
-  }
-
-  _makePreview(s, max = 40) {
-    if (!s) return '';
-    if (s.length <= max) return s;
-    return s.slice(0, max) + '…';
-  }
-
-  _interpRuleTemplate(template, ctx) {
-    return String(template || '').replace(/\{(\w+)\}/g, (_, key) => {
-      const v = ctx[key];
-      return v == null ? '' : String(v);
-    });
-  }
-
-  _renderDmRoutingPrompt(rule, ctx, event) {
-    const payloadKeys = new Set(['original_text', 'url_matched', 'urlMatched', 'filename']);
-    const keyAlias = { urlMatched: 'url_matched' };
-    const payloadFragments = [];
-    const seen = new Set();
-    const retrievedAt = new Date().toISOString();
-    const addPayload = (rawKey) => {
-      const key = keyAlias[rawKey] || rawKey;
-      if (seen.has(key)) return;
-      const value = ctx[rawKey] ?? ctx[key];
-      if (value == null || value === '') return;
-      seen.add(key);
-      payloadFragments.push({
-        source_type: 'routed_dm_payload',
-        trusted: false,
-        origin: key === 'url_matched'
-          ? String(value)
-          : `slack:dm:${event.ts || 'unknown'}:${key}`,
-        content: String(value),
-        retrieved_at: retrievedAt,
-        platform: 'slack',
-        author_id: event.user || null,
-        metadata: {
-          key,
-          repo_slug: key === 'url_matched' ? (ctx.repo_slug || '') : undefined,
-        },
-      });
-    };
-
-    const tpl = rule.target.workerPrompt || rule.target.threadBootstrap || '';
-    let instructionText = String(tpl || '').replace(/\{(\w+)\}/g, (_, key) => {
-      if (payloadKeys.has(key)) {
-        addPayload(key);
-        return `[routed_dm_payload:${keyAlias[key] || key}]`;
-      }
-      const v = ctx[key];
-      return v == null ? '' : String(v);
-    });
-
-    for (const key of payloadKeys) addPayload(key);
-
-    if (ctx.file) {
-      instructionText += ctx.localPath
-        ? `\n\n[附件已下载到: ${ctx.localPath}]`
-        : '\n\n[附件下载失败，请手动从 Slack 获取。]';
-    }
-    return { instructionText, payloadFragments };
-  }
-
   async _downloadDMFile(file, event, userId) {
     if (!file?.url_private) throw new Error('no url_private');
     if (!isSafeUrl(file.url_private)) throw new Error('unsafe URL');
@@ -2435,14 +2303,7 @@ export class SlackAdapter extends PlatformAdapter {
     if (!cfg?.enabled) return { routed: false };
 
     const rules = Array.isArray(cfg.rules) ? cfg.rules : [];
-    const text = event.text || '';
-    const files = event.files || [];
-
-    let matched = null;
-    for (const rule of rules) {
-      const ctx = this._matchDMRule(rule, text, files);
-      if (ctx) { matched = { rule, ctx }; break; }
-    }
+    const matched = matchDmRule(event, rules);
 
     if (!matched) {
       return { routed: false, fallback: cfg.dmFallback || 'worker' };
@@ -2459,10 +2320,10 @@ export class SlackAdapter extends PlatformAdapter {
         ctx.localPath = null;
       }
     }
-    ctx.date_mmdd = this._dateMMDD();
+    ctx.date_mmdd = formatDmRoutingDate();
 
     try {
-      const mainText = markdownToMrkdwn(this._interpRuleTemplate(rule.target.mainTemplate, ctx));
+      const mainText = markdownToMrkdwn(renderDmRoutingMainText(rule, ctx));
       const mainMsg = await this._slack.chat.postMessage({
         channel: rule.target.channel,
         text: mainText,
@@ -2485,7 +2346,7 @@ export class SlackAdapter extends PlatformAdapter {
       this._trackBotMessage(mainMsg.ts);
       this._trackThread(mainMsg.ts);
 
-      const { instructionText, payloadFragments } = this._renderDmRoutingPrompt(rule, ctx, event);
+      const { instructionText, payloadFragments } = renderDmRoutingPrompt(rule, ctx, event);
 
       if (this.onMessage) {
         const channelMeta = await this.fetchChannelMeta(rule.target.channel);
@@ -2513,7 +2374,7 @@ export class SlackAdapter extends PlatformAdapter {
       logError(TAG, `DM routing failed (rule=${rule.name}): ${err.message}`);
       try {
         const pendingText = markdownToMrkdwn([
-          this._interpRuleTemplate(rule.target.mainTemplate || '待补', ctx),
+          interpolateDmRoutingTemplate(rule.target.mainTemplate || '待补', ctx),
           '',
           '待补：DM 路由已命中，但自动建卡/启动 worker 时遇到 Slack API 故障；请稍后补处理。',
         ].filter((line) => line !== null && line !== undefined).join('\n'));
