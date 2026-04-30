@@ -8,29 +8,33 @@ Adapters implement `src/adapters/interface.js`.
 
 ```javascript
 export class PlatformAdapter {
-  async start(onMessage, onInteractive) {}
-  async disconnect() {}
-  async sendReply(channel, threadTs, text, extra) {}
-  async sendApproval(channel, threadTs, prompt) {}
-  buildPayloads(text) {}
-  async cleanupIndicator(channel, threadTs, typingSet, errorMsg) {}
+  async start(onMessage, onInteractive) { throw new Error("not implemented"); }
+  async disconnect() { throw new Error("not implemented"); }
+  async sendReply(channel, threadTs, text, extra) { throw new Error("not implemented"); }
+  async editMessage(channel, ts, text, extra) { throw new Error("not implemented"); }
+  async deliver(intent, ctx) { throw new Error("not implemented"); }
+  async uploadFile(channel, threadTs, filePath, filename) { throw new Error("not implemented"); }
+  async setTyping(channel, threadTs, status) { throw new Error("not implemented"); }
+  async setThreadStatus(channel, threadTs, status, loadingMessages) {}
+  async sendApproval(channel, threadTs, prompt) { throw new Error("not implemented"); }
+  buildPayloads(text) { throw new Error("not implemented"); }
+  async cleanupIndicator(channel, threadTs, typingSet, errorMsg) { throw new Error("not implemented"); }
   async fetchThreadHistory(threadTs, channel) { return null; }
-  get botUserId() {}
-  get platform() { return "unknown"; }
 
   // Optional capabilities: override only when supported by the platform.
-  async setThreadStatus(channel, threadTs, status, loadingMessages) {}
-  async editMessage(channel, ts, text, extra) {}
-  async uploadFile(channel, threadTs, filePath, filename) {}
   async setSuggestedPrompts(channel, threadTs, prompts) {}
-  async setThreadTitle(channel, threadTs, title) {}
-  async startStream(channel, threadTs, options) {}
+  async startStream(channel, threadTs, options) { return null; }
   async appendStream(streamId, chunks) {}
   async stopStream(streamId, payload) {}
-  createQiSubscriber() {}
-  createPlanSubscriber() {}
-  createTextSubscriber() {}
-  createStatusSubscriber() {}
+  createQiSubscriber() { return null; }
+  createPlanSubscriber() { return null; }
+  createTextSubscriber() { return null; }
+  createStatusSubscriber() { return null; }
+
+  get botUserId() { throw new Error("not implemented"); }
+  get platform() { return "unknown"; }
+  get capabilities() { return { stream: false, edit: false, metadata: false }; }
+  get supportsInteractiveApproval() { return false; }
 }
 ```
 
@@ -53,7 +57,6 @@ Optional capabilities, implemented only by adapters that support the behavior:
 - `editMessage`: update a previously sent message
 - `uploadFile`: upload generated files
 - `setSuggestedPrompts`: Slack suggested prompts
-- `setThreadTitle`: Slack thread metadata
 - `startStream` / `appendStream` / `stopStream`: task-card streaming
 - `createQiSubscriber` / `createPlanSubscriber` / `createTextSubscriber` / `createStatusSubscriber`: `cc_event` rendering subscriber factories
 

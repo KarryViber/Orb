@@ -28,6 +28,29 @@ export class PlatformAdapter {
    */
   async fetchThreadHistory(threadTs, channel) { return null; }
 
+  // ---- Optional capabilities ----
+  // Adapters override only when the underlying platform supports the behavior.
+  // Defaults are no-ops or null so callers can probe via `capabilities` and
+  // duck-type without crashing on platforms that lack the feature.
+
+  /** Slack-style suggested prompts attached to a thread. */
+  async setSuggestedPrompts(_channel, _threadTs, _prompts) { /* no-op */ }
+
+  /** Task-card streaming: start a stream-capable message. Returns stream id or null. */
+  async startStream(_channel, _threadTs, _options) { return null; }
+
+  /** Append chunks to an existing stream. */
+  async appendStream(_streamId, _chunks) { /* no-op */ }
+
+  /** Settle a stream with final chunks. */
+  async stopStream(_streamId, _payload) { /* no-op */ }
+
+  /** cc_event rendering subscriber factories. Return null when not supported. */
+  createQiSubscriber() { return null; }
+  createPlanSubscriber() { return null; }
+  createTextSubscriber() { return null; }
+  createStatusSubscriber() { return null; }
+
   get botUserId() { throw new Error('not implemented'); }
   get platform() { return 'unknown'; }
   get capabilities() { return { stream: false, edit: false, metadata: false }; }
