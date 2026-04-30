@@ -1,7 +1,6 @@
 import { WebClient } from '@slack/web-api';
 import { SocketModeClient } from '@slack/socket-mode';
-import { spawn } from 'node:child_process';
-import { appendFileSync, closeSync, createReadStream, existsSync, mkdirSync, openSync, writeFileSync } from 'node:fs';
+import { createReadStream, mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -16,6 +15,12 @@ import {
 } from './slack-format.js';
 import { PlatformAdapter } from './interface.js';
 import { downloadAndCacheImage, cleanImageCache, IMAGE_EXTENSIONS } from './image-cache.js';
+import {
+  dispatchBlockActionHandler,
+  handleBlockActionMessageChanged,
+  releaseBlockActionMessage,
+  updateBlockActionCard,
+} from './slack-block-actions.js';
 import {
   formatDmRoutingDate,
   interpolateDmRoutingTemplate,
@@ -784,11 +789,6 @@ const TEXT_EXTENSIONS = new Set([
   'rb', 'go', 'rs', 'java', 'kt', 'swift', 'c', 'cpp', 'h', 'hpp', 'cfg',
 ]);
 const MAX_FILE_SIZE = 100 * 1024; // 100KB
-const BLOCK_ACTION_HANDLER_RE = /^[a-z][a-z0-9_]{0,63}$/;
-const HANDLER_EXTENSIONS = ['.py', '.sh', '.js'];
-const HANDLER_DEDUP_TTL = 10 * 60 * 1000;
-const HANDLER_LOG_DIR = join(__dirname, '..', '..', 'logs', 'handlers');
-const HANDLER_PID_LOG = join(HANDLER_LOG_DIR, 'pids.log');
 
 export class StreamAPIError extends Error {
   constructor(message, cause, slackErrorCode = null) {
@@ -1571,237 +1571,35 @@ export class SlackAdapter extends PlatformAdapter {
       return;
     }
 
-    await this._dispatchBlockActionHandler({ body, action, actionId });
-  }
-
-  _rememberBlockActionMessage(messageTs) {
-    this._blockActionInFlight.add(messageTs);
-    const timer = setTimeout(() => {
-      this._blockActionInFlight.delete(messageTs);
-    }, HANDLER_DEDUP_TTL);
-    timer.unref?.();
+    await dispatchBlockActionHandler({
+      body,
+      action,
+      actionId,
+      slack: this._slack,
+      getProfilePaths: this._getProfilePaths,
+      resolveLedger: (ledgerHint) => this._resolveAdapterEventLedger(ledgerHint),
+      inFlight: this._blockActionInFlight,
+    });
   }
 
   _releaseBlockActionMessage(messageTs) {
-    if (!messageTs) return;
-    this._blockActionInFlight.delete(messageTs);
-  }
-
-  _isBlockActionProcessingMessage(message) {
-    if (!message) return false;
-    const text = [message.text || '', extractBlockKitText(message.blocks)]
-      .filter(Boolean)
-      .join('\n');
-    return text.includes('⏳ 处理中…');
+    releaseBlockActionMessage(this._blockActionInFlight, messageTs);
   }
 
   _handleMessageChanged(event) {
-    const messageTs = event?.message?.ts || event?.previous_message?.ts;
-    if (!messageTs || !this._blockActionInFlight.has(messageTs)) return;
-    if (this._isBlockActionProcessingMessage(event.message)) return;
-    this._releaseBlockActionMessage(messageTs);
-    info(TAG, `block_action released: message_ts=${messageTs}`);
+    handleBlockActionMessageChanged(event, this._blockActionInFlight);
   }
 
   async _updateBlockActionCard(channel, messageTs, text, originalBlocks = null, ledgerHint = {}) {
-    const safeText = markdownToMrkdwn(String(text || ''));
-    const statusBlock = {
-      type: 'context',
-      elements: [{ type: 'mrkdwn', text: safeText }],
-    };
-    const preserved = Array.isArray(originalBlocks)
-      ? originalBlocks.filter((block) => block && block.type !== 'actions')
-      : [];
-    const blocks = preserved.length
-      ? [statusBlock, ...preserved]
-      : [
-        {
-          type: 'section',
-          text: { type: 'mrkdwn', text: safeText },
-        },
-      ];
-    const result = await this._slack.chat.update({
+    return updateBlockActionCard({
+      slack: this._slack,
+      resolveLedger: (hint) => this._resolveAdapterEventLedger(hint),
       channel,
-      ts: messageTs,
-      text: safeText,
-      blocks,
+      messageTs,
+      text,
+      originalBlocks,
+      ledgerHint,
     });
-    const ledger = this._resolveAdapterEventLedger(ledgerHint);
-    try {
-      ledger?.recordAdapterEvent({
-        source: 'slack._updateBlockActionCard',
-        eventType: 'adapter.handler.update',
-        channel,
-        ts: result?.ts || messageTs,
-        platform: 'slack',
-        meta: { messageTs },
-      });
-    } catch (err) {
-      warn(TAG, `ledger record failed: ${err.message}`);
-    }
-    return result;
-  }
-
-  _resolveHandlerScript(profilePaths, actionId) {
-    if (!profilePaths?.scriptsDir) return null;
-    const handlersDir = join(profilePaths.scriptsDir, 'handlers');
-    for (const ext of HANDLER_EXTENSIONS) {
-      const candidate = join(handlersDir, `${actionId}${ext}`);
-      if (existsSync(candidate)) return candidate;
-    }
-    return null;
-  }
-
-  _getHandlerCommand(handlerPath) {
-    if (handlerPath.endsWith('.py')) return { command: 'python3', args: [handlerPath] };
-    if (handlerPath.endsWith('.sh')) return { command: '/bin/bash', args: [handlerPath] };
-    return { command: process.execPath, args: [handlerPath] };
-  }
-
-  async _dispatchBlockActionHandler({ body, action, actionId }) {
-    const channel = body.channel?.id || body.container?.channel_id;
-    const messageTs = body.container?.message_ts || body.message?.ts;
-    const threadTs = body.message?.thread_ts || messageTs || null;
-    const userId = body.user?.id || '';
-    const rawActionId = String(actionId || '').replace(/-/g, '_');
-    const originalBlocks = Array.isArray(body.message?.blocks) ? body.message.blocks : null;
-
-    if (!channel || !messageTs) {
-      warn(TAG, `block_action missing channel/message_ts: action_id=${rawActionId || 'unknown'}`);
-      return;
-    }
-
-    if (!BLOCK_ACTION_HANDLER_RE.test(rawActionId)) {
-      warn(TAG, `rejected block_action with invalid action_id: ${rawActionId || 'unknown'}`);
-      try {
-        await this._updateBlockActionCard(
-          channel,
-          messageTs,
-          `⚠️ 未注册 handler: ${formatSlackInlineCode(rawActionId || 'unknown')} · <@${userId || 'unknown'}>`,
-          originalBlocks,
-          { userId },
-        );
-      } catch (err) {
-        logError(TAG, `failed to update invalid handler message: ${err.message}`);
-      }
-      return;
-    }
-
-    let profilePaths = null;
-    try {
-      profilePaths = this._getProfilePaths ? this._getProfilePaths(userId) : null;
-    } catch (err) {
-      logError(TAG, `profile resolution failed for handler user=${userId}: ${err.message}`);
-    }
-    const profileName = profilePaths?.name || 'unknown';
-
-    const handlerPath = this._resolveHandlerScript(profilePaths, rawActionId);
-    if (!handlerPath) {
-      warn(TAG, `unregistered handler: action_id=${rawActionId} profile=${profileName}`);
-      try {
-        await this._updateBlockActionCard(
-          channel,
-          messageTs,
-          `⚠️ 未注册 handler: ${formatSlackInlineCode(rawActionId)} · <@${userId || 'unknown'}>`,
-          originalBlocks,
-          { userId },
-        );
-      } catch (err) {
-        logError(TAG, `failed to update unregistered handler message: ${err.message}`);
-      }
-      return;
-    }
-
-    if (this._blockActionInFlight.has(messageTs)) {
-      info(TAG, `block_action dedup: action_id=${rawActionId || 'unknown'} message_ts=${messageTs}`);
-      return;
-    }
-    this._rememberBlockActionMessage(messageTs);
-
-    const processingText = `⏳ 处理中… <@${userId}> clicked ${formatSlackInlineCode(rawActionId)}`;
-    try {
-      await this._updateBlockActionCard(channel, messageTs, processingText, originalBlocks, { userId });
-    } catch (err) {
-      logError(TAG, `failed to update handler processing message: ${err.message}`);
-    }
-
-    const responseUrl = body.response_url || body.response_urls?.[0]?.response_url || null;
-    const context = {
-      action_id: rawActionId,
-      value: action.value ?? null,
-      user_id: userId,
-      channel,
-      message_ts: messageTs,
-      thread_ts: threadTs,
-      profile: profilePaths?.name || null,
-      response_url: responseUrl,
-      message_blocks: originalBlocks,
-    };
-
-    mkdirSync(HANDLER_LOG_DIR, { recursive: true });
-    const logPath = join(
-      HANDLER_LOG_DIR,
-      `${rawActionId}-${Date.now()}-${String(messageTs).replace(/[^\d]+/g, '_') || 'message'}.log`
-    );
-    writeFileSync(
-      logPath,
-      `${new Date().toISOString()} action_id=${rawActionId} profile=${profileName} user_id=${userId || 'unknown'}\n${JSON.stringify(context)}\n\n`,
-      { flag: 'a' },
-    );
-
-    let logFd = null;
-    try {
-      const { command, args } = this._getHandlerCommand(handlerPath);
-      logFd = openSync(logPath, 'a');
-      const child = spawn(command, args, {
-        cwd: profilePaths?.scriptsDir || undefined,
-        detached: true,
-        stdio: ['pipe', logFd, logFd],
-      });
-
-      child.on('error', (err) => {
-        this._releaseBlockActionMessage(messageTs);
-        logError(TAG, `handler spawn error: action_id=${rawActionId} message_ts=${messageTs} error=${err.message}`);
-        this._updateBlockActionCard(
-          channel,
-          messageTs,
-          `⚠️ handler 启动失败: ${formatSlackInlineCode(rawActionId)}`,
-          originalBlocks,
-          { userId },
-        ).catch((updateErr) => {
-          logError(TAG, `failed to update handler spawn error message: ${updateErr.message}`);
-        });
-      });
-      child.stdin.on('error', () => {});
-      child.stdin.write(`${JSON.stringify(context)}\n`);
-      child.stdin.end();
-      child.unref();
-      closeSync(logFd);
-      logFd = null;
-
-      appendFileSync(
-        HANDLER_PID_LOG,
-        `${new Date().toISOString()} pid=${child.pid} profile=${profileName} action_id=${rawActionId} message_ts=${messageTs}\n`,
-        'utf-8',
-      );
-      info(TAG, `handler spawned: pid=${child.pid} profile=${profileName} action_id=${rawActionId} message_ts=${messageTs} log=${logPath}`);
-    } catch (err) {
-      this._releaseBlockActionMessage(messageTs);
-      logError(TAG, `failed to spawn handler: action_id=${rawActionId} message_ts=${messageTs} error=${err.message}`);
-      try {
-        await this._updateBlockActionCard(
-          channel,
-          messageTs,
-          `⚠️ handler 启动失败: ${formatSlackInlineCode(rawActionId)}`,
-          originalBlocks,
-          { userId },
-        );
-      } catch (updateErr) {
-        logError(TAG, `failed to update handler launch error message: ${updateErr.message}`);
-      }
-    } finally {
-      if (logFd != null) closeSync(logFd);
-    }
   }
 
   // --- Reply / Edit helpers ---
