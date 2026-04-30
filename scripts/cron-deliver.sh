@@ -50,8 +50,9 @@ STEP=""
 REASON=""
 DATE_OVERRIDE=""
 
-# Karry 的 DM channel id
-DM_CHANNEL="D0ANGB3M1CZ"
+# Profile owner DM channel for failure reports.
+# 走 env 注入；缺失时 --on-fail-dm 模式会显式报错，避免在公开仓硬编码个人 channel id。
+DM_CHANNEL="${ORB_FAILURE_DM_CHANNEL:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SLACK_SEND="$SCRIPT_DIR/slack-send-thread.sh"
@@ -91,6 +92,10 @@ today_jst() {
 if [[ "$ON_FAIL_DM" == true ]]; then
   if [[ -z "$STEP" || -z "$REASON" ]]; then
     echo "❌ --on-fail-dm 模式需要 --step 和 --reason" >&2
+    exit 1
+  fi
+  if [[ -z "$DM_CHANNEL" ]]; then
+    echo "❌ --on-fail-dm 模式需要环境变量 ORB_FAILURE_DM_CHANNEL（profile owner DM channel id）" >&2
     exit 1
   fi
   DATE_STR=$(today_jst)
