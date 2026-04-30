@@ -1,12 +1,12 @@
 import { join } from 'node:path';
 import net from 'node:net';
 import { randomUUID } from 'node:crypto';
-import { readdirSync, readFileSync, existsSync, statSync, unlinkSync, writeFileSync, mkdirSync } from 'node:fs';
+import { readdirSync, readFileSync, existsSync, unlinkSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { info, error as logError, warn } from './log.js';
 import { taskQueue } from './queue.js';
 import { sanitizeErrorText } from './format-utils.js';
-import { listFacts, storeLesson, storeCorrectionLesson, purgeTransient, lintMemory } from './memory.js';
+import { listFacts, storeLesson, storeCorrectionLesson } from './memory.js';
 import { spawnWorker } from './spawn.js';
 import { getDefaults } from './config.js';
 import { extractSuggestedPrompts } from './adapters/slack-format.js';
@@ -17,6 +17,10 @@ import {
   spawnSkillReview,
 } from './scheduler-skill-review.js';
 import {
+  checkMemorySync,
+  runMemoryMaintenance,
+} from './scheduler-memory-maintenance.js';
+import {
   ASSISTANT_TEXT_FINAL,
   CONTROL_PLANE_MESSAGE,
   METADATA_TITLE,
@@ -26,8 +30,6 @@ import { TurnDeliveryLedger, ledgerPathForDataDir } from './turn-delivery/ledger
 import { TurnDeliveryOrchestrator } from './turn-delivery/orchestrator.js';
 const TAG = 'scheduler';
 const DRAIN_TIMEOUT = 30_000;
-const MEMORY_SYNC_THRESHOLD = 20;    // cumulative tool uses before memory/user sync
-const MEMORY_SYNC_INTERVAL = 6 * 60 * 60 * 1000;  // min 6h between syncs per profile
 const MAX_AUTO_CONTINUE = 2;  // max auto-retries on empty result (context overflow)
 const PERMISSION_APPROVAL_TIMEOUT_MS = parseInt(process.env.ORB_PERMISSION_TIMEOUT_MS, 10) || 300_000;
 const STATUS_REFRESH_MS = 20_000;
@@ -1766,44 +1768,21 @@ export class Scheduler {
   // --- Memory + User profile sync ---
 
   _checkMemorySync(profileName, toolCount, task) {
-    if (!toolCount) return;
-
-    const prev = this._memorySyncCounts.get(profileName) || 0;
-    const next = prev + toolCount;
-    this._memorySyncCounts.set(profileName, next);
-
-    if (next < MEMORY_SYNC_THRESHOLD) return;
-
-    // Reset counter regardless of rate limit
-    this._memorySyncCounts.set(profileName, 0);
-
-    // Rate limit: min 6h between syncs
-    const lastSync = this._lastMemorySync.get(profileName) || 0;
-    if (Date.now() - lastSync < MEMORY_SYNC_INTERVAL) return;
-    this._lastMemorySync.set(profileName, Date.now());
-    info(TAG, `memory sync threshold reached: profile=${profileName} tools=${next}`);
-    this._spawnMemorySync(task);
+    return checkMemorySync({
+      profileName,
+      toolCount,
+      task,
+      memorySyncCounts: this._memorySyncCounts,
+      lastMemorySync: this._lastMemorySync,
+      getProfile: (userId) => this.getProfile(userId),
+    });
   }
 
-  // Memory housekeeping: purge transient facts, lint memory.db, GC image cache.
-  // MEMORY.md / USER.md distillation is retired — CLI-native auto-memory
-  // (~/.claude/projects/{cwd}/memory/) handles persistent preference tracking.
   async _spawnMemorySync(task) {
-    const { userId } = task;
-    const profile = this.getProfile(userId);
-    const dbPath = join(profile.dataDir, 'memory.db');
-
-    const transientReport = await purgeTransient(dbPath, { maxAgeDays: 7 }).catch(() => ({ purged: 0 }));
-    if (transientReport.purged > 0) {
-      info(TAG, `purged ${transientReport.purged} transient fact(s)`);
-    }
-
-    const lintReport = await lintMemory(dbPath, { fix: true }).catch(() => ({}));
-    if (lintReport.actions_taken?.length > 0) {
-      info(TAG, `memory lint: ${lintReport.actions_taken.length} actions — ${lintReport.actions_taken.join(', ')}`);
-    }
-
-    cleanupImages(profile.workspaceDir);
+    return runMemoryMaintenance({
+      task,
+      getProfile: (userId) => this.getProfile(userId),
+    });
   }
 
   shutdown(signal) {
@@ -1917,20 +1896,4 @@ export class Scheduler {
       process.exit(1);
     }, DRAIN_TIMEOUT);
   }
-}
-
-// ── Image GC ──
-
-function cleanupImages(workspaceDir) {
-  const imgDir = join(workspaceDir, '.images');
-  try {
-    const files = readdirSync(imgDir);
-    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
-    for (const f of files) {
-      const fp = join(imgDir, f);
-      try {
-        if (statSync(fp).mtimeMs < cutoff) unlinkSync(fp);
-      } catch {}
-    }
-  } catch {}
 }
