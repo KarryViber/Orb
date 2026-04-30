@@ -1,11 +1,7 @@
 /**
- * Memory bridge — Holographic (conversation) + DocStore (file knowledge).
+ * Memory bridge — Holographic conversation facts, trust scoring, HRR.
  *
- * Two independent SQLite databases:
- *   - memory.db  → Holographic: conversation facts, trust scoring, HRR
- *   - doc-index.db → DocStore: file chunks, FTS5 BM25 search
- *
- * Both called via Python subprocess bridges.
+ * Called via Python subprocess bridge.
  */
 
 import { execFile } from 'node:child_process';
@@ -13,9 +9,6 @@ import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { info, warn } from './log.js';
 import {
-  DOC_INDEX_DB,
-  DOC_INDEX_ENABLED,
-  ORB_DOC_RECALL_LIMIT,
   ORB_MEMORY_MIN_TRUST,
   ORB_MEMORY_RECALL_LIMIT,
   MEMORY_ENABLED,
@@ -24,18 +17,15 @@ import {
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const HOLOGRAPHIC_BRIDGE = join(__dirname, '..', 'lib', 'holographic', 'bridge.py');
-const DOCSTORE_BRIDGE = join(__dirname, '..', 'lib', 'docstore', 'bridge.py');
 const EXTRACT_SCRIPT = join(__dirname, '..', 'lib', 'holographic', 'extract.py');
 const DISTILL_SCRIPT = join(__dirname, '..', 'lib', 'holographic', 'distill.py');
 const LINT_SCRIPT = join(__dirname, '..', 'lib', 'holographic', 'memory-lint.py');
 const PYTHON = PYTHON_PATH;
-const DEFAULT_DOC_DB = DOC_INDEX_DB || '';  // explicit env override; profile dataDir preferred
 
 // Recall tuning — override via .env, no code change needed.
 // See spec architecture-hardening.md #30 for the parameter matrix.
 const MEMORY_RECALL_LIMIT = ORB_MEMORY_RECALL_LIMIT;
 const MEMORY_MIN_TRUST = ORB_MEMORY_MIN_TRUST;
-const DOC_RECALL_LIMIT = ORB_DOC_RECALL_LIMIT;
 const TAG = 'memory';
 
 function serializeError(error) {
@@ -133,29 +123,6 @@ function holographicBatchBridge(dbPath, operations) {
   });
 }
 
-// ── DocStore bridge (positional args) ──
-
-function docstoreBridge(dbPath, command, ...extraArgs) {
-  return new Promise((resolve, reject) => {
-    execFile(
-      PYTHON,
-      [DOCSTORE_BRIDGE, command, dbPath, ...extraArgs],
-      { timeout: 30_000, maxBuffer: 2 * 1024 * 1024 },
-      (err, stdout, stderr) => {
-        if (err) {
-          reject(createBridgeError(`docstore ${command} failed`, err, stderr));
-          return;
-        }
-        try {
-          resolve(JSON.parse(stdout.trim()));
-        } catch {
-          reject(new Error(`docstore ${command}: invalid JSON output`));
-        }
-      },
-    );
-  });
-}
-
 // ── Public API ──
 
 /**
@@ -174,28 +141,6 @@ export async function recallMemory(query, userId, dbPath) {
     return [];
   } catch (error) {
     logBridgeFallback('recallMemory', dbPath, error);
-    return [];
-  }
-}
-
-/**
- * Search indexed documents (file knowledge).
- * @param {string} query
- * @param {string} [dataDir] - Profile data directory (prefers dataDir/doc-index.db over env)
- * @param {string|null} [slug] - Optional project slug to scope search to a single project
- */
-export async function searchDocs(query, dataDir, slug = null) {
-  if (!DOC_INDEX_ENABLED || !query || DOC_RECALL_LIMIT <= 0) return [];
-  const db = (dataDir ? join(dataDir, 'doc-index.db') : '') || DEFAULT_DOC_DB;
-  try {
-    if (!db) return [];
-    const extraArgs = ['--limit', String(DOC_RECALL_LIMIT)];
-    if (slug) extraArgs.push('--slug', slug);
-    const results = await docstoreBridge(db, 'search', query, ...extraArgs);
-    if (Array.isArray(results)) return results;
-    return [];
-  } catch (error) {
-    logBridgeFallback('searchDocs', db, error);
     return [];
   }
 }

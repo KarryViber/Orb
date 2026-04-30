@@ -2,7 +2,8 @@ import { createHash } from 'node:crypto';
 import { readFileSync, existsSync, readdirSync } from 'node:fs';
 import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { recallMemory, searchDocs } from './memory.js';
+import { searchDocs } from './docstore.js';
+import { recallMemory } from './memory.js';
 import { warn } from './log.js';
 import {
   DOC_INDEX_DB,
