@@ -427,6 +427,7 @@ export function createSlackStatusSubscriber(adapter, { heartbeatMs = STATUS_HEAR
   };
 
   const refresh = async (state, { includeElapsed = true } = {}) => {
+    if (!turns.has(state?.key)) return;
     if (!state?.payload || typeof state.ctx?.applyThreadStatus !== 'function') return;
     const base = buildStatusText(state.payload);
     const status = includeElapsed && state.startedAt
@@ -448,6 +449,7 @@ export function createSlackStatusSubscriber(adapter, { heartbeatMs = STATUS_HEAR
 
       if (ctx?.deferDeliveryUntilResult || ctx?.channelSemantics === 'silent') return;
       const state = turns.get(key) || { payload: null, startedAt: 0, timer: null, ctx };
+      state.key = key;
       state.payload = msg.payload || {};
       state.startedAt = Date.now();
       state.ctx = ctx;
@@ -458,6 +460,17 @@ export function createSlackStatusSubscriber(adapter, { heartbeatMs = STATUS_HEAR
           refresh(state).catch((err) => warn(TAG, `[status_subscriber] heartbeat failed: ${err.message}`));
         }, heartbeatMs);
         if (typeof state.timer.unref === 'function') state.timer.unref();
+      }
+    },
+    clearByContext({ channel, threadTs } = {}) {
+      if (!channel || !threadTs) return;
+      for (const [key, state] of turns.entries()) {
+        const stCh = state.ctx?.channel || state.ctx?.task?.channel;
+        const stTs = state.ctx?.effectiveThreadTs || state.ctx?.threadTs || state.ctx?.task?.threadTs;
+        if (stCh === channel && stTs === threadTs) {
+          if (state.timer) clearInterval(state.timer);
+          turns.delete(key);
+        }
       }
     },
   };
@@ -895,6 +908,7 @@ export class SlackAdapter extends PlatformAdapter {
     this._blockActionInFlight = new Set();
     this._streams = new Map();
     this._teamId = null;
+    this._statusSubscriber = null;
 
     // Reaction dedupe (30s per ts+reaction, avoids add/remove/add loops)
     this._reactionDedupCache = new Map();
@@ -1887,7 +1901,14 @@ export class SlackAdapter extends PlatformAdapter {
   }
 
   createStatusSubscriber() {
-    return createSlackStatusSubscriber(this);
+    if (!this._statusSubscriber) {
+      this._statusSubscriber = createSlackStatusSubscriber(this);
+    }
+    return this._statusSubscriber;
+  }
+
+  clearStatusByContext({ channel, threadTs } = {}) {
+    this._statusSubscriber?.clearByContext?.({ channel, threadTs });
   }
 
   // --- Streaming helpers ---

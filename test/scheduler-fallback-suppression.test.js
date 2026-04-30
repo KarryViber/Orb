@@ -39,6 +39,9 @@ function makeAdapter() {
     async setThreadStatus(channel, threadTs, status, loadingMessages) {
       calls.push(['setThreadStatus', channel, threadTs, status, loadingMessages]);
     },
+    clearStatusByContext(ctx) {
+      calls.push(['clearStatusByContext', ctx]);
+    },
     createTextSubscriber() {
       return createSlackTextSubscriber(this, { debounceMs: 0 });
     },
@@ -116,6 +119,21 @@ test('turn_end alone marks responded=true (no fallback warning on subsequent exi
   ]);
 
   assert.equal(fallbackWarnings(calls).length, 0);
+});
+
+test('worker exit clears Slack status subscriber context after clearing thread status', async () => {
+  const calls = await runTask([
+    { msg: { type: 'turn_start' } },
+    { exit: { code: 0, signal: null } },
+  ], { warnLines: [] });
+
+  const clearStatusIndex = calls.findIndex((call) => call[0] === 'setThreadStatus' && call[3] === '');
+  const clearSubscriberIndex = calls.findIndex((call) => call[0] === 'clearStatusByContext');
+
+  assert.notEqual(clearStatusIndex, -1);
+  assert.notEqual(clearSubscriberIndex, -1);
+  assert.ok(clearStatusIndex < clearSubscriberIndex);
+  assert.deepEqual(calls[clearSubscriberIndex][1], { channel: 'C1', threadTs: '111.222' });
 });
 
 test('cc_event stream delivery suppresses fallback warning when IPC signals missing', async (t) => {

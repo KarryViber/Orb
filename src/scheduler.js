@@ -1618,6 +1618,7 @@ export class Scheduler {
         onExit: async (code, signal) => {
           await stopTyping();
           await applyThreadStatus('');
+          adapter?.clearStatusByContext?.({ channel, threadTs: effectiveThreadTs });
           if (currentCcTurnId) {
             try {
               await this._publishWorkerCcEvent({
