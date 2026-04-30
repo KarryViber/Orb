@@ -2,6 +2,7 @@ import { readFileSync, existsSync } from 'node:fs';
 import { warn } from './log.js';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { validateDmRoutingConfig } from './dm-routing-schema.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '..');
@@ -21,6 +22,11 @@ export function loadConfig(force = false) {
 
   // Deep interpolate env vars
   _config = interpolateEnv(parsed);
+  const dmRoutingErrors = validateDmRoutingConfig(_config);
+  if (dmRoutingErrors.length > 0) {
+    warn('config', `invalid adapters.slack.dmRouting.rules:\n- ${dmRoutingErrors.join('\n- ')}`);
+    throw new Error(`invalid adapters.slack.dmRouting.rules: ${dmRoutingErrors.join('; ')}`);
+  }
   _config._root = ROOT;
   return _config;
 }
