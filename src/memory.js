@@ -12,6 +12,15 @@ import { execFile } from 'node:child_process';
 import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { info, warn } from './log.js';
+import {
+  DOC_INDEX_DB,
+  DOC_INDEX_ENABLED,
+  ORB_DOC_RECALL_LIMIT,
+  ORB_MEMORY_MIN_TRUST,
+  ORB_MEMORY_RECALL_LIMIT,
+  MEMORY_ENABLED,
+  PYTHON_PATH,
+} from './runtime-env.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const HOLOGRAPHIC_BRIDGE = join(__dirname, '..', 'lib', 'holographic', 'bridge.py');
@@ -19,16 +28,14 @@ const DOCSTORE_BRIDGE = join(__dirname, '..', 'lib', 'docstore', 'bridge.py');
 const EXTRACT_SCRIPT = join(__dirname, '..', 'lib', 'holographic', 'extract.py');
 const DISTILL_SCRIPT = join(__dirname, '..', 'lib', 'holographic', 'distill.py');
 const LINT_SCRIPT = join(__dirname, '..', 'lib', 'holographic', 'memory-lint.py');
-const PYTHON = process.env.PYTHON_PATH || 'python3';
-const MEMORY_ENABLED = process.env.MEMORY_ENABLED !== 'false';
-const DOC_INDEX_ENABLED = process.env.DOC_INDEX_ENABLED !== 'false';
-const DEFAULT_DOC_DB = process.env.DOC_INDEX_DB || '';  // explicit env override; profile dataDir preferred
+const PYTHON = PYTHON_PATH;
+const DEFAULT_DOC_DB = DOC_INDEX_DB || '';  // explicit env override; profile dataDir preferred
 
 // Recall tuning — override via .env, no code change needed.
 // See spec architecture-hardening.md #30 for the parameter matrix.
-const MEMORY_RECALL_LIMIT = parseInt(process.env.ORB_MEMORY_RECALL_LIMIT || '10', 10);
-const MEMORY_MIN_TRUST = parseFloat(process.env.ORB_MEMORY_MIN_TRUST || '0.3');
-const DOC_RECALL_LIMIT = parseInt(process.env.ORB_DOC_RECALL_LIMIT || '8', 10);
+const MEMORY_RECALL_LIMIT = ORB_MEMORY_RECALL_LIMIT;
+const MEMORY_MIN_TRUST = ORB_MEMORY_MIN_TRUST;
+const DOC_RECALL_LIMIT = ORB_DOC_RECALL_LIMIT;
 const TAG = 'memory';
 
 function serializeError(error) {

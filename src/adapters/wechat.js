@@ -18,6 +18,7 @@ import { createCipheriv, createHash, randomUUID, randomBytes } from 'node:crypto
 import { info, error as logError, warn } from '../log.js';
 import { buildSendPayloads } from './wechat-format.js';
 import { PlatformAdapter } from './interface.js';
+import { ORB_PERMISSION_APPROVAL_MODE } from '../runtime-env.js';
 
 const TAG = 'wechat';
 
@@ -624,7 +625,7 @@ export class WeChatAdapter extends PlatformAdapter {
   }
 
   async sendApproval(channel, threadTs, prompt) {
-    const mode = process.env.ORB_PERMISSION_APPROVAL_MODE || 'auto-allow';
+    const mode = ORB_PERMISSION_APPROVAL_MODE;
     const renderedPrompt = formatApprovalPrompt(prompt);
     if (mode === 'auto-allow') {
       await this.sendReply(channel, threadTs, `[需要审批] ${renderedPrompt}\n（当前配置为 auto-allow，自动批准一次）`);

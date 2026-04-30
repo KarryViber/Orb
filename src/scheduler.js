@@ -34,10 +34,17 @@ import {
 } from './turn-delivery/intents.js';
 import { TurnDeliveryLedger, ledgerPathForDataDir } from './turn-delivery/ledger.js';
 import { TurnDeliveryOrchestrator } from './turn-delivery/orchestrator.js';
+import { makeCcEvent, makeInject, makeTask } from './ipc-schema.js';
+import {
+  ORB_EVENTBUS_SMOKE_LOG,
+  ORB_PERMISSION_APPROVAL_MODE,
+  ORB_PERMISSION_TIMEOUT_MS,
+  ORB_WORKER_TIMEOUT_MS,
+} from './runtime-env.js';
 const TAG = 'scheduler';
 const DRAIN_TIMEOUT = 30_000;
 const MAX_AUTO_CONTINUE = 2;  // max auto-retries on empty result (context overflow)
-const PERMISSION_APPROVAL_TIMEOUT_MS = parseInt(process.env.ORB_PERMISSION_TIMEOUT_MS, 10) || 300_000;
+const PERMISSION_APPROVAL_TIMEOUT_MS = ORB_PERMISSION_TIMEOUT_MS;
 const STATUS_REFRESH_MS = 20_000;
 const SILENT_PREFIX = '[SILENT]';
 const LOADING_MESSAGES = [
@@ -355,7 +362,7 @@ export class EventBus {
 export class Scheduler {
   constructor({ maxWorkers, timeoutMs, getProfile, startPermissionServer = true, spawnWorkerFn = spawnWorker }) {
     this.maxWorkers = maxWorkers || 3;
-    this.timeoutMs = timeoutMs || parseInt(process.env.ORB_WORKER_TIMEOUT_MS, 10) || 1_800_000;
+    this.timeoutMs = timeoutMs || ORB_WORKER_TIMEOUT_MS;
     this.getProfile = getProfile;
     this.eventBus = new EventBus();
     this.adapters = new Map();     // platform → adapter
@@ -371,10 +378,10 @@ export class Scheduler {
     this._spawnWorkerFn = spawnWorkerFn;
     this._turnDeliveryLedgers = new Map();
     this._pendingPermissionRequests = new Map();
-    this._permissionApprovalMode = process.env.ORB_PERMISSION_APPROVAL_MODE || 'auto-allow';
+    this._permissionApprovalMode = ORB_PERMISSION_APPROVAL_MODE;
     this._permissionSocketPath = join(tmpdir(), `orb-permission-scheduler-${process.pid}.sock`);
     this._permissionServer = null;
-    if (process.env.ORB_EVENTBUS_SMOKE_LOG === '1') {
+    if (ORB_EVENTBUS_SMOKE_LOG) {
       this.eventBus.subscribe({
         match: (msg) => msg?.type === 'cc_event',
         handle: (msg) => info(TAG, `eventBus cc_event: turn=${msg.turnId || 'unknown'} event=${msg.eventType || 'unknown'}`),
@@ -682,8 +689,7 @@ export class Scheduler {
       if (!entry.pendingInjects) entry.pendingInjects = new Map();
       entry.pendingInjects.set(injectId, injectTask);
       try {
-        entry.worker.send({
-          type: 'inject',
+        entry.worker.send(makeInject({
           injectId,
           userText: task.userText,
           fileContent: task.fileContent,
@@ -692,7 +698,7 @@ export class Scheduler {
           attemptId: injectTask.attemptId,
           origin: injectTask.origin,
           channelMeta: task.channelMeta,
-        });
+        }));
         info(TAG, `injected into active worker: thread=${threadTs}`);
         return;
       } catch (e) {
@@ -1255,8 +1261,7 @@ export class Scheduler {
 
     try {
       ({ worker } = this._spawnWorkerFn({
-        task: {
-          type: 'task',
+        task: makeTask({
           userText: effectiveText,
           fileContent,
           imagePaths: imagePaths || [],
@@ -1279,7 +1284,7 @@ export class Scheduler {
             workspaceDir: profile.workspaceDir,
             dataDir: profile.dataDir,
           },
-        },
+        }),
         timeout: this.timeoutMs,
         label: threadTs,
         onMessage: async (msg) => {
@@ -1520,13 +1525,12 @@ export class Scheduler {
           adapter?.clearStatusByContext?.({ channel, threadTs: effectiveThreadTs });
           if (currentCcTurnId) {
             try {
-              await this._publishWorkerCcEvent({
-                type: 'cc_event',
+              await this._publishWorkerCcEvent(makeCcEvent({
                 eventType: 'turn_abort',
                 turnId: currentCcTurnId,
                 origin: task.origin,
-                synthetic: true,
-              }, {
+                payload: { synthetic: true },
+              }), {
                 task,
                 turn,
                 worker,

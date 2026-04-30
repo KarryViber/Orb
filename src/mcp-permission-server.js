@@ -1,16 +1,17 @@
 import { randomUUID } from 'node:crypto';
 import { appendFileSync } from 'node:fs';
 import net from 'node:net';
+import { parseIntEnv, parseStringEnv } from './runtime-env.js';
 
 const SERVER_NAME = 'orb_permission';
 const TOOL_NAME = 'orb_request_permission';
 const STDIO_ENCODING = 'utf8';
-const PERMISSION_TIMEOUT_MS = parseInt(process.env.ORB_PERMISSION_TIMEOUT_MS, 10) || 300_000;
-const threadTs = process.env.ORB_THREAD_TS || '';
-const channel = process.env.ORB_CHANNEL || '';
-const userId = process.env.ORB_USER_ID || '';
-const schedulerSocketPath = process.env.ORB_SCHEDULER_SOCKET || '';
-const debugLogPath = process.env.ORB_MCP_PERMISSION_LOG || '';
+const PERMISSION_TIMEOUT_MS = parseIntEnv(process.env.ORB_PERMISSION_TIMEOUT_MS, 300_000);
+const threadTs = parseStringEnv(process.env.ORB_THREAD_TS, '');
+const channel = parseStringEnv(process.env.ORB_CHANNEL, '');
+const userId = parseStringEnv(process.env.ORB_USER_ID, '');
+const schedulerSocketPath = parseStringEnv(process.env.ORB_SCHEDULER_SOCKET, '');
+const debugLogPath = parseStringEnv(process.env.ORB_MCP_PERMISSION_LOG, '');
 
 process.stdin.on('error', () => {});
 process.stdout.on('error', () => {});

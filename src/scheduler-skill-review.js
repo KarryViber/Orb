@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { info } from './log.js';
 import { spawnWorker } from './spawn.js';
 import { assessSkillReviewTrigger } from './skill-review-trigger.js';
+import { makeTask } from './ipc-schema.js';
 
 const TAG = 'scheduler';
 export const SKILL_REVIEW_THRESHOLD = 10;
@@ -148,10 +149,10 @@ export function spawnSkillReview({
 
   let worker;
   ({ worker } = spawnWorker({
-    task: {
-      type: 'task',
+    task: makeTask({
       userText: reviewPrompt,
       fileContent: '',
+      imagePaths: [],
       threadTs: `skill-review-${Date.now()}`,
       channel: null,
       userId: null,
@@ -170,7 +171,7 @@ export function spawnSkillReview({
         workspaceDir: profile.workspaceDir,
         dataDir: profile.dataDir,
       },
-    },
+    }),
     timeout: 120_000,
     label: `skill-review:${profile.name}`,
     onMessage: () => {},

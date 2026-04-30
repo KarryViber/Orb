@@ -39,11 +39,12 @@ import {
   TASK_PROGRESS_START,
   TASK_PROGRESS_STOP,
 } from '../turn-delivery/intents.js';
+import { IMAGE_CACHE_DIR, ORB_STREAM_TRACE } from '../runtime-env.js';
 
 const TAG = 'slack';
 const MAX_USERNAME_CACHE = 500;
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const streamTrace = () => process.env.ORB_STREAM_TRACE === '1';
+const streamTrace = () => ORB_STREAM_TRACE;
 
 const QI_INITIAL_CHUNKS = [
   { type: 'plan_update', title: 'Orbiting...' },
@@ -862,7 +863,7 @@ export class SlackAdapter extends PlatformAdapter {
     this._botUserId = null;
     this._botId = null;
 
-    this._imageCacheDir = process.env.IMAGE_CACHE_DIR || join(homedir(), '.orb', 'cache', 'images');
+    this._imageCacheDir = IMAGE_CACHE_DIR;
 
     // Dedup
     this._seenMessages = new Map();

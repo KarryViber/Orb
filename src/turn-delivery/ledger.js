@@ -9,6 +9,7 @@ import {
   TASK_PROGRESS_APPEND,
   validateTurnDeliveryRecord,
 } from './intents.js';
+import { ORB_LEDGER_HYDRATE } from '../runtime-env.js';
 
 const TAG = 'turn-delivery-ledger';
 const HYDRATE_STABLE_INTENTS = new Set([
@@ -96,7 +97,7 @@ export class TurnDeliveryLedger {
   }
 
   _hydrateDeliveredKeys() {
-    if (process.env.ORB_LEDGER_HYDRATE === '0') return;
+    if (!ORB_LEDGER_HYDRATE) return;
     const filePath = this._resolveNdjsonPath();
     if (!filePath || !existsSync(filePath)) return;
     try {

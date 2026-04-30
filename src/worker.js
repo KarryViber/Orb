@@ -9,9 +9,30 @@ import { buildPrompt } from './context.js';
 import { getSessionId, updateSession } from './session.js';
 import { storeConversation } from './memory.js';
 import { resolveTurnCompleteText } from './worker-turn-text.js';
+import {
+  makeCcEvent,
+  makeError,
+  makeInjectFailed,
+  makeResult,
+  makeTurnComplete,
+  makeTurnEnd,
+  makeTurnStart,
+} from './ipc-schema.js';
+import {
+  CLAUDE_EFFORT,
+  CLAUDE_MODEL,
+  CLAUDE_PATH,
+  MAX_TURNS,
+  ORB_MCP_PERMISSION_LOG,
+  ORB_PERMISSION_TIMEOUT_MS,
+  PYTHON_PATH,
+  WORKER_IDLE_TIMEOUT_MS,
+  WORKSPACE_DIR,
+} from './runtime-env.js';
 
 /**
  * Worker IPC Protocol
+ * Schema source of truth: src/ipc-schema.js
  *
  * Scheduler -> Worker:
  *   { type: 'task', userText, fileContent, imagePaths, threadTs, channel,
@@ -40,11 +61,9 @@ import { resolveTurnCompleteText } from './worker-turn-text.js';
  *     - process-exit completion signal, not a UI stream primitive.
  */
 
-const CLAUDE_PATH = process.env.CLAUDE_PATH || 'claude';
-const PYTHON = process.env.PYTHON_PATH || 'python3';
+const PYTHON = PYTHON_PATH;
 const MEMORY_USAGE_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'lib', 'memory-usage');
-const MAX_TURNS = parseInt(process.env.MAX_TURNS, 10) || 50;
-const DEFAULT_PERMISSION_TIMEOUT_MS = parseInt(process.env.ORB_PERMISSION_TIMEOUT_MS, 10) || 300_000;
+const DEFAULT_PERMISSION_TIMEOUT_MS = ORB_PERMISSION_TIMEOUT_MS;
 const MCP_PERMISSION_TOOL_NOT_FOUND_RE = /MCP tool mcp__orb_permission__orb_request_permission[\s\S]*not found[\s\S]*Available MCP tools: none/i;
 const CLI_API_ERROR_RE = /\b(?:API Error|Internal server error|5\d\d|rate limit|overloaded|upstream)\b/i;
 const DEFAULT_WORKSPACE_ALLOW_RULES = [
@@ -120,13 +139,12 @@ process.on('message', async (msg) => {
       }
       const injected = _activeCli.inject(injectText, null, msg.imagePaths);
       if (injected) {
-        await ipcSend({ type: 'turn_start', injectId: msg.injectId || null, attemptId: msg.attemptId || null }).catch(() => {});
+        await ipcSend(makeTurnStart({ injectId: msg.injectId || null, attemptId: msg.attemptId || null })).catch(() => {});
         console.log(`[worker] injected: "${(msg.userText || '').slice(0, 60)}"`);
       } else {
         clearCcTurn();
         console.warn('[worker] inject rejected by CLI — signaling fail-forward');
-        await ipcSend({
-          type: 'inject_failed',
+        await ipcSend(makeInjectFailed({
           injectId: msg.injectId || null,
           attemptId: msg.attemptId || null,
           userText: msg.userText,
@@ -135,13 +153,12 @@ process.on('message', async (msg) => {
           channelMeta: msg.channelMeta,
           fragments: msg.fragments || _currentFragments,
           origin: msg.origin || _currentOrigin || null,
-        }).catch(() => {});
+        })).catch(() => {});
         _activeCli.close();
       }
     } else {
       console.warn('[worker] inject received but no active CLI — signaling fail-forward');
-      await ipcSend({
-        type: 'inject_failed',
+      await ipcSend(makeInjectFailed({
         injectId: msg.injectId || null,
         attemptId: msg.attemptId || null,
         userText: msg.userText,
@@ -150,7 +167,7 @@ process.on('message', async (msg) => {
         channelMeta: msg.channelMeta,
         fragments: msg.fragments || _currentFragments,
         origin: msg.origin || _currentOrigin || null,
-      }).catch(() => {});
+      })).catch(() => {});
       setImmediate(() => process.exit(0));
     }
     return;
@@ -166,7 +183,7 @@ process.on('message', async (msg) => {
     profileName: profile?.name,
     dataDir: profile?.dataDir || process.cwd(),
   });
-  await ipcSend({ type: 'turn_start', attemptId: attemptId || null }).catch(() => {});
+  await ipcSend(makeTurnStart({ attemptId: attemptId || null })).catch(() => {});
 
   // Fail-fast: skill-review mode without context produces "no skill" noise.
   // Without real content to review the worker is just burning tokens on nothing.
@@ -175,13 +192,11 @@ process.on('message', async (msg) => {
     if (!hasCtx) {
       console.error('[worker] skill-review invoked without priorConversation, skipping');
       try {
-        process.send({
-          type: 'result',
+        process.send(makeResult({
           text: '',
           toolCount: 0,
           channelSemantics: _currentChannelSemantics,
-          exitOnly: true,
-        });
+        }));
       } catch {}
       setImmediate(() => process.exit(0));
       return;
@@ -195,14 +210,14 @@ process.on('message', async (msg) => {
     const resolvedWorkspace = resolve(profile.workspaceDir);
     const resolvedData = resolve(profile.dataDir);
     if (!resolvedWorkspace.startsWith(profileRoot) || !resolvedData.startsWith(profileRoot)) {
-      process.send({ type: 'error', error: `path traversal blocked: workspace=${resolvedWorkspace}` });
+      process.send(makeError({ error: `path traversal blocked: workspace=${resolvedWorkspace}` }));
       process.exit(1);
       return;
     }
   }
 
   // Use profile-specific workspace, fallback to env/cwd
-  const WORKSPACE = profile?.workspaceDir || process.env.WORKSPACE_DIR || process.cwd();
+  const WORKSPACE = profile?.workspaceDir || WORKSPACE_DIR || process.cwd();
 
   // Session key includes platform to avoid collisions
   const sessionKey = platform ? `${platform}:${threadTs}` : threadTs;
@@ -268,8 +283,8 @@ process.on('message', async (msg) => {
     const turns = Number.isFinite(maxTurns) && maxTurns > 0 ? maxTurns : MAX_TURNS;
     const streamArgs = [
       '--max-turns', String(turns),
-      ...(model || process.env.CLAUDE_MODEL ? ['--model', model || process.env.CLAUDE_MODEL] : []),
-      ...(effort || process.env.CLAUDE_EFFORT ? ['--effort', effort || process.env.CLAUDE_EFFORT] : []),
+      ...(model || CLAUDE_MODEL ? ['--model', model || CLAUDE_MODEL] : []),
+      ...(effort || CLAUDE_EFFORT ? ['--effort', effort || CLAUDE_EFFORT] : []),
       '--input-format', 'stream-json',
       '--output-format', 'stream-json',
       '--exclude-dynamic-system-prompt-sections',
@@ -309,19 +324,18 @@ process.on('message', async (msg) => {
         }).catch((err) => console.warn(`[worker] memory usage record failed: ${err.message}`));
         if (turn.text?.trim()) {
           const gitDiffSummary = await collectGitDiffSummary(WORKSPACE, _currentTurnModifiedPaths);
-          await ipcSend({
-            type: 'turn_complete',
+          await ipcSend(makeTurnComplete({
             text: turn.text,
             toolCount: turn.toolCount,
             lastTool: turn.lastTool,
             stopReason: turn.stopReason,
             channelSemantics: _currentChannelSemantics,
             gitDiffSummary,
-          });
+          }));
         }
       });
       cli.setOnTurnEnd(async () => {
-        await ipcSend({ type: 'turn_end' }).catch(() => {});
+        await ipcSend(makeTurnEnd()).catch(() => {});
         clearCcTurn();
       });
 
@@ -378,8 +392,7 @@ process.on('message', async (msg) => {
     const cliFailure = exitResult.code !== 0 || (!exitResult.stopReason && CLI_API_ERROR_RE.test(stderrSummary));
     const resultStopReason = exitResult.stopReason
       || (cliFailure ? (CLI_API_ERROR_RE.test(stderrSummary) ? 'api_error' : 'cli_error') : null);
-    await ipcSend({
-      type: 'result',
+    await ipcSend(makeResult({
       text: '',
       toolCount: exitResult.toolCount,
       lastTool: exitResult.lastTool,
@@ -388,18 +401,17 @@ process.on('message', async (msg) => {
       exitOnly: true,
       exitCode: exitResult.code,
       stderrSummary,
-    });
+    }));
 
     const memDbPath = join(dataDir, 'memory.db');
     storeConversation({ userText, responseText: exitResult.lastTurnText || '', threadTs, userId, dbPath: memDbPath }).catch(() => {});
 
   } catch (err) {
-    await ipcSend({
-      type: 'error',
+    await ipcSend(makeError({
       error: err.message,
       // 附带上下文供教训蒸馏
       errorContext: { userText: (userText || '').slice(0, 2000) },
-    }).catch(() => {});
+    })).catch(() => {});
   } finally {
     cleanupTempFile(mcpConfigPath);
   }
@@ -409,7 +421,7 @@ process.on('message', async (msg) => {
   setImmediate(() => process.exit(0));
 });
 
-const IDLE_TIMEOUT = parseInt(process.env.WORKER_IDLE_TIMEOUT_MS, 10) || 60_000; // idle → close stdin → CLI exits
+const IDLE_TIMEOUT = WORKER_IDLE_TIMEOUT_MS; // idle → close stdin → CLI exits
 function truncateText(text, maxChars) {
   const normalized = String(text || '').replace(/\s+\n/g, '\n').trim();
   if (normalized.length <= maxChars) return normalized;
@@ -710,14 +722,13 @@ function writeCcEvent({ event_type, payload }) {
 
 function sendCcEvent(eventType, payload) {
   if (!_currentTurnId) return;
-  ipcSend({
-    type: 'cc_event',
+  ipcSend(makeCcEvent({
     turnId: _currentTurnId,
     attemptId: _currentAttemptId || null,
     origin: _currentOrigin || null,
     eventType,
     payload,
-  }).catch(() => {});
+  })).catch(() => {});
 }
 
 function truncate256(text) {
@@ -1184,7 +1195,7 @@ function schedulerSocketPathForPid(pid) {
 }
 
 function buildWorkerMcpConfig({ threadTs, channel, userId, permissionTimeoutMs, workspace }) {
-  const workspaceDir = workspace || process.env.WORKSPACE_DIR || process.cwd();
+  const workspaceDir = workspace || WORKSPACE_DIR || process.cwd();
   const configPath = join(
     tmpdir(),
     `orb-mcp-${process.pid}-${sanitizeFileToken(threadTs)}.json`,
@@ -1201,7 +1212,7 @@ function buildWorkerMcpConfig({ threadTs, channel, userId, permissionTimeoutMs, 
         ORB_CHANNEL: String(channel || ''),
         ORB_USER_ID: String(userId || ''),
         ORB_PERMISSION_TIMEOUT_MS: String(permissionTimeoutMs || DEFAULT_PERMISSION_TIMEOUT_MS),
-        ...(process.env.ORB_MCP_PERMISSION_LOG ? { ORB_MCP_PERMISSION_LOG: process.env.ORB_MCP_PERMISSION_LOG } : {}),
+        ...(ORB_MCP_PERMISSION_LOG ? { ORB_MCP_PERMISSION_LOG } : {}),
       },
     },
   };
