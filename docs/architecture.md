@@ -101,7 +101,7 @@ The authoritative reference for payload fields lives in [`/CLAUDE.md`](../CLAUDE
 | `turn_end` | none | Claude CLI produced a `result` event for the current turn; scheduler stops typing |
 | `turn_complete` | `text`, `toolCount`, `lastTool`, `stopReason`, `channelSemantics`, `deliveredTexts`, optional `undeliveredText`, `gitDiffSummary` | One Claude turn finished; scheduler delivers final text while keeping the worker alive for follow-up `inject` |
 | `cc_event` | `turnId`, `eventType`, `payload`, optional `attemptId`, `origin` | Raw Claude Code event forwarded to scheduler subscribers; drives Slack Qi/plan/text/status rendering |
-| `inject_failed` | `userText`, optional `injectId`, `attemptId`, `fileContent`, `imagePaths` | Follow-up inject could not reach the live CLI session; scheduler fails forward by replaying through a fresh worker |
+| `inject_failed` | `userText`, optional `injectId`, `attemptId`, `fileContent`, `imagePaths`, `fragments?: LabeledFragment[]` | Follow-up inject could not reach the live CLI session; scheduler fails forward by replaying through a fresh worker |
 | `error` | `error`, optional `errorContext` | Terminal failure |
 | `result` | `text` (usually empty), `stopReason`, `channelSemantics`, `exitOnly: true`, optional `toolCount`, `lastTool`, `exitCode`, `stderrSummary` | Worker process-exit signal; final text already delivered via `turn_complete`. Kept for lifecycle / non-success `stopReason` surfacing |
 

@@ -1129,7 +1129,9 @@ function sanitizeFileToken(value) {
 
 function buildUserContent({ userText, fileContent, imagePaths, workspace }) {
   let text = userText || '';
-  if (fileContent) text += `\n\n---\n\n## 附件\n${fileContent}`;
+  if (fileContent) {
+    console.warn('[worker] ignored raw fileContent in buildUserContent; context.js must render attachments');
+  }
   return [
     ...buildImageBlocks(imagePaths, workspace),
     { type: 'text', text },
