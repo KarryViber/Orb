@@ -9,14 +9,20 @@ incoming message
     |
     v
 adapter -> scheduler -> worker -> Claude Code CLI
-              |            |
-              |            +--> build Orb-managed prompt additions
-              |            +--> memory bridge
-              |            +--> docstore bridge
-              |
-              +--> permission socket server
-              +--> cron scheduler
+    ^         |   ^        |
+    |         |   |        +--> build Orb-managed prompt additions
+    |         |   |        +--> memory bridge
+    |         |   |        +--> docstore bridge
+    |         |   |
+    |         |   +-- cc_event / turn_complete / result IPC
+    |         |
+    |         +--> turn-delivery orchestrator (single egress owner) ----+
+    |         +--> permission socket server                              |
+    |         +--> cron scheduler                                        |
+    +------------------------------------------------------------------- +
 ```
+
+User-visible output flows back through the channel-typed `TurnDeliveryOrchestrator`; scheduler and adapter subscribers never call platform message APIs directly. See [turn-delivery-architecture.md](turn-delivery-architecture.md).
 
 Main modules:
 
@@ -74,28 +80,32 @@ This split keeps stable prompt material on Claude Code's side and reduces Orb-sp
 
 ## IPC Protocol
 
-Scheduler and worker communicate over Node IPC.
+Scheduler and worker communicate over Node IPC (`process.send` / `on('message')`).
+
+The authoritative reference for payload fields lives in [`/CLAUDE.md`](../CLAUDE.md#worker-ipc-protocol) (§ Worker IPC Protocol) and the worker source header comment in `src/worker.js`. Adding or changing message types requires updating both, plus this section.
 
 ### Scheduler -> Worker
 
 | Type | Payload | Purpose |
 | --- | --- | --- |
-| `task` | `userText`, `fileContent`, `imagePaths`, `threadTs`, `channel`, `userId`, `platform`, `threadHistory`, `profile`, `model`, `effort`, optional `mode` and `priorConversation` | Start a new turn |
-| `inject` | `userText`, optional `fileContent`, optional `imagePaths` | Continue an active same-thread session |
+| `task` | `userText`, `fileContent`, `imagePaths`, `threadTs`, `channel`, `userId`, `platform`, `threadHistory`, `profile`, `model`, `effort`, `attemptId`, optional `channelSemantics`, `channelMeta`, `origin`, `maxTurns`, `mode`, `priorConversation`, `disablePermissionPrompt` | Start a new turn for a thread |
+| `inject` | `userText`, optional `injectId`, `attemptId`, `fileContent`, `imagePaths`, `channelMeta`, `origin` | Continue an active same-thread Claude session without forking a new worker |
+
+`attemptId` threads through every downstream IPC payload for delivery-ledger correlation. `origin` (`{ kind: 'cron' | 'inject' | 'user' | 'system', name, parentAttemptId }`) tags the trigger source for replay/debug attribution. `channelSemantics` is `'reply'` (default), `'silent'` (suppress successful worker text delivery), or reserved `'broadcast'`. See [turn-delivery-architecture.md](turn-delivery-architecture.md) for how these flow through the egress orchestrator.
 
 ### Worker -> Scheduler
 
 | Type | Payload | Purpose |
 | --- | --- | --- |
-| `turn_start` | none | Scheduler owns typing from this point |
-| `progress_update` | `text` | Todo/progress card update |
-| `intermediate_text` | `text` | Mid-turn assistant text |
-| `turn_end` | none | Turn finished on Claude side |
-| `turn_complete` | `text`, `toolCount`, `lastTool`, `stopReason`, `deliveredTexts`, optional `undeliveredText` | Deliver one Claude turn while keeping the worker alive |
-| `result` | `text`, `toolCount`, optional `lastTool`, optional `stopReason` | Final worker result before exit |
+| `turn_start` | optional `injectId`, `attemptId` | Worker received a task or accepted inject; scheduler owns typing from this point |
+| `turn_end` | none | Claude CLI produced a `result` event for the current turn; scheduler stops typing |
+| `turn_complete` | `text`, `toolCount`, `lastTool`, `stopReason`, `channelSemantics`, `deliveredTexts`, optional `undeliveredText`, `gitDiffSummary` | One Claude turn finished; scheduler delivers final text while keeping the worker alive for follow-up `inject` |
+| `cc_event` | `turnId`, `eventType`, `payload`, optional `attemptId`, `origin` | Raw Claude Code event forwarded to scheduler subscribers; drives Slack Qi/plan/text/status rendering |
+| `inject_failed` | `userText`, optional `injectId`, `attemptId`, `fileContent`, `imagePaths` | Follow-up inject could not reach the live CLI session; scheduler fails forward by replaying through a fresh worker |
 | `error` | `error`, optional `errorContext` | Terminal failure |
+| `result` | `text` (usually empty), `stopReason`, `channelSemantics`, `exitOnly: true`, optional `toolCount`, `lastTool`, `exitCode`, `stderrSummary` | Worker process-exit signal; final text already delivered via `turn_complete`. Kept for lifecycle / non-success `stopReason` surfacing |
 
-This is the contract that keeps scheduling concerns separate from Claude-process concerns.
+This is the contract that keeps scheduling concerns separate from Claude-process concerns. The legacy `progress_update` and `intermediate_text` types are gone — Slack UI rendering now derives entirely from the `cc_event` stream.
 
 ## Claude CLI Session Model
 
@@ -215,3 +225,6 @@ These rules define the architecture and should not drift casually:
 - [getting-started.md](getting-started.md)
 - [configuration.md](configuration.md)
 - [profile-guide.md](profile-guide.md)
+- [turn-delivery-architecture.md](turn-delivery-architecture.md) — channel-typed egress orchestrator that owns user-visible turn output
+- [adapter-development.md](adapter-development.md)
+- [memory-policy.md](memory-policy.md)
