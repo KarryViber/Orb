@@ -9,8 +9,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 _SCRIPTS_DIR = Path('/Users/karry/Orb/profiles/karry/scripts')
-if str(_SCRIPTS_DIR) not in sys.path:
-  sys.path.insert(0, str(_SCRIPTS_DIR))
+_ROOT_SCRIPTS_DIR = Path('/Users/karry/Orb/scripts')
+for _path in (_ROOT_SCRIPTS_DIR, _SCRIPTS_DIR):
+  if str(_path) not in sys.path:
+    sys.path.insert(0, str(_path))
 from cron_run_log import RunLog  # noqa: E402
 from lib.archive_audit import append_archive_event  # noqa: E402
 
