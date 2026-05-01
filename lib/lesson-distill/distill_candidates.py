@@ -132,8 +132,11 @@ def slack_post(token, channel, blocks, text):
 
 def card(candidate_path, meta, lesson, apply):
   value = str(candidate_path)
+  source = meta.get("source", "unknown")
+  cron_name = meta.get("cron_name")
+  label = f"`{source}` · {cron_name}" if cron_name else f"`{source}`"
   return [
-    {"type": "section", "text": {"type": "mrkdwn", "text": f"*Lesson candidate* `{meta.get('source', 'unknown')}`\n{lesson}\n\n*How to apply*\n{apply}"}},
+    {"type": "section", "text": {"type": "mrkdwn", "text": f"*Lesson candidate* {label}\n{lesson}\n\n*How to apply*\n{apply}"}},
     {"type": "context", "elements": [{"type": "mrkdwn", "text": f"`{candidate_path}`"}]},
     {"type": "actions", "elements": [
       {"type": "button", "text": {"type": "plain_text", "text": "收录"}, "style": "primary", "action_id": "lesson_candidate_approve", "value": value},
@@ -175,7 +178,9 @@ def main():
         continue
       processed += 1
       lesson, apply = build_lesson_text(meta)
-      fallback = f"Lesson candidate: {meta.get('source', 'unknown')}"
+      _source = meta.get('source', 'unknown')
+      _cron_name = meta.get('cron_name')
+      fallback = f"Lesson candidate: {_source} · {_cron_name}" if _cron_name else f"Lesson candidate: {_source}"
       blocks = card(path, meta, lesson, apply)
       validate_payload(path, blocks, fallback)
 
