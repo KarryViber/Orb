@@ -45,9 +45,9 @@ function makeSlackRecorder() {
   };
 }
 
-function fakeChild(stdinWrites) {
+function fakeChild(stdinWrites, pid = 4242) {
   const child = new EventEmitter();
-  child.pid = 4242;
+  child.pid = pid;
   child.stdin = new EventEmitter();
   child.stdin.write = (value) => stdinWrites.push(value);
   child.stdin.end = () => {};
@@ -155,6 +155,44 @@ test('block action spawn failure releases dedup and writes launch error back', a
   assert.equal(inFlight.has('111.222'), false);
   assert.equal(updates.length, 2);
   assert.match(updates[1].text, /handler 启动失败/);
+});
+
+test('block action handler timeout kills child, releases dedup, and updates card', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'orb-handler-timeout-'));
+  const scriptsDir = join(root, 'scripts');
+  mkdirSync(join(scriptsDir, 'handlers'), { recursive: true });
+  writeFileSync(join(scriptsDir, 'handlers', 'seed_water.py'), 'print("ok")\n');
+  const { slack, updates } = makeSlackRecorder();
+  const inFlight = new Set();
+  const killed = [];
+  t.mock.method(process, 'kill', (pid, signal) => {
+    killed.push([pid, signal]);
+    return true;
+  });
+
+  await dispatchBlockActionHandler({
+    body: makeBody(),
+    action: { action_id: 'seed_water', value: 'seed-1' },
+    actionId: 'seed_water',
+    slack,
+    getProfilePaths: () => ({ name: 'test', scriptsDir }),
+    resolveLedger: () => null,
+    inFlight,
+    logDir: join(root, 'logs'),
+    pidLog: join(root, 'logs', 'pids.log'),
+    handlerTimeoutMs: 5,
+    spawnImpl() {
+      return fakeChild([], 999999);
+    },
+  });
+
+  assert.equal(inFlight.has('111.222'), true);
+  await delay(25);
+  assert.deepEqual(killed[0], [999999, 'SIGTERM']);
+  assert.equal(inFlight.has('111.222'), false);
+  assert.equal(updates.length, 2);
+  assert.match(updates[1].text, /handler 超时（5min）已强制终止/);
+  assert.match(updates[1].text, /seed_water/);
 });
 
 test('block action dedup entry expires after ttl', async () => {

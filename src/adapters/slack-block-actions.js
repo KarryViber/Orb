@@ -11,6 +11,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 export const BLOCK_ACTION_HANDLER_RE = /^[a-z][a-z0-9_]{0,63}$/;
 export const HANDLER_EXTENSIONS = ['.py', '.sh', '.js'];
 export const HANDLER_DEDUP_TTL = 10 * 60 * 1000;
+export const HANDLER_HARD_TIMEOUT_MS = 5 * 60 * 1000;
 export const HANDLER_LOG_DIR = join(__dirname, '..', '..', 'logs', 'handlers');
 export const HANDLER_PID_LOG = join(HANDLER_LOG_DIR, 'pids.log');
 
@@ -143,6 +144,7 @@ export async function dispatchBlockActionHandler({
   spawnImpl = spawnProcess,
   logDir = HANDLER_LOG_DIR,
   pidLog = HANDLER_PID_LOG,
+  handlerTimeoutMs = HANDLER_HARD_TIMEOUT_MS,
 }) {
   const channel = body.channel?.id || body.container?.channel_id;
   const messageTs = body.container?.message_ts || body.message?.ts;
@@ -241,7 +243,31 @@ export async function dispatchBlockActionHandler({
       stdio: ['pipe', logFd, logFd],
     });
 
+    let killHandle = null;
+    const timeoutHandle = setTimeout(() => {
+      try {
+        process.kill(child.pid, 'SIGTERM');
+        killHandle = setTimeout(() => {
+          try {
+            process.kill(child.pid, 'SIGKILL');
+          } catch {}
+        }, 5_000);
+        killHandle.unref?.();
+      } catch {}
+      releaseBlockActionMessage(inFlight, messageTs);
+      updateCard(`⚠️ handler 超时（5min）已强制终止: ${formatSlackInlineCode(rawActionId)}`).catch((updateErr) => {
+        logError(TAG, `failed to update handler timeout message: ${updateErr.message}`);
+      });
+    }, handlerTimeoutMs);
+    timeoutHandle.unref?.();
+
+    child.on('exit', () => {
+      clearTimeout(timeoutHandle);
+      if (killHandle) clearTimeout(killHandle);
+    });
     child.on('error', (err) => {
+      clearTimeout(timeoutHandle);
+      if (killHandle) clearTimeout(killHandle);
       releaseBlockActionMessage(inFlight, messageTs);
       logError(TAG, `handler spawn error: action_id=${rawActionId} message_ts=${messageTs} error=${err.message}`);
       updateCard(`⚠️ handler 启动失败: ${formatSlackInlineCode(rawActionId)}`).catch((updateErr) => {
