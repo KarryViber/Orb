@@ -186,3 +186,41 @@ test('non-success result sends cron failure receipt instead of auto-continue', a
   assert.equal(replies[0][1], 'C1');
   assert.match(replies[0][3], /^⚠️ skill-promotion-tick \d{2}\/\d{2}｜失败：LLM｜API Error: 500 Internal server error$/);
 });
+
+test('empty silent successful turn_complete suppresses result auto-continue', async (t) => {
+  const warnLines = [];
+  t.mock.method(console, 'warn', (line) => warnLines.push(String(line)));
+
+  const calls = await runTask([
+    { msg: { type: 'turn_start' } },
+    {
+      msg: {
+        type: 'turn_complete',
+        text: '',
+        toolCount: 0,
+        stopReason: 'success',
+        channelSemantics: 'silent',
+      },
+    },
+    {
+      msg: {
+        type: 'result',
+        text: '',
+        exitOnly: true,
+        stopReason: 'success',
+        channelSemantics: 'silent',
+      },
+    },
+    { exit: { code: 0, signal: null } },
+  ], {
+    taskOverrides: {
+      threadTs: 'cron:empty-silent',
+      deliveryThreadTs: null,
+      channelSemantics: 'silent',
+      deferDeliveryUntilResult: true,
+    },
+  });
+
+  assert.equal(fallbackWarnings(calls).length, 0);
+  assert.equal(warnLines.some((line) => line.includes('auto-continue')), false);
+});

@@ -1483,6 +1483,9 @@ export class Scheduler {
 
           if (msg.type === 'turn_complete') {
             finalStopReason = msg.stopReason || finalStopReason;
+            if (msg.channelSemantics === 'silent' && isSuccessfulStopReason(msg.stopReason)) {
+              suppressedSuccessObserved = true;
+            }
             await stopTyping();
             const deliveryText = typeof msg?.text === 'string' ? msg.text : '';
             const metadataText = deliveryText;
