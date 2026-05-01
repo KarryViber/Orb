@@ -34,7 +34,6 @@ import {
 } from './turn-delivery/intents.js';
 import { TurnDeliveryLedger, ledgerPathForDataDir } from './turn-delivery/ledger.js';
 import { TurnDeliveryOrchestrator } from './turn-delivery/orchestrator.js';
-import { createTurnDeliveryCcEventSubscriber } from './turn-delivery/cc-event-subscriber.js';
 import { makeCcEvent, makeInject, makeTask, validateIncomingIpc } from './ipc-schema.js';
 import {
   ORB_EVENTBUS_SMOKE_LOG,
@@ -449,11 +448,8 @@ export class Scheduler {
       });
     }
     this.adapters.set(name, adapter);
-    if (name === 'slack') {
-      if (!adapter.__orbTurnDeliveryCcEventUnsubscribe) {
-        adapter.__orbTurnDeliveryCcEventSubscriber = createTurnDeliveryCcEventSubscriber();
-        adapter.__orbTurnDeliveryCcEventUnsubscribe = this.eventBus.subscribe(adapter.__orbTurnDeliveryCcEventSubscriber);
-      }
+    if (typeof adapter.installCcEventSubscriber === 'function') {
+      adapter.installCcEventSubscriber(this.eventBus);
     }
     setImmediate(() => {
       this.replayQueuedTasks().catch((err) => {

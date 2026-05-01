@@ -47,6 +47,7 @@ import {
   TASK_PROGRESS_START,
   TASK_PROGRESS_STOP,
 } from '../turn-delivery/intents.js';
+import { createTurnDeliveryCcEventSubscriber } from '../turn-delivery/cc-event-subscriber.js';
 import { IMAGE_CACHE_DIR, ORB_STREAM_TRACE } from '../runtime-env.js';
 
 const TAG = 'slack';
@@ -203,6 +204,12 @@ export class SlackAdapter extends PlatformAdapter {
 
   get supportsInteractiveApproval() {
     return true;
+  }
+
+  installCcEventSubscriber(eventBus) {
+    if (this.__orbTurnDeliveryCcEventUnsubscribe) return;
+    this.__orbTurnDeliveryCcEventSubscriber = createTurnDeliveryCcEventSubscriber();
+    this.__orbTurnDeliveryCcEventUnsubscribe = eventBus.subscribe(this.__orbTurnDeliveryCcEventSubscriber);
   }
 
   get capabilities() {
