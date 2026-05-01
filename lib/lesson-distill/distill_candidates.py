@@ -147,9 +147,19 @@ def main():
   log = RunLog("failure-lesson-distill")
   parser = argparse.ArgumentParser()
   parser.add_argument("--data-dir", required=True)
-  parser.add_argument("--channel", default=os.environ.get("LESSON_DISTILL_CHANNEL", "CXXXXXXXXXX"))
+  parser.add_argument("--channel", default=os.environ.get("LESSON_DISTILL_CHANNEL"))
+  parser.add_argument("--channel-name", dest="channel_name", help="Slack 频道名（从 config.json profiles.<profile>.channels 反查）")
   parser.add_argument("--dry-run", action="store_true")
   args = parser.parse_args()
+  if args.channel_name and args.channel:
+    parser.error("--channel 和 --channel-name 不能同时使用")
+  if args.channel_name:
+    import subprocess
+    args.channel = subprocess.check_output(
+        ["python3", "/Users/karry/Orb/scripts/cron/channels-resolve.py", args.channel_name]
+    ).decode().strip()
+  if not args.channel:
+    args.channel = "CXXXXXXXXXX"  # 兼容旧默认值
 
   candidates = sorted(Path(args.data_dir, "lesson-candidates").glob("*.md"))
   token = os.environ.get("SLACK_BOT_TOKEN") or os.environ.get("SLACK_TOKEN")

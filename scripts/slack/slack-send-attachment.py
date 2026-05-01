@@ -54,12 +54,22 @@ def plain_fallback(header: str, body: str) -> str:
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--channel", required=True)
+parser.add_argument("--channel", help="Slack channel ID（与 --channel-name 二选一）")
+parser.add_argument("--channel-name", dest="channel_name", help="Slack 频道名（从 config.json profiles.<profile>.channels 反查）")
 parser.add_argument("--thread-ts", required=True)
 parser.add_argument("--color", default="#5865F2", help="兼容旧参数，已忽略")
 parser.add_argument("--header", default="")
 parser.add_argument("--body", required=True)
 args = parser.parse_args()
+if args.channel_name and args.channel:
+    parser.error("--channel 和 --channel-name 不能同时使用")
+if args.channel_name:
+    import subprocess
+    args.channel = subprocess.check_output(
+        ["python3", "/Users/karry/Orb/scripts/cron/channels-resolve.py", args.channel_name]
+    ).decode().strip()
+if not args.channel:
+    parser.error("必须提供 --channel 或 --channel-name")
 args.body = args.body.replace("\\n", "\n")
 
 header = sanitize_mrkdwn(args.header.strip())

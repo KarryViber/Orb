@@ -78,12 +78,22 @@ def send_blockkit(channel, text, blocks, color="#2eb886", thread_ts=None):
 
 def main():
     parser = argparse.ArgumentParser(description="Send Slack Block Kit message")
-    parser.add_argument("--channel", required=True, help="Slack channel ID")
+    parser.add_argument("--channel", help="Slack channel ID（与 --channel-name 二选一）")
+    parser.add_argument("--channel-name", dest="channel_name", help="Slack 频道名（从 config.json profiles.<profile>.channels 反查）")
     parser.add_argument("--thread", help="Thread timestamp for reply")
     parser.add_argument("--text", required=True, help="Fallback text / notification text")
     parser.add_argument("--color", default="#2eb886", help="兼容旧参数，已忽略")
     parser.add_argument("--blocks", help="JSON file with blocks array (reads stdin if omitted)")
     args = parser.parse_args()
+    if args.channel_name and args.channel:
+        parser.error("--channel 和 --channel-name 不能同时使用")
+    if args.channel_name:
+        import subprocess
+        args.channel = subprocess.check_output(
+            ["python3", "/Users/karry/Orb/scripts/cron/channels-resolve.py", args.channel_name]
+        ).decode().strip()
+    if not args.channel:
+        parser.error("必须提供 --channel 或 --channel-name")
     
     if args.blocks:
         with open(args.blocks) as f:
