@@ -860,6 +860,7 @@ export class Scheduler {
 
     let responded = false;
     let userVisibleDeliveryObserved = false;
+    let suppressedSuccessObserved = false;
     let pendingAutoContinue = null;
     let effectiveThreadTs = task.deliveryThreadTs === undefined ? (threadTs || null) : task.deliveryThreadTs;
     let turnCount = 0;
@@ -902,6 +903,7 @@ export class Scheduler {
       if (!shouldSuppressForChannelSemantics(effectiveChannelSemantics, stopReason)) return false;
       const textLength = String(text || '').length;
       info(TAG, `silent ${phase} suppressed: thread=${threadTs} textLen=${textLength}`);
+      suppressedSuccessObserved = true;
       return true;
     };
 
@@ -1086,7 +1088,7 @@ export class Scheduler {
 
         // Exit signal: empty text after turn_complete delivery is expected and
         // should not enter auto-continue or fallback delivery.
-        if (userVisibleDeliveryObserved) {
+        if (userVisibleDeliveryObserved || suppressedSuccessObserved) {
           this._autoContinueCount.delete(threadTs);
           return;
         }
@@ -1357,6 +1359,7 @@ export class Scheduler {
             await abandonTurn(turn);
             turn = makeTurnState(taskCardConfig);
             userVisibleDeliveryObserved = false;
+            suppressedSuccessObserved = false;
             currentCcTurnId = makeTurnId({ turnId: msg.turnId, threadTs, attemptId: msg.attemptId || task.attemptId });
             orchestrator.beginTurn({
               turnId: currentCcTurnId,
@@ -1398,6 +1401,7 @@ export class Scheduler {
               }
               if (deferDeliveryUntilResult && isSilentResultText(deliveryText)) {
                 info(TAG, `silent deferred turn suppressed: thread=${threadTs}`);
+                suppressedSuccessObserved = true;
                 await emitAssistantFinal({
                   text: deliveryText,
                   msg,
@@ -1427,6 +1431,7 @@ export class Scheduler {
               const silentDeferredFallback = deferDeliveryUntilResult && isSilentResultText(fallbackText);
               if (silentDeferredFallback) {
                 info(TAG, `silent deferred turn suppressed after delivery failure: thread=${threadTs}`);
+                suppressedSuccessObserved = true;
                 await emitAssistantFinal({
                   text: fallbackText,
                   msg,
