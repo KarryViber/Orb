@@ -48,6 +48,7 @@ const MAX_AUTO_CONTINUE = 2;  // max auto-retries on empty result (context overf
 const PERMISSION_APPROVAL_TIMEOUT_MS = ORB_PERMISSION_TIMEOUT_MS;
 const STATUS_REFRESH_MS = 20_000;
 const SILENT_PREFIX = '[SILENT]';
+const KEEP_ACKED_INTERRUPTED_RUNS = 20;
 const LOADING_MESSAGES = [
   'Cooking…',
   'Reading files…',
@@ -665,6 +666,8 @@ export class Scheduler {
       return;
     }
 
+    this._cleanupAckedInterruptedRuns(profiles, profilesDir);
+
     const pending = [];
     for (const entry of profiles) {
       const profileName = entry.name;
@@ -708,6 +711,24 @@ export class Scheduler {
       } catch (err) {
         warn(TAG, `startup interrupted-run notification failed for profile=${profileName}: ${err.message}`);
       }
+    }
+  }
+
+  _cleanupAckedInterruptedRuns(profiles, profilesDir) {
+    for (const profileEntry of profiles) {
+      const dataDir = join(profilesDir, profileEntry.name, 'data');
+      if (!existsSync(dataDir)) continue;
+      try {
+        const ackedFiles = readdirSync(dataDir)
+          .filter((name) => /^interrupted-runs\.acked\.[\dT:.\-Z]+\.json$/.test(name))
+          .map((name) => ({ name, path: join(dataDir, name) }))
+          .sort((a, b) => b.name.localeCompare(a.name));
+        for (const old of ackedFiles.slice(KEEP_ACKED_INTERRUPTED_RUNS)) {
+          try {
+            unlinkSync(old.path);
+          } catch {}
+        }
+      } catch {}
     }
   }
 

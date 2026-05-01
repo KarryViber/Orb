@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { Scheduler } from '../src/scheduler.js';
@@ -223,4 +223,27 @@ test('empty silent successful turn_complete suppresses result auto-continue', as
 
   assert.equal(fallbackWarnings(calls).length, 0);
   assert.equal(warnLines.some((line) => line.includes('auto-continue')), false);
+});
+
+test('startup interrupted-run scan keeps only latest acked audit files', async () => {
+  const profilesDir = mkdtempSync(join(tmpdir(), 'orb-interrupted-acked-'));
+  const dataDir = join(profilesDir, 'test', 'data');
+  mkdirSync(dataDir, { recursive: true });
+  for (let i = 0; i < 25; i += 1) {
+    const day = String(i + 1).padStart(2, '0');
+    writeFileSync(join(dataDir, `interrupted-runs.acked.2026-05-${day}T00-00-00-000Z.json`), '[]\n');
+  }
+
+  const scheduler = new Scheduler({
+    startPermissionServer: false,
+    getProfile: makeProfile,
+  });
+  await scheduler._notifyInterruptedRuns({ profilesDir });
+
+  const remaining = readdirSync(dataDir)
+    .filter((name) => name.startsWith('interrupted-runs.acked.'))
+    .sort();
+  assert.equal(remaining.length, 20);
+  assert.equal(existsSync(join(dataDir, 'interrupted-runs.acked.2026-05-01T00-00-00-000Z.json')), false);
+  assert.equal(remaining[0], 'interrupted-runs.acked.2026-05-06T00-00-00-000Z.json');
 });
