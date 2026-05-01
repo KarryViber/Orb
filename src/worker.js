@@ -66,7 +66,8 @@ import {
  */
 
 const PYTHON = PYTHON_PATH;
-const MEMORY_USAGE_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'lib', 'memory-usage');
+const ORB_ROOT = resolve(join(dirname(fileURLToPath(import.meta.url)), '..'));
+const MEMORY_USAGE_DIR = join(ORB_ROOT, 'lib', 'memory-usage');
 const DEFAULT_PERMISSION_TIMEOUT_MS = ORB_PERMISSION_TIMEOUT_MS;
 const MCP_PERMISSION_TOOL_NOT_FOUND_RE = /MCP tool mcp__orb_permission__orb_request_permission[\s\S]*not found[\s\S]*Available MCP tools: none/i;
 const CLI_API_ERROR_RE = /\b(?:API Error|Internal server error|5\d\d|rate limit|overloaded|upstream)\b/i;
@@ -217,8 +218,7 @@ process.on('message', async (msg) => {
 
   // IPC profile path validation — prevent path traversal
   if (profile?.workspaceDir && profile?.dataDir) {
-    const orbRoot = resolve(join(dirname(fileURLToPath(import.meta.url)), '..'));
-    const profileRoot = join(orbRoot, 'profiles');
+    const profileRoot = join(ORB_ROOT, 'profiles');
     const resolvedWorkspace = resolve(profile.workspaceDir);
     const resolvedData = resolve(profile.dataDir);
     if (!resolvedWorkspace.startsWith(profileRoot) || !resolvedData.startsWith(profileRoot)) {
@@ -306,6 +306,7 @@ process.on('message', async (msg) => {
       '--output-format', 'stream-json',
       '--exclude-dynamic-system-prompt-sections',
       '--verbose',
+      '--add-dir', ORB_ROOT,
     ];
     if (!permissionPromptDisabled) {
       streamArgs.push(
