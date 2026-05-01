@@ -45,5 +45,5 @@ r = requests.post("http://localhost:19825/command",
 ```
 
 ## 约束
-- X/Twitter 写入统一走脚本层 (`~/Orb/profiles/karry/scripts/x-*.sh`)，不直接调 opencli
+- X/Twitter 写入统一走脚本层 (`~/Orb/profiles/<your-profile>/scripts/x-*.sh`)，不直接调 opencli
 - 浏览器适配器在 cron/服务端不适用

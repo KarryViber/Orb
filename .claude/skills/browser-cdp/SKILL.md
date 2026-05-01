@@ -27,16 +27,16 @@ Playwright connect_over_cdp("http://127.0.0.1:9223")
 
 ```bash
 # 启动 CDP Chrome（自动关闭普通 Chrome → 复制 profile → 启动）
-~/Orb/profiles/karry/scripts/chrome-cdp-start.sh
+~/Orb/profiles/<your-profile>/scripts/chrome-cdp-start.sh
 
 # 检查状态
-~/Orb/profiles/karry/scripts/chrome-cdp-start.sh --status
+~/Orb/profiles/<your-profile>/scripts/chrome-cdp-start.sh --status
 
 # 登录态过期时：关闭 → 重新复制 profile → 重启
-~/Orb/profiles/karry/scripts/chrome-cdp-start.sh --refresh
+~/Orb/profiles/<your-profile>/scripts/chrome-cdp-start.sh --refresh
 
 # 关闭
-~/Orb/profiles/karry/scripts/chrome-cdp-start.sh --kill
+~/Orb/profiles/<your-profile>/scripts/chrome-cdp-start.sh --kill
 ```
 
 ## Playwright 连接模板

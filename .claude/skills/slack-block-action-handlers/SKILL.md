@@ -1,6 +1,6 @@
 ---
 name: slack-block-action-handlers
-description: Slack 按钮点击 (block_action) 的确定性路由协议——新建审批卡按钮时必须在 `profiles/karry/scripts/handlers/` 下放同名 handler 脚本，adapter 按 action_id 直接执行（零 LLM、零 worker fork）。Use when 需要新建带按钮的 Slack 卡片、修改 handler 脚本、或排查按钮点击无响应。
+description: Slack 按钮点击 (block_action) 的确定性路由协议——新建审批卡按钮时必须在 `profiles/<your-profile>/scripts/handlers/` 下放同名 handler 脚本，adapter 按 action_id 直接执行（零 LLM、零 worker fork）。Use when 需要新建带按钮的 Slack 卡片、修改 handler 脚本、或排查按钮点击无响应。
 provenance: user-authored
 ---
 

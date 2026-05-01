@@ -39,7 +39,7 @@ divider
 
 ## 3. 语义 → markdown 对照表（核心）
 
-完整 6 档映射见 `~/Orb/profiles/karry/workspace/CLAUDE.md` § Slack 输出格式。这里只列 cron / 反思类高频用法：
+完整 6 档映射见 `~/Orb/profiles/<your-profile>/workspace/CLAUDE.md` § Slack 输出格式。这里只列 cron / 反思类高频用法：
 
 | 需要的视觉 | 写 | 渲染成 |
 |---|---|---|
@@ -62,7 +62,7 @@ divider
 
 **正解**：把 anchor 持久化为显式 JSON 状态文件。
 
-文件位置：`~/Orb/profiles/karry/data/<task>-daily-anchor.json`
+文件位置：`~/Orb/profiles/<your-profile>/data/<task>-daily-anchor.json`
 
 最小 schema：
 ```json

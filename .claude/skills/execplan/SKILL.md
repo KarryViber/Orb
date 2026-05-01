@@ -65,7 +65,7 @@ provenance: user-authored
 
 ## Orb 工作流约定
 
-- **位置**：`~/Orb/profiles/karry/workspace/specs/{task-name}.md`
+- **位置**：`~/Orb/profiles/<your-profile>/workspace/specs/{task-name}.md`
 - **命名**：kebab-case，见名知意（`dm-routing.md` / `worker-zombie-cleanup.md`）
 - **提交时机**：ExecPlan 本身就是一个 commit，后续每个 milestone 完成也要 commit
 - **不要**在 ExecPlan 里再嵌套 ``` 代码块（用缩进块替代）；顶层也不必用 ``` 包裹整份文档

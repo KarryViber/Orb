@@ -34,7 +34,7 @@ provenance: user-authored
 
 | 层 | 典型对象 | 典型短指令 |
 |---|---|---|
-| **记忆层** | `~/.claude/projects/.../memory/*.md`、`~/Orb/profiles/karry/data/lessons/*.md`、holographic facts | 「记住这个」「忘掉那条」「改一下那条规则」 |
+| **记忆层** | `~/.claude/projects/.../memory/*.md`、`~/Orb/profiles/<your-profile>/data/lessons/*.md`、holographic facts | 「记住这个」「忘掉那条」「改一下那条规则」 |
 | **配置层** | `~/Orb/config.json`、cron-jobs.json、`.claude/settings.json`、hooks | 「把这个 cron 关掉」「加个权限」「改一下 trigger」 |
 | **运行参数层** | 当前任务的 model/effort、--append-system-prompt、单次会话行为 | 「跑一下」「切到 sonnet」「再试一次」 |
 | **外部动作层** | Slack 发送、API 调用、文件对外交付、git push | 「发出去」「推上去」「确认」 |

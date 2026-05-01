@@ -47,7 +47,7 @@ provenance: user-authored
 
 **强制留痕**：每次 L1 分派必须输出一句 `🔀 分派 → <agent_type>：<一句话目标>`。便于事后 grep transcript 审计漏派。
 
-**反向铁律**：命中清单条件**未派 = 流程作弊**。事后发现写 lesson 复盘到 `~/Orb/profiles/karry/data/lessons/agent-dispatch-miss-*.md`，标记触发场景 + 漏派代价。
+**反向铁律**：命中清单条件**未派 = 流程作弊**。事后发现写 lesson 复盘到 `~/Orb/profiles/<your-profile>/data/lessons/agent-dispatch-miss-*.md`，标记触发场景 + 漏派代价。
 
 **例外**：
 - 任务本身就是「读 1 个特定文件回答 1 个具体问题」→ L0 自己做（即使 ≥3 行 grep 也走 L0，因为目标文件已知）
@@ -62,7 +62,7 @@ provenance: user-authored
 
 **何时改用 CC**：
 - 多轮探查 + 反复试错（agentic loop 强）
-- 需要复用 Orb 的 skills/CLAUDE.md 体系（CC 起在 `~/Orb/profiles/karry/workspace/` 能直接吃到全套 skill + memory，Codex 是裸的）
+- 需要复用 Orb 的 skills/CLAUDE.md 体系（CC 起在 `~/Orb/profiles/<your-profile>/workspace/` 能直接吃到全套 skill + memory，Codex 是裸的）
 - 任务边界模糊、需要在歧义点停下确认
 
 **决策树**：
@@ -113,7 +113,7 @@ provenance: user-authored
 
 ### 五个铁律（launcher 内部已实现，调用方了解原因即可）
 
-1. **`--cd` 必须是 `~/Orb`**，不能给子目录。原因：codex sandbox 把 `--cd` 当可写根，给 `workspace/` 会让 `~/Orb/profiles/karry/scripts/` 被踢出可写域，4/30 daily-notes-monitor regex 修复就栽在这。
+1. **`--cd` 必须是 `~/Orb`**，不能给子目录。原因：codex sandbox 把 `--cd` 当可写根，给 `workspace/` 会让 `~/Orb/profiles/<your-profile>/scripts/` 被踢出可写域，4/30 daily-notes-monitor regex 修复就栽在这。
 2. **`</dev/null` 强制关 stdin** — codex 检测到 stdin open 会等输入，heredoc/pipe 喂 prompt 都会触发挂起
 3. **prompt 走位置参数**，不走 heredoc / pipe / `<<EOF`
 4. **`--dangerously-bypass-approvals-and-sandbox`** + **spec 里禁止 codex 动 git** — 既绕开 sandbox 拦 `.git/index.lock`，又保证 diff 由主 session commit、日志不乱
@@ -124,7 +124,7 @@ provenance: user-authored
 | 写法 | 踩的坑 |
 |---|---|
 | 裸跑 `codex exec ...` 不走 launcher | ⚠️ 没自动回报，要 Karry 催「好了吗」 |
-| `codex exec --cd ~/Orb/profiles/karry/workspace ...` | ① sandbox 把 workspace 当可写根，profiles/karry/scripts 被踢出 |
+| `codex exec --cd ~/Orb/profiles/<your-profile>/workspace ...` | ① sandbox 把 workspace 当可写根，profiles/<your-profile>/scripts 被踢出 |
 | `echo "干活" \| codex exec ...` | ② stdin 管道，挂 |
 | `codex exec <<EOF ... EOF` | ② heredoc，同样挂 |
 | `codex exec --sandbox workspace-write "...动 .git..."` | ③ sandbox 拦 `.git/index.lock` |
@@ -132,7 +132,7 @@ provenance: user-authored
 | spec 里写「commit 一下」 | codex 边写边 commit，主 session diff 回收混乱 |
 | 不过滤 stderr | rollout ERROR 每次出现，混淆真错误 |
 
-> **强制**：`~/Orb/profiles/karry/workspace/.claude/hooks/codex-exec-guard.sh` 已升级为 block 模式（PreToolUse Bash hook，`exit 2` 阻断）。命中铁律 1-4 任一坑会被直接拦下。launcher 内部已经合规，所以裸调用 launcher 不被 block；如果绕过 launcher 自己写 codex exec 命令，hook 还在守底线。
+> **强制**：`~/Orb/profiles/<your-profile>/workspace/.claude/hooks/codex-exec-guard.sh` 已升级为 block 模式（PreToolUse Bash hook，`exit 2` 阻断）。命中铁律 1-4 任一坑会被直接拦下。launcher 内部已经合规，所以裸调用 launcher 不被 block；如果绕过 launcher 自己写 codex exec 命令，hook 还在守底线。
 
 ### 何时仍可裸跑（罕见例外）
 
@@ -158,8 +158,8 @@ provenance: user-authored
 
 ## 相关上下文位置
 <外部 codex 不知道 Orb 有这些索引，显式告诉它去哪找；没有则写「无」>
-- 对话记忆：holographic DB（`profiles/karry/data/memory.db`），trust>0.6 相关 facts
-- 文件知识：docstore FTS（`profiles/karry/data/doc-index.db`，slug: <project-slug>）
+- 对话记忆：holographic DB（`profiles/<your-profile>/data/memory.db`），trust>0.6 相关 facts
+- 文件知识：docstore FTS（`profiles/<your-profile>/data/doc-index.db`，slug: <project-slug>）
 - spec 前置 / 历史 spec：`specs/<related>.md`
 - 运行时日志：`logs/orb.log`
 
@@ -169,11 +169,11 @@ provenance: user-authored
 
 ## 禁写区（默认值，每个 spec 必带）
 codex 验收 / 自测期间禁止写以下生产数据，要造数据用临时 fixture：
-- `profiles/karry/data/memory.db`（holographic 记忆，曾被 codex 验收时塞测试 fact）
-- `profiles/karry/data/cron-jobs.json`（活 cron，写错会乱 schedule）
-- `profiles/karry/data/sessions.json`（thread↔session 映射）
-- `profiles/karry/data/doc-index.db`（DocStore FTS）
-- `profiles/karry/data/daily-notes/*.md`（实时日记）
+- `profiles/<your-profile>/data/memory.db`（holographic 记忆，曾被 codex 验收时塞测试 fact）
+- `profiles/<your-profile>/data/cron-jobs.json`（活 cron，写错会乱 schedule）
+- `profiles/<your-profile>/data/sessions.json`（thread↔session 映射）
+- `profiles/<your-profile>/data/doc-index.db`（DocStore FTS）
+- `profiles/<your-profile>/data/daily-notes/*.md`（实时日记）
 - 任何 `profiles/*/data/` 下的真实落盘文件
 
 例外（spec 显式声明才能写）：
@@ -206,7 +206,7 @@ codex 验收 / 自测期间禁止写以下生产数据，要造数据用临时 f
 收到 launcher 自动 ✅ 后：
 
 1. **读 diff / 读 log**，不信任 launcher 摘要（"agent 说做了 X 不等于做了 X"）
-2. **验禁写区**：`git status` + `ls -la profiles/karry/data/*.db profiles/karry/data/*.json` 看 mtime，禁写文件被改 = FAIL，回滚 + 改 spec 重派
+2. **验禁写区**：`git status` + `ls -la profiles/<your-profile>/data/*.db profiles/<your-profile>/data/*.json` 看 mtime，禁写文件被改 = FAIL，回滚 + 改 spec 重派
 3. 判级：
    - **PASS** — 符合预期，commit
    - **PARTIAL** — 列缺口，决定本地补 or 再派一轮
