@@ -39,7 +39,7 @@ BLOCKS_FILE=""
 COLOR="#5865F2"
 NO_THREAD=false
 MAX_CHARS=2800
-RECEIPT_DIR="${SLACK_SEND_RECEIPT_DIR:-/Users/karry/Orb/workspace/docs/receipts/slack-send-thread}"
+RECEIPT_DIR="${SLACK_SEND_RECEIPT_DIR:-/Users/karry/Orb/data/receipts/slack-send-thread}"
 mkdir -p "$RECEIPT_DIR"
 RECEIPT_FILE="$RECEIPT_DIR/$(date '+%Y-%m-%d_%H-%M-%S')-$$.log"
 
