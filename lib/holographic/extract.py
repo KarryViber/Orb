@@ -53,7 +53,9 @@ INSTRUCTION_PATTERNS = [
     (r"记住|以后都|以后.*默认|从现在起|永远|始终|不要再|别再|每次都", "instruction"),
     (r"我(喜欢|偏好|习惯|倾向|不喜欢|不想|讨厌|受不了)", "preference"),
     (r"(决定|确定|就这样|就用|不用|不做|放弃|选|采用|用这个|就这么定)", "decision"),
-    (r"(会议|meeting|打合せ|截止|deadline|上线|发布|里程碑|milestone)", "event"),
+    # Technical actions / changes — commit messages, fixes, deployments etc.
+    (r"(commit|merge|push|pull[- ]?request|PR\b|fix(?:ed|ing)?|修复|修了|挪到?|迁移|重构|删除|删了|加了?|新增|新建|装好|部署|上线|发布|回滚|降级|回退|hotfix|patch)", "decision"),
+    (r"(会议|meeting|打合せ|截止|deadline|上线|发布|里程碑|milestone|今天|明天|本周|下周)", "event"),
     (r"(客户|项目|公司|团队|partner|同事|老板|上司)", "entity"),
 ]
 
@@ -151,8 +153,10 @@ def extract_facts(user_text: str, response_text: str) -> list[dict]:
     # The user message itself often contains the most valuable signal
     user_category = detect_category(user_text)
 
-    # For instruction/preference/decision, store the user's exact words
-    if user_category in ("instruction", "preference", "decision"):
+    # For instruction/preference/decision/event/entity/knowledge, store the user's exact words.
+    # (Previously only the first three captured a direct fact; event/entity/knowledge fell
+    # through to the conversation path and got zapped by the low-importance drop below.)
+    if user_category in ("instruction", "preference", "decision", "event", "entity", "knowledge"):
         trust_confidence = _confidence_for(user_category, "high")
         source_kind = classify_source_kind(user_text)
         facts.append({
@@ -198,9 +202,12 @@ def extract_facts(user_text: str, response_text: str) -> list[dict]:
         category = detect_category(condensed_user + " " + condensed_response)
         importance = assess_importance(condensed_user, category)
 
-        # Skip low-importance general conversation
+        # Skip low-importance general conversation only when both sides are short.
+        # Longer turns (>=80 chars user OR >=80 chars response) likely contain
+        # context worth keeping as a Q/A condensed fact even if uncategorized.
         if importance == "low" and category == "conversation":
-            return []
+            if len(condensed_user) < 80 and len(summary_line) < 80:
+                return []
 
         trust_confidence = _confidence_for(category, importance)
         source_kind = classify_source_kind(content, derived_from_response=bool(condensed_response))
