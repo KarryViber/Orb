@@ -25,6 +25,7 @@ src/
   scheduler-shutdown-persistence.js — Scheduler shutdown state persistence
   scheduler-skill-review.js — skill-review mode scheduler dispatch
   spawn.js             — Claude CLI subprocess spawn helper
+  stop-reason.js       — CLI stop reason classification helpers
   mcp-permission-server.js — In-process MCP server backing CLI permission prompts
   skill-review-trigger.js — Skill-review mode dispatch hook
   lesson-candidates.js — Lesson candidate detection / persistence
@@ -32,6 +33,12 @@ src/
   worker-image-blocks.js — Worker-side image attachment → content block conversion
   worker-mcp-boot.js   — Worker-side MCP server startup
   worker-turn-text.js  — Worker-side turn text buffering and deduplication
+  context-providers/   — User-prompt external context providers
+    docstore.js        — DocStore recall provider
+    holographic.js     — Holographic memory recall provider
+    interface.js       — Provider interface (name + prefetch)
+    skill-review.js    — Skill-review prior-conversation provider
+    thread-history.js  — Thread history provider
   turn-delivery/       — Per-turn delivery orchestration
     adapter-strategy.js — Adapter delivery strategy selection
     cc-event-format.js — Claude Code event formatting helpers
@@ -48,6 +55,8 @@ src/
     slack-block-actions.js — Slack block action (button click) routing
     slack-dm-routing.js — Slack DM inbound routing implementation
     slack-format.js    — Markdown→mrkdwn, Block Kit builder
+    slack-permission-render.js — Slack permission prompt rendering
+    slack-stream-error.js — Slack stream error classification & fallback
     wechat.js          — WeChat adapter
     wechat-format.js   — WeChat plain-text formatter (Markdown unsupported)
     image-cache.js     — Adapter-shared image download/cache helper

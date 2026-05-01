@@ -59,12 +59,17 @@ while ((m = refRe.exec(text)) !== null) {
 }
 
 const skillRefRe = /CLI skill `([\w-]+)`/g;
-const skillDir = path.join(WORKSPACE, '.claude/skills');
-const existingSkills = fs.existsSync(skillDir)
-  ? fs.readdirSync(skillDir).filter(function (d) {
-      return fs.existsSync(path.join(skillDir, d, 'SKILL.md'));
-    })
-  : [];
+const skillDirs = [
+  path.join(WORKSPACE, '.claude/skills'),
+  path.join(ORB_ROOT, '.claude/skills'),
+];
+const existingSkills = [];
+for (const skillDir of skillDirs) {
+  if (!fs.existsSync(skillDir)) continue;
+  for (const d of fs.readdirSync(skillDir)) {
+    if (fs.existsSync(path.join(skillDir, d, 'SKILL.md'))) existingSkills.push(d);
+  }
+}
 while ((m = skillRefRe.exec(text)) !== null) {
   const name = m[1];
   if (!existingSkills.includes(name)) warnings.push('referenced CLI skill missing: ' + name);
@@ -80,10 +85,12 @@ if (fs.existsSync(ORB_CLAUDE_MD)) {
     for (const f of fs.readdirSync(ORB_SRC_DIR)) {
       if (f.endsWith('.js') && fs.statSync(path.join(ORB_SRC_DIR, f)).isFile()) realSrcFiles.add(f);
     }
-    const adaptersDir = path.join(ORB_SRC_DIR, 'adapters');
-    if (fs.existsSync(adaptersDir)) {
-      for (const f of fs.readdirSync(adaptersDir)) {
-        if (f.endsWith('.js')) realSrcFiles.add(f);
+    for (const sub of ['adapters', 'turn-delivery', 'context-providers']) {
+      const subDir = path.join(ORB_SRC_DIR, sub);
+      if (fs.existsSync(subDir)) {
+        for (const f of fs.readdirSync(subDir)) {
+          if (f.endsWith('.js')) realSrcFiles.add(f);
+        }
       }
     }
     const docSrcFiles = new Set();
@@ -110,7 +117,7 @@ if (fs.existsSync(ORB_CLAUDE_MD)) {
         const cleaned = mm[2].replace(/\n\s*\*\s*/g, ' ');
         const fields = cleaned
           .split(',')
-          .map(function (s) { return s.trim().replace(/\?$/, '').replace(/:.*$/, ''); })
+          .map(function (s) { return s.trim().replace(/:.*$/, '').replace(/\?$/, ''); })
           .filter(function (s) { return s && /^\w+$/.test(s); });
         map[t] = new Set(fields);
       }
