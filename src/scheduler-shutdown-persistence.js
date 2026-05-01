@@ -46,6 +46,12 @@ export function sanitizeTaskForPersistence(task) {
   return persisted;
 }
 
+function isCronTask(task) {
+  if (!task || typeof task !== 'object') return false;
+  if (task.origin?.kind === 'cron') return true;
+  return String(task.threadTs || '').startsWith('cron:');
+}
+
 function taskDedupKey(task, fallbackThreadTs = null) {
   const attemptId = task?.attemptId;
   if (!attemptId) return null;
@@ -160,6 +166,7 @@ export function persistShutdownQueues({ threadQueues, activeWorkers, getProfile 
       return { profileName, dataDir };
     };
     const addPersistedTask = (task, threadTs = null) => {
+      if (isCronTask(task)) return;
       const persistedTask = sanitizeTaskForPersistence(task);
       if (!persistedTask) return;
       const { profileName, dataDir } = resolveProfileForTask(persistedTask);
@@ -176,6 +183,7 @@ export function persistShutdownQueues({ threadQueues, activeWorkers, getProfile 
       }
     };
     const addInterrupted = (task, role) => {
+      if (isCronTask(task)) return;
       const persistedTask = sanitizeTaskForPersistence(task);
       if (!persistedTask) return;
       const { profileName, dataDir } = resolveProfileForTask(persistedTask);
