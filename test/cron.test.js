@@ -49,6 +49,7 @@ function createScheduler(dataDir, executeTask) {
   const scheduler = new CronScheduler({
     getProfilePaths: () => ({ dataDir, workspaceDir: dataDir, scriptsDir: dataDir }),
     scheduler: { executeTask },
+    getProfileNotifyDm: () => 'D0ANGB3M1CZ',
   });
   scheduler.setProfileNames(['karry']);
   return scheduler;
@@ -61,6 +62,7 @@ function createMultiProfileScheduler(profileDirs, executeTask) {
       return { dataDir, workspaceDir: dataDir, scriptsDir: dataDir };
     },
     scheduler: { executeTask },
+    getProfileNotifyDm: () => 'D0ANGB3M1CZ',
   });
   scheduler.setProfileNames(Object.keys(profileDirs));
   return scheduler;
@@ -73,7 +75,7 @@ test('tick releases the scheduler lock before worker completion', async () => {
 
   const scheduler = createScheduler(dataDir, async (job) => {
     executed.push(job.threadTs);
-    if (job.threadTs === 'cron:job-1') return gate.promise;
+    if (job.threadTs === 'cron:karry:job-1') return gate.promise;
     return { text: 'ok' };
   });
 
@@ -89,7 +91,7 @@ test('tick releases the scheduler lock before worker completion', async () => {
   ]);
 
   await scheduler.tick();
-  assert.deepEqual(executed, ['cron:job-1', 'cron:job-2']);
+  assert.deepEqual(executed, ['cron:karry:job-1', 'cron:karry:job-2']);
 
   gate.resolve('ok');
   await delay(20);

@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, readdirSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import {
   abandonTurnState,
   EventBus,
@@ -93,6 +96,27 @@ test('EventBus times out a stuck subscriber and continues publishing', async () 
   assert.deepEqual(received, ['turn-timeout']);
 });
 
+test('EventBus disables subscriber after three consecutive failures', async () => {
+  const bus = new EventBus();
+  const failingSubscriber = {
+    name: 'failingSubscriber',
+    handle() {
+      throw new Error('subscriber boom');
+    },
+  };
+  bus.subscribe(failingSubscriber);
+
+  for (let i = 0; i < 3; i += 1) {
+    await assert.rejects(
+      bus.publish({ type: 'cc_event', turnId: `turn-${i}`, eventType: 'result' }),
+      /EventBus publish failed/,
+    );
+  }
+
+  assert.equal(bus.subscribers.has(failingSubscriber), false);
+  await bus.publish({ type: 'cc_event', turnId: 'turn-disabled', eventType: 'result' });
+});
+
 test('Scheduler cc_event route publishes fake tool_use without handling legacy IPC branches', async () => {
   const scheduler = new Scheduler({ getProfile: () => ({ name: 'test' }), startPermissionServer: false });
   const received = [];
@@ -108,4 +132,35 @@ test('Scheduler cc_event route publishes fake tool_use without handling legacy I
   assert.equal(received[0].msg.payload, payload);
   assert.equal(received[0].ctx.scheduler, scheduler);
   assert.equal(received[0].ctx.threadTs, '123.456');
+});
+
+test('Scheduler records lesson candidate when EventBus subscriber fails', async () => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'orb-eventbus-failure-'));
+  const scheduler = new Scheduler({ getProfile: () => ({ name: 'test', dataDir }), startPermissionServer: false });
+  scheduler.eventBus.subscribe({
+    name: 'lessonFailingSubscriber',
+    handle() {
+      throw new Error('subscriber exploded');
+    },
+  });
+
+  await assert.rejects(
+    scheduler._publishWorkerCcEvent(
+      { type: 'cc_event', turnId: 'turn-fail', eventType: 'tool_use', payload: { name: 'Bash' } },
+      {
+        threadTs: '123.456',
+        profile: { name: 'test', dataDir },
+        task: { origin: { kind: 'user', name: 'first-touch', parentAttemptId: null } },
+      },
+    ),
+    /EventBus publish failed/,
+  );
+
+  const candidateDir = join(dataDir, 'lesson-candidates');
+  const files = readdirSync(candidateDir).filter((name) => name.includes('event-bus-subscriber-failed'));
+  assert.equal(files.length, 1);
+  const text = readFileSync(join(candidateDir, files[0]), 'utf8');
+  assert.match(text, /event-bus-subscriber-failed/);
+  assert.match(text, /lessonFailingSubscriber/);
+  assert.match(text, /tool_use/);
 });

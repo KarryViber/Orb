@@ -27,15 +27,16 @@ test('cron path uses scheduler executeTask and preserves cc-events JSONL side ef
   const tasks = [];
   const scheduler = new CronScheduler({
     getProfilePaths: () => ({ dataDir, workspaceDir: dataDir, scriptsDir: dataDir }),
+    getProfileNotifyDm: () => 'D0ANGB3M1CZ',
     scheduler: {
       executeTask: async (task) => {
         tasks.push(task);
         mkdirSync(ccDir, { recursive: true });
         appendFileSync(ccFile, `${JSON.stringify({
           ts: '2026-04-25T00:00:00+09:00',
-          thread_ts: 'cron:job-jsonl',
+          thread_ts: 'cron:karry:job-jsonl',
           turn_id: 'turn-1',
-          job_id: 'cron:job-jsonl',
+          job_id: 'cron:karry:job-jsonl',
           profile: 'karry',
           event_type: 'tool_use',
           payload: { name: 'Bash' },
@@ -51,7 +52,7 @@ test('cron path uses scheduler executeTask and preserves cc-events JSONL side ef
   await scheduler._awaitJobWrites(dataDir);
 
   assert.equal(tasks.length, 1);
-  assert.equal(tasks[0].threadTs, 'cron:job-jsonl');
+  assert.equal(tasks[0].threadTs, 'cron:karry:job-jsonl');
   assert.equal(tasks[0].channel, 'D0ANGB3M1CZ');
   assert.equal(tasks[0].channelSemantics, 'silent');
   assert.match(tasks[0].jobRunId, /^job-jsonl:\d+:[0-9a-f-]+$/);
@@ -59,5 +60,5 @@ test('cron path uses scheduler executeTask and preserves cc-events JSONL side ef
   const rows = readFileSync(ccFile, 'utf-8').trim().split('\n').map((line) => JSON.parse(line));
   assert.equal(rows.length, 1);
   assert.equal(rows[0].event_type, 'tool_use');
-  assert.equal(rows[0].thread_ts, 'cron:job-jsonl');
+  assert.equal(rows[0].thread_ts, 'cron:karry:job-jsonl');
 });

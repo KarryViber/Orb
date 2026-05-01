@@ -13,7 +13,7 @@ import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, s
 import { basename, dirname, join } from 'node:path';
 import { info, error as logError, warn } from './log.js';
 import { writeLessonCandidate } from './lesson-candidates.js';
-import { getProfileNotifyDm } from './config.js';
+import { getProfileNotifyDm as getConfiguredProfileNotifyDm } from './config.js';
 
 const TAG = 'cron';
 const TICK_INTERVAL = 60_000; // 60 seconds
@@ -220,7 +220,7 @@ function updateLastGoodJobs(dataDir) {
 }
 
 function postFailureDm(profileName, corruptPath, fallback) {
-  const channel = getProfileNotifyDm(profileName);
+  const channel = getConfiguredProfileNotifyDm(profileName);
   const token = process.env.SLACK_BOT_TOKEN;
   if (!channel) {
     warn(TAG, `cron corrupt DM skipped for profile=${profileName}: notifyChannels.dm not configured`);
@@ -248,7 +248,7 @@ function postFailureDm(profileName, corruptPath, fallback) {
 }
 
 function postCronPersistenceFailureDm(profileName, dataDir, reason) {
-  const channel = getProfileNotifyDm(profileName);
+  const channel = getConfiguredProfileNotifyDm(profileName);
   const token = process.env.SLACK_BOT_TOKEN;
   if (!channel) {
     warn(TAG, `cron persistence failure DM skipped for profile=${profileName}: notifyChannels.dm not configured`);
@@ -476,9 +476,10 @@ export class CronScheduler {
    * @param {Function} opts.getProfilePaths - (profileName) => { dataDir, workspaceDir, scriptsDir }
    * @param {object} [opts.scheduler] - Scheduler with executeTask()
    */
-  constructor({ getProfilePaths, scheduler = null }) {
+  constructor({ getProfilePaths, scheduler = null, getProfileNotifyDm = getConfiguredProfileNotifyDm }) {
     this._getProfilePaths = getProfilePaths;
     this._scheduler = scheduler;
+    this._getProfileNotifyDm = getProfileNotifyDm;
     this._running = false;
     this._inflightJobs = new Set();
     this._jobWriteChains = new Map();
@@ -732,7 +733,7 @@ export class CronScheduler {
   }
 
   _resolveDelivery(job) {
-    const channel = getProfileNotifyDm(job.profileName);
+    const channel = this._getProfileNotifyDm(job.profileName);
     if (!channel) {
       const err = new Error(`no notifyChannels.dm configured for profile=${job.profileName}`);
       err.code = 'ORB_CRON_NOTIFY_DM_MISSING';

@@ -327,6 +327,7 @@ export class EventBus {
   constructor({ subscriberTimeoutMs = 5_000 } = {}) {
     this.subscribers = new Set();
     this.subscriberTimeoutMs = subscriberTimeoutMs;
+    this._subscriberFailures = new Map();
   }
 
   subscribe(subscriber) {
@@ -353,14 +354,40 @@ export class EventBus {
   }
 
   async _publishToSubscriber(subscriber, msg, ctx) {
-    return this._withSubscriberTimeout(async () => {
-      const match = typeof subscriber === 'function'
-        ? true
-        : (typeof subscriber.match === 'function' ? await subscriber.match(msg, ctx) : true);
-      if (!match) return;
-      if (typeof subscriber === 'function') await subscriber(msg, ctx);
-      else await subscriber.handle(msg, ctx);
-    });
+    const subscriberName = this._subscriberName(subscriber);
+    try {
+      const handled = await this._withSubscriberTimeout(async () => {
+        const match = typeof subscriber === 'function'
+          ? true
+          : (typeof subscriber.match === 'function' ? await subscriber.match(msg, ctx) : true);
+        if (!match) return false;
+        if (typeof subscriber === 'function') await subscriber(msg, ctx);
+        else await subscriber.handle(msg, ctx);
+        return true;
+      });
+      if (handled) this._subscriberFailures.delete(subscriber);
+    } catch (err) {
+      const previous = this._subscriberFailures.get(subscriber);
+      const count = (previous?.count || 0) + 1;
+      this._subscriberFailures.set(subscriber, {
+        count,
+        lastError: err.message,
+        lastFailedAt: new Date().toISOString(),
+      });
+      err.subscriberName = subscriberName;
+      err.subscriberFailureCount = count;
+      if (count >= 3) {
+        this.subscribers.delete(subscriber);
+        this._subscriberFailures.delete(subscriber);
+        warn(TAG, `subscriber ${subscriberName} disabled after 3 consecutive failures: ${err.message}`);
+      }
+      throw err;
+    }
+  }
+
+  _subscriberName(subscriber) {
+    if (typeof subscriber === 'function') return subscriber.name || 'anonymous-function';
+    return subscriber.name || subscriber.constructor?.name || 'anonymous-subscriber';
   }
 
   _withSubscriberTimeout(operation) {
@@ -899,10 +926,35 @@ export class Scheduler {
   }
 
   async _publishWorkerCcEvent(msg, ctx = {}) {
-    await this.eventBus.publish(msg, {
-      scheduler: this,
-      ...ctx,
-    });
+    try {
+      await this.eventBus.publish(msg, {
+        scheduler: this,
+        ...ctx,
+      });
+    } catch (err) {
+      const errors = err instanceof AggregateError ? err.errors : [err];
+      const summaries = errors.map((item) => ({
+        subscriber: item?.subscriberName || 'unknown',
+        message: sanitizeErrorText(item?.message || String(item || 'unknown')).slice(0, 200),
+        count: item?.subscriberFailureCount || null,
+      }));
+      try {
+        writeLessonCandidate(ctx.profile?.dataDir || ctx.task?.profile?.dataDir, {
+          source: 'event-bus-subscriber-failed',
+          stopReason: msg.eventType || 'cc_event',
+          errorContext: JSON.stringify({
+            eventType: msg.eventType || null,
+            subscribers: summaries,
+          }).slice(0, 500),
+          threadId: ctx.threadTs || ctx.task?.threadTs || '',
+          kind: 'event-bus',
+          origin: ctx.task?.origin || msg.origin || null,
+        });
+      } catch (lessonErr) {
+        warn(TAG, `failed to write event-bus subscriber failure lesson candidate: ${lessonErr.message}`);
+      }
+      throw err;
+    }
   }
 
   async _spawnWorker(task) {
@@ -1412,6 +1464,7 @@ export class Scheduler {
                 threadTs,
                 effectiveThreadTs,
                 platform,
+                profile,
                 deferDeliveryUntilResult,
                 channelSemantics,
                 applyThreadStatus,
@@ -1639,6 +1692,7 @@ export class Scheduler {
                 threadTs,
                 effectiveThreadTs,
                 platform,
+                profile,
                 deferDeliveryUntilResult,
                 channelSemantics,
                 applyThreadStatus,
