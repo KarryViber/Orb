@@ -6,6 +6,7 @@ import { homedir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildPrompt } from './context.js';
+import { warn } from './log.js';
 import { collectGitDiffSummary, isFileModifyingTool } from './worker-git-diff.js';
 import { buildImageBlocks } from './worker-image-blocks.js';
 import { buildWorkerMcpConfig, collectWorkspaceMcpServers } from './worker-mcp-boot.js';
