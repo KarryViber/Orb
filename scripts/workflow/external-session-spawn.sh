@@ -100,11 +100,18 @@ HBPY
 
   if [[ "$ENGINE" == "codex" ]]; then
     cd ~/Orb
+    # Codex 0.128.0+ 走 sandbox workspace-write 替代粗暴 bypass：
+    #   - workdir / /tmp / $TMPDIR / ~/.codex/memories 在 sandbox 内可写
+    #   - approval_policy=never 不阻塞
+    #   - network 显式启用（npm install / git fetch / curl 都走得通）
+    # 写域外（如 Karry 别处文件）会被拒，比 bypass 多一层护栏。
     codex exec \
-      --dangerously-bypass-approvals-and-sandbox \
+      --sandbox workspace-write \
+      -c approval_policy='"never"' \
+      -c sandbox_workspace_write.network_access=true \
       --cd ~/Orb \
       "$PROMPT" \
-      </dev/null \
+</dev/null \
       >"$LOG" \
       2> >(grep -v "failed to record rollout items: thread" >> "$LOG")
   else

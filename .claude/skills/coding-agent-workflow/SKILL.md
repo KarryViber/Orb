@@ -116,7 +116,7 @@ provenance: user-authored
 1. **`--cd` 必须是 `~/Orb`**，不能给子目录。原因：codex sandbox 把 `--cd` 当可写根，给 `workspace/` 会让 `~/Orb/profiles/<your-profile>/scripts/` 被踢出可写域，4/30 daily-notes-monitor regex 修复就栽在这。
 2. **`</dev/null` 强制关 stdin** — codex 检测到 stdin open 会等输入，heredoc/pipe 喂 prompt 都会触发挂起
 3. **prompt 走位置参数**，不走 heredoc / pipe / `<<EOF`
-4. **`--dangerously-bypass-approvals-and-sandbox`** + **spec 里禁止 codex 动 git** — 既绕开 sandbox 拦 `.git/index.lock`，又保证 diff 由主 session commit、日志不乱
+4. **`--sandbox workspace-write` + `-c approval_policy='"never"'` + `-c sandbox_workspace_write.network_access=true`** + **spec 里禁止 codex 动 git** — 替代旧 `--dangerously-bypass-approvals-and-sandbox`（5/2 切换）。新姿势：~/Orb 顶层 + /tmp + $TMPDIR + ~/.codex/memories 在 sandbox 内可写，网络启用，approval 不阻塞；写域外（如 Karry 别处文件）会被拒，比 bypass 多一层护栏。git diff 仍由主 session commit。
 5. **stderr 过滤 `failed to record rollout items: thread`** — codex_core 内部 rollout 持久化噪音，每次 exec 都出现且不影响执行
 
 ### 调用反例速查
