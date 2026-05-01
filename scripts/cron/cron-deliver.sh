@@ -21,6 +21,7 @@
 # 选项：
 #   --cron-name     cron 任务名（必填，用于失败 DM 标题）
 #   --channel       Slack 频道 ID（正常模式必填）
+#   --channel-name  Slack 频道名（从 config.json profiles.<profile>.channels 反查 ID）
 #   --main-msg      主消息文本（正常模式必填，必须符合公式 {emoji} {名} {日期}｜...）
 #   --reaction      Slack reaction 名（不带冒号，如 sleeping / bird / chart_with_upwards_trend）
 #   --thread-file   markdown thread（与 --blocks-file 二选一）
@@ -39,6 +40,7 @@ set -euo pipefail
 
 CRON_NAME=""
 CHANNEL=""
+CHANNEL_NAME=""
 MAIN_MSG=""
 REACTION=""
 THREAD_FILE=""
@@ -62,6 +64,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --cron-name) CRON_NAME="$2"; shift 2 ;;
     --channel) CHANNEL="$2"; shift 2 ;;
+    --channel-name) CHANNEL_NAME="$2"; shift 2 ;;
     --main-msg) MAIN_MSG="$2"; shift 2 ;;
     --reaction) REACTION="$2"; shift 2 ;;
     --thread-file) THREAD_FILE="$2"; shift 2 ;;
@@ -75,6 +78,18 @@ while [[ $# -gt 0 ]]; do
     *) echo "未知参数: $1" >&2; exit 1 ;;
   esac
 done
+
+if [[ -n "$CHANNEL" && -n "$CHANNEL_NAME" ]]; then
+  echo "❌ --channel 和 --channel-name 不能同时使用" >&2
+  exit 1
+fi
+
+if [[ -n "$CHANNEL_NAME" ]]; then
+  CHANNEL=$(python3 "$SCRIPT_DIR/channels-resolve.py" "$CHANNEL_NAME") || {
+    echo "❌ failed to resolve channel name: $CHANNEL_NAME" >&2
+    exit 64
+  }
+fi
 
 if [[ -z "$CRON_NAME" ]]; then
   echo "❌ --cron-name 必填" >&2
