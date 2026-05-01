@@ -10,7 +10,8 @@ from pathlib import Path
 
 _SCRIPTS_DIR = Path('/Users/karry/Orb/profiles/karry/scripts')
 _ROOT_SCRIPTS_DIR = Path('/Users/karry/Orb/scripts')
-for _path in (_ROOT_SCRIPTS_DIR, _SCRIPTS_DIR):
+_ROOT_CRON_DIR = Path('/Users/karry/Orb/scripts/cron')
+for _path in (_ROOT_CRON_DIR, _ROOT_SCRIPTS_DIR, _SCRIPTS_DIR):
   if str(_path) not in sys.path:
     sys.path.insert(0, str(_path))
 from cron_run_log import RunLog  # noqa: E402

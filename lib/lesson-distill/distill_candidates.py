@@ -7,7 +7,7 @@ import urllib.request
 from pathlib import Path
 
 import sys as _sys  # noqa: E402
-_sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+_sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "cron"))
 from cron_run_log import RunLog  # noqa: E402
 
 
