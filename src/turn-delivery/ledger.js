@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { mkdir, appendFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import {
@@ -32,6 +32,7 @@ export class TurnDeliveryLedger {
     this._ndjsonPath = ndjsonPath || null;
     this._recordsByTurn = new Map();
     this._deliveredKeys = new Set();
+    this._writeQueue = [];
     this._hydrateEnabled = hydrate;
     this._hydrateDeliveredKeys();
   }
@@ -49,7 +50,7 @@ export class TurnDeliveryLedger {
     records.push(normalized);
     this._recordsByTurn.set(normalized.turnId, records);
     if (deliveredKey) this._deliveredKeys.add(String(deliveredKey));
-    this._appendNdjson(normalized);
+    this._appendNdjson(normalized, { sync: HYDRATE_STABLE_INTENTS.has(normalized.intent) });
     return normalized;
   }
 
@@ -127,13 +128,32 @@ export class TurnDeliveryLedger {
     }
   }
 
-  _appendNdjson(record) {
+  _appendNdjson(record, { sync = false } = {}) {
     const filePath = this._resolveNdjsonPath();
-    if (!filePath) return;
+    if (!filePath) return Promise.resolve();
     const line = `${JSON.stringify(record)}\n`;
-    mkdir(dirname(filePath), { recursive: true })
+    if (sync) {
+      try {
+        mkdirSync(dirname(filePath), { recursive: true });
+        appendFileSync(filePath, line, 'utf8');
+      } catch (err) {
+        this._safeLog(`ndjson append failed: ${err.message}`);
+      }
+      return Promise.resolve();
+    }
+    const write = mkdir(dirname(filePath), { recursive: true })
       .then(() => appendFile(filePath, line, 'utf8'))
       .catch((err) => this._safeLog(`ndjson append failed: ${err.message}`));
+    this._writeQueue.push(write);
+    write.finally(() => {
+      const index = this._writeQueue.indexOf(write);
+      if (index >= 0) this._writeQueue.splice(index, 1);
+    });
+    return write;
+  }
+
+  async flush() {
+    await Promise.allSettled([...this._writeQueue]);
   }
 
   _safeLog(message) {

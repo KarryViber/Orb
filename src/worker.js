@@ -11,6 +11,7 @@ import { buildImageBlocks } from './worker-image-blocks.js';
 import { buildWorkerMcpConfig, collectWorkspaceMcpServers } from './worker-mcp-boot.js';
 import { getSessionId, updateSession } from './session.js';
 import { storeConversation } from './memory.js';
+import { writeLessonCandidate } from './lesson-candidates.js';
 import { resolveTurnCompleteText } from './worker-turn-text.js';
 import {
   makeCcEvent,
@@ -107,6 +108,10 @@ let _currentOrigin = null;
 let _currentChannelSemantics = 'reply';
 let _currentTurnModifiedPaths = new Set();
 let _currentMemoryManifest = [];
+let _stdoutParseFailCount = 0;
+let _stdoutParseFailLastSampleAt = 0;
+const STDOUT_PARSE_FAIL_THRESHOLD = 50;
+const STDOUT_PARSE_FAIL_SAMPLE_INTERVAL_MS = 60_000;
 
 process.on('message', async (msg) => {
   if (msg.type === 'inject') {
@@ -393,7 +398,21 @@ process.on('message', async (msg) => {
 
     // Session persistence
     if (exitResult.sessionId) {
-      await updateSession(dataDir, sessionKey, { sessionId: exitResult.sessionId, userId });
+      try {
+        await updateSession(dataDir, sessionKey, { sessionId: exitResult.sessionId, userId });
+      } catch (err) {
+        warn('worker', `session persistence failed (degraded): ${err.message}`);
+        try {
+          writeLessonCandidate(dataDir, {
+            source: 'session-persistence-failure',
+            stopReason: 'sessions_json_write_failed',
+            errorContext: `Worker turn completed but session persistence failed: ${err.message}`,
+            threadId: threadTs,
+            kind: 'session',
+            origin: { kind: 'worker-session-save', threadTs, userId },
+          });
+        } catch {}
+      }
     }
 
     // Send final result as an exit/status signal only. turn_complete is the only
@@ -800,7 +819,22 @@ function runClaudeInteractive(args, initialContent, workspace) {
       try {
         const parsed = JSON.parse(line);
         handleStreamMsg(parsed).catch(() => {});
-      } catch {}
+      } catch {
+        _stdoutParseFailCount += 1;
+        const now = Date.now();
+        if (now - _stdoutParseFailLastSampleAt > STDOUT_PARSE_FAIL_SAMPLE_INTERVAL_MS) {
+          _stdoutParseFailLastSampleAt = now;
+          warn('worker', `cli stdout JSON parse failed (sample, count=${_stdoutParseFailCount}): ${line.slice(0, 120)}`);
+        }
+        if (_stdoutParseFailCount >= STDOUT_PARSE_FAIL_THRESHOLD) {
+          process.send?.({
+            type: 'error',
+            error: `cli stdout JSON parse failed ${_stdoutParseFailCount} times`,
+            errorContext: { lastLinePrefix: line.slice(0, 120) },
+          });
+          process.exit(1);
+        }
+      }
     }
   });
 

@@ -40,8 +40,9 @@ function save(dataDir, sessions) {
   try {
     writeFileSync(tmp, JSON.stringify(sessions, null, 2), 'utf8');
     renameSync(tmp, file);
-  } catch {
+  } catch (err) {
     try { unlinkSync(tmp); } catch {}
+    throw new Error(`failed to persist sessions.json: ${err.message}`);
   }
 }
 

@@ -1722,9 +1722,21 @@ export class SlackAdapter extends PlatformAdapter {
     this._teamId = auth.team_id || null;
     info(TAG, `booted as @${auth.user} (${this._botUserId}, bot=${this._botId})`);
 
-    this._socket.on('message', (evt) => this._handleMessage(evt));
-    this._socket.on('interactive', (evt) => this._handleInteractive(evt));
-    this._socket.on('reaction_added', (evt) => this._handleReaction(evt));
+    const safeHandle = (eventType, handler) => async (evt, ...rest) => {
+      try {
+        return await handler.call(this, evt, ...rest);
+      } catch (err) {
+        const event = evt?.event || evt?.body || evt || {};
+        logError(
+          TAG,
+          `slack handler ${eventType} failed: ${err.message} eventType=${eventType} channel=${event.channel || event.channel_id || null} thread_ts=${event.thread_ts || null} user=${event.user || event.user_id || null} ts=${event.event_ts || event.ts || null}`
+        );
+      }
+    };
+
+    this._socket.on('message', safeHandle('message', this._handleMessage));
+    this._socket.on('interactive', safeHandle('interactive', this._handleInteractive));
+    this._socket.on('reaction_added', safeHandle('reaction_added', this._handleReaction));
 
     this._socket.on('disconnect', (err) => {
       warn(TAG, `socket disconnected: ${err || 'unknown'}`);

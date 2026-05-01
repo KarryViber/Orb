@@ -971,7 +971,9 @@ export class Scheduler {
       if (!prevTurn || prevTurn.abandoned) return;
       clearStatusRefresh(prevTurn);
       for (const key of [...this._pendingPermissionRequests.keys()]) {
-        if (key.startsWith(`${threadTs}:`)) this._pendingPermissionRequests.delete(key);
+        if (key.startsWith(`${threadTs}:`)) {
+          this._resolvePermissionRequest(key, { allow: false, reason: 'turn abandoned' });
+        }
       }
       await abandonTurnState({
         turn: prevTurn,
@@ -1653,7 +1655,7 @@ export class Scheduler {
     });
   }
 
-  shutdown(signal) {
+  async shutdown(signal) {
     const allWorkers = [...this.activeWorkers.values()].map(({ worker }) => worker).concat([...this._backgroundWorkers]);
     info(TAG, `${signal} received, draining ${this.activeWorkers.size} active + ${this._backgroundWorkers.size} background worker(s)...`);
     try {
@@ -1668,6 +1670,14 @@ export class Scheduler {
       activeWorkers: this.activeWorkers,
       getProfile: (userId) => this.getProfile(userId),
     });
+
+    for (const ledger of this._turnDeliveryLedgers.values()) {
+      try {
+        await ledger.flush?.();
+      } catch (err) {
+        warn(TAG, `turn delivery ledger flush failed: ${err.message}`);
+      }
+    }
 
     // Disconnect all adapters
     for (const [name, adapter] of this.adapters) {

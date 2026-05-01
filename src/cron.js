@@ -245,6 +245,48 @@ function postFailureDm(profileName, corruptPath, fallback) {
   });
 }
 
+function postCronPersistenceFailureDm(profileName, dataDir, reason) {
+  const channel = PROFILE_DM_CHANNELS[profileName] || PROFILE_DM_CHANNELS.karry;
+  const token = process.env.SLACK_BOT_TOKEN;
+  if (!channel || !token || typeof fetch !== 'function') return;
+
+  const text = [
+    '🚨 cron-jobs.json 写入失败',
+    `profile: ${profileName}`,
+    `dataDir: ${dataDir}`,
+    `reason: ${reason}`,
+    'nextRunAt 未落盘；修复磁盘/权限后下次 tick 会重试 due 窗口。',
+  ].join('\n').slice(0, 500);
+
+  fetch('https://slack.com/api/chat.postMessage', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json; charset=utf-8',
+    },
+    body: JSON.stringify({ channel, text }),
+  }).catch((err) => {
+    warn(TAG, `failed to send cron persistence failure DM: ${err.message}`);
+  });
+}
+
+function recordCronPersistenceFailure(dataDir, reason, job = null) {
+  try {
+    writeLessonCandidate(dataDir, {
+      source: 'cron-persistence-failure',
+      stopReason: 'cron_jobs_write_failed',
+      errorContext: String(reason || '').slice(0, 500),
+      threadId: job?.id ? `cron:${job.id}` : 'cron:persist',
+      cronName: job?.name || job?.id || 'cron-jobs.json',
+      kind: 'cron',
+      origin: { kind: 'cron-persist', jobId: job?.id || null },
+    });
+  } catch (err) {
+    warn(TAG, `failed to write cron persistence failure lesson candidate: ${err.message}`);
+  }
+  postCronPersistenceFailureDm(profileNameFromDataDir(dataDir), dataDir, reason);
+}
+
 function loadJobs(dataDir) {
   const p = jobsPath(dataDir);
   if (!existsSync(p)) {
@@ -373,7 +415,7 @@ function withJobsFileLock(dataDir, fn) {
   }
 }
 
-function saveJobs(dataDir, jobs) {
+export function saveJobs(dataDir, jobs) {
   const p = jobsPath(dataDir);
   const tmp = p + '.tmp.' + process.pid;
   try {
@@ -386,6 +428,7 @@ function saveJobs(dataDir, jobs) {
   } catch (err) {
     logError(TAG, `failed to save jobs to ${p}: ${err.message}`);
     try { unlinkSync(tmp); } catch {}
+    throw err;
   }
 }
 
@@ -515,19 +558,28 @@ export class CronScheduler {
         }
 
         if (nextRunUpdates.size > 0) {
-          await this._queueJobWrite(paths.dataDir, (storedJobs) => {
-            let dirty = false;
+          try {
+            await this._queueJobWrite(paths.dataDir, (storedJobs) => {
+              let dirty = false;
 
-            for (const storedJob of storedJobs) {
-              const updates = nextRunUpdates.get(storedJob.id);
-              if (!updates) continue;
-              if (storedJob.nextRunAt === updates.nextRunAt) continue;
-              storedJob.nextRunAt = updates.nextRunAt;
-              dirty = true;
+              for (const storedJob of storedJobs) {
+                const updates = nextRunUpdates.get(storedJob.id);
+                if (!updates) continue;
+                if (storedJob.nextRunAt === updates.nextRunAt) continue;
+                storedJob.nextRunAt = updates.nextRunAt;
+                dirty = true;
+              }
+
+              return dirty;
+            });
+          } catch (err) {
+            logError(TAG, `failed to persist cron nextRunAt updates: ${err.message}`);
+            recordCronPersistenceFailure(paths.dataDir, err.message);
+            for (const job of dueJobs) {
+              const storedJob = jobs.find((item) => item.id === job.id);
+              if (storedJob) job.nextRunAt = storedJob.nextRunAt;
             }
-
-            return dirty;
-          });
+          }
         }
 
         for (const job of dueJobs) {
@@ -651,6 +703,7 @@ export class CronScheduler {
       await this._persistJobState(paths.dataDir, job);
     } catch (err) {
       logError(TAG, `failed to persist job ${job.id}: ${err.message}`);
+      recordCronPersistenceFailure(paths.dataDir, err.message, job);
     } finally {
       this._inflightJobs.delete(inflightKey);
     }
