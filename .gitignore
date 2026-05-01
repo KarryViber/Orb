@@ -35,8 +35,14 @@ logs/handlers/
 *.db-shm
 *.bak
 
-# IDE
+# IDE — ignore .claude/ everywhere except the Orb system-level skill pool
+# (`.claude/skills/`, see _GOVERNANCE.md § Skill 分层 scope; loaded into every
+# worker via worker.js `--add-dir <orbRoot>`)
 .claude/
+!.claude/
+.claude/*
+!.claude/skills/
+!.claude/skills/**
 
 # OSS research clones (cloned for adopt-from-external-repo workflows)
 research/
