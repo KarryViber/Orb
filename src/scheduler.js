@@ -8,7 +8,7 @@ import { taskQueue } from './queue.js';
 import { sanitizeErrorText } from './format-utils.js';
 import { listFacts, storeLesson, storeCorrectionLesson } from './memory.js';
 import { spawnWorker } from './spawn.js';
-import { getDefaults } from './config.js';
+import { getDefaults, getProfileNotifyDm } from './config.js';
 import { writeLessonCandidate, isUserCorrectionText } from './lesson-candidates.js';
 import {
   checkSkillReview,
@@ -48,9 +48,6 @@ const MAX_AUTO_CONTINUE = 2;  // max auto-retries on empty result (context overf
 const PERMISSION_APPROVAL_TIMEOUT_MS = ORB_PERMISSION_TIMEOUT_MS;
 const STATUS_REFRESH_MS = 20_000;
 const SILENT_PREFIX = '[SILENT]';
-const PROFILE_DM_CHANNELS = {
-  karry: 'D0ANGB3M1CZ',
-};
 const LOADING_MESSAGES = [
   'Cooking…',
   'Reading files…',
@@ -684,8 +681,11 @@ export class Scheduler {
     }
 
     for (const { profileName, dataDir, interruptedPath } of pending) {
-      const channel = PROFILE_DM_CHANNELS[profileName] || PROFILE_DM_CHANNELS.karry;
-      if (!channel) continue;
+      const channel = getProfileNotifyDm(profileName);
+      if (!channel) {
+        warn(TAG, `startup interrupted-run notification skipped for profile=${profileName}: notifyChannels.dm not configured`);
+        continue;
+      }
 
       try {
         const runs = JSON.parse(readFileSync(interruptedPath, 'utf8'));

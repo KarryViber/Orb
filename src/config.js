@@ -76,6 +76,12 @@ export function resolveProfile(userId) {
   throw new Error(`no profile mapped for userId: ${userId}`);
 }
 
+export function getProfileNotifyDm(profileName) {
+  const config = loadConfig();
+  const channel = config.profiles?.[profileName]?.notifyChannels?.dm;
+  return typeof channel === 'string' && channel.trim() ? channel : null;
+}
+
 /**
  * Resolve relative paths in profile to absolute paths.
  */

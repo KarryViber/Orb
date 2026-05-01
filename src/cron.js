@@ -13,14 +13,12 @@ import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, s
 import { basename, dirname, join } from 'node:path';
 import { info, error as logError, warn } from './log.js';
 import { writeLessonCandidate } from './lesson-candidates.js';
+import { getProfileNotifyDm } from './config.js';
 
 const TAG = 'cron';
 const TICK_INTERVAL = 60_000; // 60 seconds
 const JOBS_LOCK_TIMEOUT_MS = 5_000;
 const JOBS_LOCK_STALE_MS = 60_000;
-const PROFILE_DM_CHANNELS = {
-  karry: 'D0ANGB3M1CZ',
-};
 const missingJobsLogged = new Set();
 
 export class BadCronExpr extends Error {
@@ -222,9 +220,13 @@ function updateLastGoodJobs(dataDir) {
 }
 
 function postFailureDm(profileName, corruptPath, fallback) {
-  const channel = PROFILE_DM_CHANNELS[profileName];
+  const channel = getProfileNotifyDm(profileName);
   const token = process.env.SLACK_BOT_TOKEN;
-  if (!channel || !token || typeof fetch !== 'function') return;
+  if (!channel) {
+    warn(TAG, `cron corrupt DM skipped for profile=${profileName}: notifyChannels.dm not configured`);
+    return;
+  }
+  if (!token || typeof fetch !== 'function') return;
 
   const text = [
     '🚨 cron-jobs.json 损坏已隔离',
@@ -246,9 +248,13 @@ function postFailureDm(profileName, corruptPath, fallback) {
 }
 
 function postCronPersistenceFailureDm(profileName, dataDir, reason) {
-  const channel = PROFILE_DM_CHANNELS[profileName] || PROFILE_DM_CHANNELS.karry;
+  const channel = getProfileNotifyDm(profileName);
   const token = process.env.SLACK_BOT_TOKEN;
-  if (!channel || !token || typeof fetch !== 'function') return;
+  if (!channel) {
+    warn(TAG, `cron persistence failure DM skipped for profile=${profileName}: notifyChannels.dm not configured`);
+    return;
+  }
+  if (!token || typeof fetch !== 'function') return;
 
   const text = [
     '🚨 cron-jobs.json 写入失败',
@@ -608,6 +614,7 @@ export class CronScheduler {
     this._inflightJobs.add(inflightKey);
     info(TAG, `executing job ${job.id} "${job.name}" (profile=${job.profileName})`);
     const origin = { kind: 'cron', name: job.id, parentAttemptId: null };
+    let applyCompletionRules = true;
     const recordFailureLesson = (reason, errorContext = '') => {
       try {
         writeLessonCandidate(paths.dataDir, {
@@ -680,13 +687,18 @@ export class CronScheduler {
       job.lastRunAt = now.toISOString();
       job.lastStatus = 'failed';
       job.lastError = truncateErrorContext(err.message);
+      if (err?.code === 'ORB_CRON_NOTIFY_DM_MISSING') {
+        job.enabled = false;
+        job.nextRunAt = null;
+        applyCompletionRules = false;
+      }
       logError(TAG, `job ${job.id} failed: ${err.message}`);
       recordFailureLesson(err.message || 'worker_error', err.stack || err.message);
       job.lastDeliveryError = null;
     }
 
     // Repeat tracking
-    if (job.repeat?.times != null) {
+    if (applyCompletionRules && job.repeat?.times != null) {
       job.repeat.completed = (job.repeat.completed || 0) + 1;
       if (job.repeat.completed >= job.repeat.times) {
         job.enabled = false;
@@ -696,7 +708,7 @@ export class CronScheduler {
     }
 
     // One-shot: disable after execution
-    if (job.schedule.kind === 'once') {
+    if (applyCompletionRules && job.schedule.kind === 'once') {
       job.enabled = false;
       job.nextRunAt = null;
     }
@@ -720,9 +732,15 @@ export class CronScheduler {
   }
 
   _resolveDelivery(job) {
+    const channel = getProfileNotifyDm(job.profileName);
+    if (!channel) {
+      const err = new Error(`no notifyChannels.dm configured for profile=${job.profileName}`);
+      err.code = 'ORB_CRON_NOTIFY_DM_MISSING';
+      throw err;
+    }
     return {
       platform: 'slack',
-      channel: PROFILE_DM_CHANNELS[job.profileName] || PROFILE_DM_CHANNELS.karry,
+      channel,
       threadTs: null,
     };
   }
