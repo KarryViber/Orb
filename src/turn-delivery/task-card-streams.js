@@ -138,7 +138,6 @@ export function createTaskCardStreamProcessor({
         const hadStream = Boolean(state.streamId);
         const initialChunks = getInitialChunks(msg, ctx, state, chunks);
         if (!await ensureStarted(state, ctx, initialChunks, msg.turnId)) return;
-        if (!hadStream && initialChunks === chunks) return;
         if (state.failed || !state.streamId) return;
         const appendSequence = state.appendSeq = (state.appendSeq || 0) + 1;
         await chainAppend(state, async () => {

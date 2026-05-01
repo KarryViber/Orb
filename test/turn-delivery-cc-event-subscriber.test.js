@@ -146,6 +146,12 @@ test('turn-delivery unified subscriber renders TodoWrite plan stream', async () 
     ['Inspect scheduler', 'complete'],
     ['Move subscriber', 'in_progress'],
   ]);
+  const planAppend = adapter.calls.find((call) => (
+    call[0] === 'appendStream'
+    && call[1] === start[4].stream_id
+    && call[2]?.some((chunk) => String(chunk.id || '').startsWith('todowrite-todo-'))
+  ));
+  assert.ok(planAppend);
 });
 
 test('turn-delivery text stream marks task card failed on Slack ownership loss', async () => {
