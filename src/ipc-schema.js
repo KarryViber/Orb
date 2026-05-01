@@ -10,6 +10,14 @@ export const IPC_TYPES = {
   RESULT: 'result',
 };
 
+const REQUIRED_FIELDS_BY_TYPE = {
+  [IPC_TYPES.CC_EVENT]: ['turnId', 'eventType', 'payload'],
+  [IPC_TYPES.TURN_COMPLETE]: ['text', 'toolCount', 'channelSemantics'],
+  [IPC_TYPES.RESULT]: ['channelSemantics'],
+  [IPC_TYPES.INJECT_FAILED]: ['userText'],
+  [IPC_TYPES.ERROR]: ['error'],
+};
+
 function requireFields(payload, fields, factoryName) {
   for (const field of fields) {
     if (!Object.hasOwn(payload || {}, field) || payload[field] === undefined) {
@@ -24,6 +32,22 @@ function normalizeOptional(value) {
 
 function normalizeArray(value) {
   return Array.isArray(value) ? value : [];
+}
+
+export function validateIncomingIpc(msg) {
+  if (!msg || typeof msg !== 'object' || typeof msg.type !== 'string') {
+    return 'invalid msg shape';
+  }
+  if (!Object.values(IPC_TYPES).includes(msg.type)) {
+    return `unknown ipc type: ${msg.type}`;
+  }
+  const required = REQUIRED_FIELDS_BY_TYPE[msg.type] || [];
+  for (const field of required) {
+    if (!Object.hasOwn(msg, field)) {
+      return `${msg.type} missing required field: ${field}`;
+    }
+  }
+  return null;
 }
 
 export function makeTask(payload = {}) {

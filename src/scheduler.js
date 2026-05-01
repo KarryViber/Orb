@@ -35,7 +35,7 @@ import {
 import { TurnDeliveryLedger, ledgerPathForDataDir } from './turn-delivery/ledger.js';
 import { TurnDeliveryOrchestrator } from './turn-delivery/orchestrator.js';
 import { createTurnDeliveryCcEventSubscriber } from './turn-delivery/cc-event-subscriber.js';
-import { makeCcEvent, makeInject, makeTask } from './ipc-schema.js';
+import { makeCcEvent, makeInject, makeTask, validateIncomingIpc } from './ipc-schema.js';
 import {
   ORB_EVENTBUS_SMOKE_LOG,
   ORB_PERMISSION_APPROVAL_MODE,
@@ -1364,8 +1364,9 @@ export class Scheduler {
           // turn_start, turn_end, turn_complete, cc_event, inject_failed,
           // error, and the process-exit result signal. Slack UI rendering is
           // driven by cc_event subscribers; legacy UI IPC handlers were removed.
-          if (!msg || !msg.type) {
-            warn(TAG, `invalid worker message: ${JSON.stringify(msg)?.slice(0, 200)}`);
+          const validationError = validateIncomingIpc(msg);
+          if (validationError) {
+            warn(TAG, `dropped invalid worker ipc: ${validationError} thread=${threadTs}`);
             return;
           }
           info(TAG, `worker response: type=${msg.type} thread=${threadTs} textLen=${msg.text?.length || 0}`);
