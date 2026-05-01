@@ -271,12 +271,13 @@ function postCronPersistenceFailureDm(profileName, dataDir, reason) {
 }
 
 function recordCronPersistenceFailure(dataDir, reason, job = null) {
+  const profileName = profileNameFromDataDir(dataDir);
   try {
     writeLessonCandidate(dataDir, {
       source: 'cron-persistence-failure',
       stopReason: 'cron_jobs_write_failed',
       errorContext: String(reason || '').slice(0, 500),
-      threadId: job?.id ? `cron:${job.id}` : 'cron:persist',
+      threadId: job?.id ? `cron:${profileName}:${job.id}` : `cron:${profileName}:persist`,
       cronName: job?.name || job?.id || 'cron-jobs.json',
       kind: 'cron',
       origin: { kind: 'cron-persist', jobId: job?.id || null },
@@ -284,7 +285,7 @@ function recordCronPersistenceFailure(dataDir, reason, job = null) {
   } catch (err) {
     warn(TAG, `failed to write cron persistence failure lesson candidate: ${err.message}`);
   }
-  postCronPersistenceFailureDm(profileNameFromDataDir(dataDir), dataDir, reason);
+  postCronPersistenceFailureDm(profileName, dataDir, reason);
 }
 
 function loadJobs(dataDir) {
@@ -597,6 +598,7 @@ export class CronScheduler {
 
   async _executeCronJob(job, paths, now) {
     const inflightKey = this._inflightKey(paths.dataDir, job.id);
+    const profileName = job.profileName;
 
     if (this._inflightJobs.has(inflightKey)) {
       warn(TAG, `job ${job.id} still running from previous tick, skipping this fire`);
@@ -612,7 +614,7 @@ export class CronScheduler {
           source: 'cron-failure',
           stopReason: reason,
           errorContext: JSON.stringify({ error: errorContext, origin }).slice(0, 500),
-          threadId: `cron:${job.id}`,
+          threadId: `cron:${profileName}:${job.id}`,
           cronName: job.name || job.id,
           kind: 'cron',
           origin,
@@ -636,7 +638,7 @@ export class CronScheduler {
         userText: job.prompt,
         fileContent: '',
         imagePaths: [],
-        threadTs: `cron:${job.id}`,
+        threadTs: `cron:${profileName}:${job.id}`,
         deliveryThreadTs: delivery.threadTs || null,
         channel: delivery.channel,
         userId: null,

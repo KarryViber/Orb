@@ -1,7 +1,7 @@
 import { join } from 'node:path';
 import net from 'node:net';
 import { randomUUID } from 'node:crypto';
-import { existsSync, unlinkSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, renameSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { info, error as logError, warn } from './log.js';
 import { taskQueue } from './queue.js';
@@ -21,6 +21,7 @@ import {
 } from './scheduler-memory-maintenance.js';
 import {
   normalizeShutdownQueue,
+  INTERRUPTED_RUNS_FILE,
   persistShutdownQueues,
   restoreShutdownQueues,
   sanitizeTaskForPersistence,
@@ -47,6 +48,9 @@ const MAX_AUTO_CONTINUE = 2;  // max auto-retries on empty result (context overf
 const PERMISSION_APPROVAL_TIMEOUT_MS = ORB_PERMISSION_TIMEOUT_MS;
 const STATUS_REFRESH_MS = 20_000;
 const SILENT_PREFIX = '[SILENT]';
+const PROFILE_DM_CHANNELS = {
+  karry: 'D0ANGB3M1CZ',
+};
 const LOADING_MESSAGES = [
   'Cooking…',
   'Reading files…',
@@ -179,6 +183,41 @@ function getTaskCardStreamErrorCode(err) {
   if (typeof err.slackErrorCode === 'string' && err.slackErrorCode) return err.slackErrorCode;
   const match = String(err.message || '').match(/chat\.(?:start|append|stop)Stream failed: ([a-z_]+)/);
   return match?.[1] || null;
+}
+
+function timestampForPath(date = new Date()) {
+  return date.toISOString().replace(/[:.]/g, '-');
+}
+
+function originLabel(origin) {
+  if (!origin || typeof origin !== 'object') return 'unknown';
+  if (origin.kind === 'cron') return `cron:${origin.name || 'unknown'}`;
+  if (origin.kind === 'inject') return `inject from ${origin.parentAttemptId || 'unknown'}`;
+  if (origin.kind === 'system') return `system:${origin.name || 'unknown'}`;
+  return origin.kind || 'unknown';
+}
+
+function formatInterruptedRunsText(profileName, runs, detailPath) {
+  const byRole = new Map();
+  for (const run of Array.isArray(runs) ? runs : []) {
+    const role = run?.role || 'unknown';
+    if (!byRole.has(role)) byRole.set(role, []);
+    byRole.get(role).push(run);
+  }
+  const lines = [`⚠️ 上次 daemon 关闭时有 ${runs.length} 个任务在执行中`, ''];
+  for (const [role, roleRuns] of byRole) {
+    lines.push(`${role} (${roleRuns.length}):`);
+    for (const run of roleRuns.slice(0, 8)) {
+      const when = run?.interruptedAt || 'unknown time';
+      const attempt = run?.attemptId ? ` (attemptId=${run.attemptId})` : '';
+      lines.push(`• ${originLabel(run?.origin)} → 触发于 ${when}${attempt}`);
+    }
+    if (roleRuns.length > 8) lines.push(`• ... 另 ${roleRuns.length - 8} 个`);
+    lines.push('');
+  }
+  lines.push('这些任务未自动重放。如需重做，请手动触发。');
+  lines.push(`详情：profiles/${profileName}/data/${detailPath}`);
+  return lines.join('\n').slice(0, 800);
 }
 
 export function makeTaskCardState({ enabled = false, deferred = false } = {}) {
@@ -370,6 +409,9 @@ export class Scheduler {
     globalThis.__orbSchedulerInstance = this;
     if (startPermissionServer !== false) this._startPermissionServer();
     this._restoreShutdownQueues();
+    void this._notifyInterruptedRuns().catch((err) => {
+      warn(TAG, `startup interrupted-run notification failed: ${err.message}`);
+    });
   }
 
   addAdapter(name, adapter) {
@@ -613,6 +655,60 @@ export class Scheduler {
 
   _restoreShutdownQueues() {
     return restoreShutdownQueues({ threadQueues: this.threadQueues });
+  }
+
+  async _notifyInterruptedRuns({ profilesDir = join(import.meta.dirname, '..', 'profiles') } = {}) {
+    if (!existsSync(profilesDir)) return;
+
+    let profiles = [];
+    try {
+      profiles = readdirSync(profilesDir, { withFileTypes: true }).filter((entry) => entry.isDirectory());
+    } catch (err) {
+      warn(TAG, `startup interrupted-run scan failed: ${err.message}`);
+      return;
+    }
+
+    const pending = [];
+    for (const entry of profiles) {
+      const profileName = entry.name;
+      const dataDir = join(profilesDir, profileName, 'data');
+      const interruptedPath = join(dataDir, INTERRUPTED_RUNS_FILE);
+      if (existsSync(interruptedPath)) pending.push({ profileName, dataDir, interruptedPath });
+    }
+    if (pending.length === 0) return;
+
+    const token = process.env.SLACK_BOT_TOKEN;
+    if (!token || typeof fetch !== 'function') {
+      warn(TAG, `startup interrupted-run notification skipped: SLACK_BOT_TOKEN unavailable`);
+      return;
+    }
+
+    for (const { profileName, dataDir, interruptedPath } of pending) {
+      const channel = PROFILE_DM_CHANNELS[profileName] || PROFILE_DM_CHANNELS.karry;
+      if (!channel) continue;
+
+      try {
+        const runs = JSON.parse(readFileSync(interruptedPath, 'utf8'));
+        if (!Array.isArray(runs) || runs.length === 0) continue;
+        const text = formatInterruptedRunsText(profileName, runs, INTERRUPTED_RUNS_FILE);
+        const resp = await fetch('https://slack.com/api/chat.postMessage', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json; charset=utf-8',
+          },
+          body: JSON.stringify({ channel, text }),
+        });
+        if (!resp?.ok) throw new Error(`Slack HTTP ${resp?.status || 'unknown'}`);
+        const body = await resp.json().catch(() => ({}));
+        if (body?.ok === false) throw new Error(`Slack API ${body.error || 'unknown_error'}`);
+        const ackPath = join(dataDir, `interrupted-runs.acked.${timestampForPath()}.json`);
+        renameSync(interruptedPath, ackPath);
+        info(TAG, `startup interrupted-run notification sent for profile=${profileName}; archived ${ackPath}`);
+      } catch (err) {
+        warn(TAG, `startup interrupted-run notification failed for profile=${profileName}: ${err.message}`);
+      }
+    }
   }
 
   _normalizeShutdownQueue(raw, queuePath) {
