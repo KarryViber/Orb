@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { Scheduler } from '../src/scheduler.js';
+import { Scheduler } from '../../src/scheduler.js';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 

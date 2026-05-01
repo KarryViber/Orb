@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveTurnCompleteText } from '../src/worker-turn-text.js';
+import { resolveTurnCompleteText } from '../../src/worker-turn-text.js';
 
 function createTurnTextHarness() {
   let turnBuffer = [];

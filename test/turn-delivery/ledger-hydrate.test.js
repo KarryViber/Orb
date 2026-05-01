@@ -4,8 +4,8 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { TurnDeliveryOrchestrator } from '../src/turn-delivery/orchestrator.js';
-import { TurnDeliveryLedger, ledgerPathForDataDir } from '../src/turn-delivery/ledger.js';
+import { TurnDeliveryOrchestrator } from '../../src/turn-delivery/orchestrator.js';
+import { TurnDeliveryLedger, ledgerPathForDataDir } from '../../src/turn-delivery/ledger.js';
 
 function todayIsoDate() {
   return new Date().toISOString().slice(0, 10);

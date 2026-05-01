@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { WeChatAdapter } from '../src/adapters/wechat.js';
+import { WeChatAdapter } from '../../../src/adapters/wechat.js';
 
 test('WeChat setTyping fetches a typing ticket on cache miss and times out quickly', async () => {
   const adapter = new WeChatAdapter({ accountId: 'acct', token: 'token', baseUrl: 'https://wechat.test' });

@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { EventBus } from '../src/scheduler.js';
-import { TurnDeliveryOrchestrator } from '../src/turn-delivery/orchestrator.js';
-import { createTurnDeliveryCcEventSubscriber } from '../src/turn-delivery/cc-event-subscriber.js';
+import { EventBus } from '../../src/scheduler.js';
+import { TurnDeliveryOrchestrator } from '../../src/turn-delivery/orchestrator.js';
+import { createTurnDeliveryCcEventSubscriber } from '../../src/turn-delivery/cc-event-subscriber.js';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 

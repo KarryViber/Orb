@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import {
   validateDmRoutingConfig,
   validateDmRoutingRules,
-} from '../src/dm-routing-schema.js';
+} from '../../../src/dm-routing-schema.js';
 
 const config = JSON.parse(readFileSync(join(process.cwd(), 'config.json'), 'utf8'));
 

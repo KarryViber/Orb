@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { collectWorkspaceMcpServers } from '../src/worker.js';
+import { collectWorkspaceMcpServers } from '../../src/worker.js';
 
 function writeMcpServer(def) {
   const workspace = mkdtempSync(join(tmpdir(), 'orb-worker-mcp-'));

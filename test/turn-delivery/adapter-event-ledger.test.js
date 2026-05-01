@@ -3,9 +3,9 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { SlackAdapter } from '../src/adapters/slack.js';
-import { Scheduler } from '../src/scheduler.js';
-import { TurnDeliveryLedger } from '../src/turn-delivery/ledger.js';
+import { SlackAdapter } from '../../src/adapters/slack.js';
+import { Scheduler } from '../../src/scheduler.js';
+import { TurnDeliveryLedger } from '../../src/turn-delivery/ledger.js';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -85,7 +85,7 @@ test('scheduler rejects adapters without deliver implementation', () => {
 });
 
 test('scheduler no longer contains delivery adapter wrapper', () => {
-  const source = readFileSync(new URL('../src/scheduler.js', import.meta.url), 'utf8');
+  const source = readFileSync(new URL('../../src/scheduler.js', import.meta.url), 'utf8');
   const removedName = 'makeAdapter' + 'ForDelivery';
   assert.equal(source.includes(removedName), false);
 });

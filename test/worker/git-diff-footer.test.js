@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { collectGitDiffSummary, recordModifiedPathFromToolUse } from '../src/worker.js';
+import { collectGitDiffSummary, recordModifiedPathFromToolUse } from '../../src/worker.js';
 
 function git(cwd, args) {
   execFileSync('git', args, { cwd, stdio: 'pipe' });

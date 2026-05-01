@@ -6,7 +6,7 @@ import {
   matchDmRule,
   renderDmRoutingMainText,
   renderDmRoutingPrompt,
-} from '../src/adapters/slack-dm-routing.js';
+} from '../../../src/adapters/slack-dm-routing.js';
 
 const config = JSON.parse(readFileSync(join(process.cwd(), 'config.json'), 'utf8'));
 const rules = config.adapters.slack.dmRouting.rules;

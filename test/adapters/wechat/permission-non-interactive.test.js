@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { Scheduler } from '../src/scheduler.js';
-import { WeChatAdapter } from '../src/adapters/wechat.js';
+import { Scheduler } from '../../../src/scheduler.js';
+import { WeChatAdapter } from '../../../src/adapters/wechat.js';
 
 function createSocket() {
   const socket = new EventEmitter();

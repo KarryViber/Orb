@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { Scheduler } from '../src/scheduler.js';
+import { Scheduler } from '../../../src/scheduler.js';
 
 test('wechat user-id threadTs is accepted by lesson and memory hook counters', () => {
   const scheduler = new Scheduler({
