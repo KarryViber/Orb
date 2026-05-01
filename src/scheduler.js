@@ -10,6 +10,7 @@ import { listFacts, storeLesson, storeCorrectionLesson } from './memory.js';
 import { spawnWorker } from './spawn.js';
 import { getDefaults, getProfileNotifyDm } from './config.js';
 import { writeLessonCandidate, isUserCorrectionText } from './lesson-candidates.js';
+import { isSuccessfulStopReason, isTruncatedStopReason } from './stop-reason.js';
 import {
   checkSkillReview,
   scanExistingSkills,
@@ -140,10 +141,6 @@ function isSilentResultText(text) {
 function normalizeChannelSemantics(value) {
   return value === 'silent' || value === 'broadcast' ? value : 'reply';
 }
-function isSuccessfulStopReason(stopReason) {
-  return !stopReason || stopReason === 'success' || stopReason === 'stop' || stopReason === 'end_turn';
-}
-
 function shortFailureReason(value, fallback = 'worker failed') {
   const text = sanitizeErrorText(value || fallback)
     .split(/\r?\n/)
@@ -1262,7 +1259,7 @@ export class Scheduler {
       try {
         if (!isSuccessfulStopReason(msg.stopReason)) {
           this._autoContinueCount.delete(threadTs);
-          const isMaxTurnsLike = msg.stopReason === 'max_turns_reached' || msg.stopReason === 'tool_use';
+          const isMaxTurnsLike = isTruncatedStopReason(msg.stopReason);
           if (isMaxTurnsLike) {
             warn(TAG, `worker turn limit result: thread=${threadTs} stopReason=${msg.stopReason} exitCode=${msg.exitCode ?? 'unknown'}`);
             if (!userVisibleDeliveryObserved) {

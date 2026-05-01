@@ -281,6 +281,26 @@ test('cron non-success stopReason records stderr summary as failed status', asyn
   });
 });
 
+test('cron truncated stopReason persists truncated status without failure lesson', async () => {
+  const dataDir = createTempDataDir();
+  const scheduler = createScheduler(
+    dataDir,
+    async () => ({ text: '', stopReason: 'tool_use' }),
+  );
+
+  writeJobs(dataDir, [createJob('job-tool-use')]);
+
+  await scheduler.tick();
+  await delay(20);
+  await scheduler._awaitJobWrites(dataDir);
+
+  const [job] = readJobs(dataDir);
+  assert.equal(job.lastStatus, 'truncated');
+  assert.equal(job.lastError, 'tool_use: 触达 turn 上限，任务未完成（非失败）');
+  assert.equal(job.lastDeliveryError, null);
+  assert.equal(existsSync(join(dataDir, 'lesson-candidates.jsonl')), false);
+});
+
 test('cron path uses scheduler executeTask and preserves cc-events JSONL side effects', async () => {
   const root = mkdtempSync(join(tmpdir(), 'orb-cron-jsonl-'));
   const dataDir = join(root, 'data');

@@ -14,6 +14,7 @@ import { basename, dirname, join } from 'node:path';
 import { info, error as logError, warn } from './log.js';
 import { writeLessonCandidate } from './lesson-candidates.js';
 import { getProfileNotifyDm as getConfiguredProfileNotifyDm } from './config.js';
+import { classifyStopReason, isSuccessfulStopReason } from './stop-reason.js';
 
 const TAG = 'cron';
 const TICK_INTERVAL = 60_000; // 60 seconds
@@ -450,10 +451,6 @@ function graceMs(schedule) {
   return 7_200_000;
 }
 
-function isSuccessfulStopReason(stopReason) {
-  return !stopReason || stopReason === 'success' || stopReason === 'stop' || stopReason === 'end_turn';
-}
-
 function failureReasonFromResult(responseText, stopReason, errorSummary = '') {
   const text = String(responseText || '').trim();
   if (text.toLowerCase().startsWith('failed:')) return text.slice('failed:'.length).trim() || 'failed';
@@ -671,10 +668,20 @@ export class CronScheduler {
       responseText = result?.text || '';
       stopReason = result?.stopReason || null;
 
+      const stopReasonClass = classifyStopReason(stopReason);
       const failureReason = failureReasonFromResult(responseText, stopReason, result?.errorSummary || '');
 
       job.lastRunAt = now.toISOString();
-      if (failureReason) {
+      if (failureReason && stopReasonClass === 'failed') {
+        job.lastStatus = 'failed';
+        job.lastError = truncateErrorContext(failureReason);
+        recordFailureLesson(failureReason, responseText || stopReason || '');
+        job.lastDeliveryError = null;
+      } else if (stopReasonClass === 'truncated') {
+        job.lastStatus = 'truncated';
+        job.lastError = `${stopReason}: 触达 turn 上限，任务未完成（非失败）`;
+        job.lastDeliveryError = null;
+      } else if (failureReason) {
         job.lastStatus = 'failed';
         job.lastError = truncateErrorContext(failureReason);
         recordFailureLesson(failureReason, responseText || stopReason || '');
