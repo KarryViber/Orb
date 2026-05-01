@@ -222,7 +222,15 @@ export function makeTaskCardState({ enabled = false, deferred = false } = {}) {
     enabled: Boolean(enabled),
     deferred: Boolean(deferred),
     streamId: null,
+    streamMessageTs: null,
     failed: false,
+  };
+}
+
+export function makeTaskCardStates(config = {}) {
+  return {
+    qi: makeTaskCardState(config),
+    plan: makeTaskCardState(config),
   };
 }
 
@@ -233,7 +241,7 @@ function makeTurnState(taskCardConfig) {
     pendingStatusLoadingMessages: null,
     statusRefreshTimer: null,
     abandoned: false,
-    taskCardState: makeTaskCardState(taskCardConfig),
+    taskCardStates: makeTaskCardStates(taskCardConfig),
   };
 }
 
@@ -1150,8 +1158,10 @@ export class Scheduler {
     };
 
     const resetTaskCardState = () => {
-      turn.taskCardState.streamId = null;
-      turn.taskCardState.failed = false;
+      for (const taskCardState of Object.values(turn.taskCardStates || {})) {
+        taskCardState.streamId = null;
+        taskCardState.failed = false;
+      }
     };
 
     const finalizeStreamsOnAbnormalExit = async () => {
@@ -1564,7 +1574,7 @@ export class Scheduler {
               threadTs: effectiveThreadTs,
               platform,
               channelSemantics: normalizeChannelSemantics(msg.channelSemantics ?? channelSemantics),
-              taskCardState: turn.taskCardState,
+              taskCardStates: turn.taskCardStates,
             });
             metadataUpdatedForTurn = false;
             await startTyping();

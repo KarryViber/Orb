@@ -47,9 +47,9 @@ function createStreamingAdapter() {
         });
       }
       if (intent.intent === 'task_progress.append') {
-        await this.appendStream(turnState.streamId, intent.meta.chunks);
+        await this.appendStream(intent.meta.streamId || turnState.streamId, intent.meta.chunks);
       } else if (intent.intent === 'task_progress.stop') {
-        await this.stopStream(turnState.streamId, { chunks: intent.meta.chunks });
+        await this.stopStream(intent.meta.streamId || turnState.streamId, { chunks: intent.meta.chunks });
       }
       return { ts: turnState.streamMessageTs || null };
     },

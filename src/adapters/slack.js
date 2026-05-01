@@ -930,6 +930,9 @@ export class SlackAdapter extends PlatformAdapter {
     const meta = intent.meta || {};
 
     if (deliveryChannel === 'stream') {
+      const streamChannel = meta.streamChannel || 'qi';
+      const streamId = meta.streamId || turnState?.streamIds?.[streamChannel] || turnState?.streamId;
+      const streamMessageTs = turnState?.streamMessageTsByChannel?.[streamChannel] || turnState?.streamMessageTs || null;
       if (intent.intent === TASK_PROGRESS_START) {
         return this.startStream(slackChannel, threadTs, {
           task_display_mode: meta.task_display_mode || 'plan',
@@ -938,12 +941,12 @@ export class SlackAdapter extends PlatformAdapter {
         });
       }
       if (intent.intent === TASK_PROGRESS_APPEND) {
-        await this.appendStream(turnState.streamId, meta.chunks || [{ type: 'markdown_text', text }]);
-        return { streamId: turnState.streamId, ts: turnState.streamMessageTs || null };
+        await this.appendStream(streamId, meta.chunks || [{ type: 'markdown_text', text }]);
+        return { streamId, ts: streamMessageTs };
       }
       if (intent.intent === TASK_PROGRESS_STOP) {
-        await this.stopStream(turnState.streamId, { chunks: meta.chunks || [] });
-        return { streamId: turnState.streamId, ts: turnState.streamMessageTs || null };
+        await this.stopStream(streamId, { chunks: meta.chunks || [] });
+        return { streamId, ts: streamMessageTs };
       }
       if (intent.intent === ASSISTANT_TEXT_DELTA) {
         await this.appendStream(turnState.streamId, [{ type: 'markdown_text', text }]);

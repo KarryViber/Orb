@@ -31,6 +31,8 @@ function chunksText(chunks) {
 }
 
 function makeMutableTurnState(seed = {}) {
+  const taskCardStates = seed.taskCardStates || (seed.taskCardState ? { qi: seed.taskCardState } : {});
+  const qiTaskCardState = taskCardStates.qi || null;
   return {
     turnId: String(seed.turnId || makeTurnId(seed)),
     attemptId: String(seed.attemptId || ''),
@@ -38,14 +40,38 @@ function makeMutableTurnState(seed = {}) {
     threadTs: seed.threadTs || '',
     platform: seed.platform || '',
     channelSemantics: normalizeChannelSemantics(seed.channelSemantics),
-    streamId: seed.streamId || seed.taskCardState?.streamId || null,
+    streamId: seed.streamId || qiTaskCardState?.streamId || null,
+    streamIds: { ...(seed.streamIds || {}) },
     streamMessageTs: seed.streamMessageTs || null,
-    taskCardState: seed.taskCardState || null,
+    streamMessageTsByChannel: { ...(seed.streamMessageTsByChannel || {}) },
+    taskCardStates,
     deliveredKeys: new Set(),
     assistantStreamTextLen: 0,
     streamFailed: false,
     streamFailureNotified: false,
   };
+}
+
+function inferTaskStreamChannel(intent) {
+  const channel = intent?.meta?.streamChannel;
+  if (typeof channel === 'string' && channel) return channel;
+  if (intent?.source === 'subscriber.plan') return 'plan';
+  if (intent?.source === 'subscriber.qi') return 'qi';
+  return 'qi';
+}
+
+function ensureTaskCardState(turnState, streamChannel) {
+  if (!turnState.taskCardStates) turnState.taskCardStates = {};
+  if (!turnState.taskCardStates[streamChannel]) {
+    turnState.taskCardStates[streamChannel] = {
+      enabled: true,
+      deferred: false,
+      streamId: null,
+      streamMessageTs: null,
+      failed: false,
+    };
+  }
+  return turnState.taskCardStates[streamChannel];
 }
 
 export class TurnDeliveryOrchestrator {
@@ -66,8 +92,10 @@ export class TurnDeliveryOrchestrator {
 
   endTurn(turnId) {
     const state = this._turns.get(String(turnId || ''));
-    if (state?.taskCardState && state.taskCardState.streamId === state.streamId) {
-      state.taskCardState.streamId = null;
+    if (state?.taskCardStates) {
+      for (const taskCardState of Object.values(state.taskCardStates)) {
+        if (taskCardState) taskCardState.streamId = null;
+      }
     }
     this._turns.delete(String(turnId || ''));
   }
@@ -186,16 +214,34 @@ export class TurnDeliveryOrchestrator {
   _applyDeliverySideEffects(intent, turnState, deliveryChannel, adapterResult) {
     if (deliveryChannel === 'stream') {
       if (intent.intent === TASK_PROGRESS_START) {
-        turnState.streamId = adapterResult?.streamId || adapterResult?.stream_id || turnState.streamId;
-        turnState.streamMessageTs = adapterResult?.ts || turnState.streamMessageTs;
-        if (turnState.taskCardState) {
-          turnState.taskCardState.streamId = turnState.streamId;
-          turnState.taskCardState.failed = false;
+        const streamChannel = inferTaskStreamChannel(intent);
+        const streamId = adapterResult?.streamId || adapterResult?.stream_id || turnState.streamIds?.[streamChannel] || null;
+        const streamMessageTs = adapterResult?.ts || turnState.streamMessageTsByChannel?.[streamChannel] || null;
+        if (!turnState.streamIds) turnState.streamIds = {};
+        if (!turnState.streamMessageTsByChannel) turnState.streamMessageTsByChannel = {};
+        turnState.streamIds[streamChannel] = streamId;
+        turnState.streamMessageTsByChannel[streamChannel] = streamMessageTs;
+        const taskCardState = ensureTaskCardState(turnState, streamChannel);
+        taskCardState.streamId = streamId;
+        taskCardState.streamMessageTs = streamMessageTs;
+        taskCardState.failed = false;
+        if (streamChannel === 'qi') {
+          turnState.streamId = streamId;
+          turnState.streamMessageTs = streamMessageTs;
         }
       } else if (intent.intent === ASSISTANT_TEXT_DELTA) {
         turnState.assistantStreamTextLen += intent.text.length;
-      } else if (intent.intent === ASSISTANT_TEXT_FINAL || intent.intent === TASK_PROGRESS_STOP) {
-        if (turnState.taskCardState?.streamId === turnState.streamId) turnState.taskCardState.streamId = null;
+      } else if (intent.intent === TASK_PROGRESS_STOP) {
+        const streamChannel = inferTaskStreamChannel(intent);
+        const streamId = intent.meta?.streamId || turnState.streamIds?.[streamChannel] || null;
+        const taskCardState = turnState.taskCardStates?.[streamChannel] || null;
+        if (taskCardState?.streamId === streamId) taskCardState.streamId = null;
+        if (turnState.streamIds) turnState.streamIds[streamChannel] = null;
+        if (streamChannel === 'qi' && turnState.streamId === streamId) turnState.streamId = null;
+      } else if (intent.intent === ASSISTANT_TEXT_FINAL) {
+        const taskCardState = turnState.taskCardStates?.qi || null;
+        if (taskCardState?.streamId === turnState.streamId) taskCardState.streamId = null;
+        if (turnState.streamIds) turnState.streamIds.qi = null;
         turnState.streamId = null;
       }
     }
@@ -204,7 +250,11 @@ export class TurnDeliveryOrchestrator {
   _handleDeliveryFailure(intent, turnState, deliveryChannel, err) {
     if (deliveryChannel === 'stream') {
       turnState.streamFailed = true;
-      if (turnState.taskCardState) turnState.taskCardState.failed = true;
+      if (intent.intent === TASK_PROGRESS_START || intent.intent === TASK_PROGRESS_APPEND || intent.intent === TASK_PROGRESS_STOP) {
+        ensureTaskCardState(turnState, inferTaskStreamChannel(intent)).failed = true;
+      } else if (turnState.taskCardStates?.qi) {
+        turnState.taskCardStates.qi.failed = true;
+      }
       this.logger(`[turn-delivery] stream delivery failed: ${err.message}`);
     }
   }
@@ -240,6 +290,11 @@ export class TurnDeliveryOrchestrator {
   }
 
   _record(intent, turnState, deliveryChannel, result, deliveredKey) {
+    const streamChannel = (
+      intent.intent === TASK_PROGRESS_START
+      || intent.intent === TASK_PROGRESS_APPEND
+      || intent.intent === TASK_PROGRESS_STOP
+    ) ? inferTaskStreamChannel(intent) : 'qi';
     const record = createTurnDeliveryRecord({
       turnId: intent.turnId,
       attemptId: intent.attemptId,
@@ -249,7 +304,7 @@ export class TurnDeliveryOrchestrator {
       intent: intent.intent,
       deliveryChannel,
       text: intent.text || chunksText(intent.meta?.chunks),
-      streamMessageTs: turnState.streamMessageTs,
+      streamMessageTs: turnState.streamMessageTsByChannel?.[streamChannel] || turnState.streamMessageTs,
       postMessageTs: result?.channel === 'postMessage' ? result.ts || null : null,
       source: intent.source || 'unknown',
       meta: { ...intent.meta, reason: result?.reason || null },

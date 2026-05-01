@@ -30,11 +30,11 @@ function createAdapter({ stream = true, failAppend = false, platform = 'slack' }
           return { ts: turnState.streamMessageTs };
         }
         if (intent.intent === 'task_progress.append') {
-          calls.push(['appendStream', turnState.streamId, intent.meta.chunks]);
+          calls.push(['appendStream', intent.meta.streamId || turnState.streamId, intent.meta.chunks]);
           return { ts: turnState.streamMessageTs };
         }
         if (intent.intent === 'task_progress.stop') {
-          calls.push(['stopStream', turnState.streamId, intent.meta.chunks]);
+          calls.push(['stopStream', intent.meta.streamId || turnState.streamId, intent.meta.chunks]);
           return { ts: turnState.streamMessageTs };
         }
       }

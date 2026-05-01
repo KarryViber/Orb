@@ -45,9 +45,9 @@ function createMockAdapter({ failAppend = false } = {}) {
           });
         }
         if (intent.intent === 'task_progress.append') {
-          await this.appendStream(turnState.streamId, intent.meta.chunks);
+          await this.appendStream(intent.meta.streamId || turnState.streamId, intent.meta.chunks);
         } else if (intent.intent === 'task_progress.stop') {
-          await this.stopStream(turnState.streamId, { chunks: intent.meta.chunks });
+          await this.stopStream(intent.meta.streamId || turnState.streamId, { chunks: intent.meta.chunks });
         } else if (intent.intent === 'assistant_text.delta') {
           await this.appendStream(turnState.streamId, [{ type: 'markdown_text', text: intent.text }]);
         }
@@ -63,7 +63,10 @@ function createMockAdapter({ failAppend = false } = {}) {
 
 function createCtx(adapter, turnId, extra = {}) {
   const turn = {
-    taskCardState: { enabled: true, deferred: false, streamId: null, failed: false },
+    taskCardStates: {
+      qi: { enabled: true, deferred: false, streamId: null, streamMessageTs: null, failed: false },
+      plan: { enabled: true, deferred: false, streamId: null, streamMessageTs: null, failed: false },
+    },
   };
   const orchestrator = new TurnDeliveryOrchestrator({ adapter });
   const ctx = {
@@ -84,7 +87,7 @@ function createCtx(adapter, turnId, extra = {}) {
     threadTs: ctx.effectiveThreadTs,
     platform: 'slack',
     channelSemantics: ctx.channelSemantics,
-    taskCardState: turn.taskCardState,
+    taskCardStates: turn.taskCardStates,
   });
   return ctx;
 }
@@ -104,7 +107,7 @@ test('turn-delivery unified subscriber dispatches Qi, text, status, and result c
   const ctx = createCtx(adapter, 'turn-unified');
 
   await bus.publish(toolUse('turn-unified', 'Bash', { description: 'Run tests' }), ctx);
-  assert.equal(ctx.turn.taskCardState.streamId, 'stream-1');
+  assert.equal(ctx.turn.taskCardStates.qi.streamId, 'stream-1');
   assert.deepEqual(adapter.calls[0].slice(0, 3), ['startStream', 'C1', '111.222']);
   assert.deepEqual(adapter.calls.at(-1), ['setThreadStatus', 'C1', '111.222', 'Bash: Run tests']);
 
@@ -118,7 +121,7 @@ test('turn-delivery unified subscriber dispatches Qi, text, status, and result c
   )), true);
 
   await bus.publish({ type: 'cc_event', turnId: 'turn-unified', eventType: 'result', payload: { stop_reason: 'end_turn' } }, ctx);
-  assert.equal(ctx.turn.taskCardState.streamId, null);
+  assert.equal(ctx.turn.taskCardStates.qi.streamId, null);
   assert.equal(adapter.calls.some((call) => call[0] === 'stopStream'), true);
   assert.deepEqual(adapter.calls.at(-1), ['setThreadStatus', 'C1', '111.222', '']);
 });
@@ -155,7 +158,37 @@ test('turn-delivery text stream marks task card failed on Slack ownership loss',
   await bus.publish(textEvent('turn-fail', 'plain text'), ctx);
   await sleep(15);
 
-  assert.equal(ctx.turn.taskCardState.failed, true);
+  assert.equal(ctx.turn.taskCardStates.qi.failed, true);
+});
+
+test('turn-delivery starts separate Qi and TodoWrite streams in either order', async () => {
+  for (const [label, events] of [
+    ['qi-first', [
+      toolUse('turn-split-qi-first', 'Bash', { description: 'Run tests' }),
+      toolUse('turn-split-qi-first', 'TodoWrite', { todos: [{ content: 'Plan', status: 'in_progress' }] }),
+    ]],
+    ['plan-first', [
+      toolUse('turn-split-plan-first', 'TodoWrite', { todos: [{ content: 'Plan', status: 'in_progress' }] }),
+      toolUse('turn-split-plan-first', 'Bash', { description: 'Run tests' }),
+    ]],
+  ]) {
+    const adapter = createMockAdapter();
+    const bus = new EventBus();
+    bus.subscribe(createTurnDeliveryCcEventSubscriber({ textDebounceMs: 1 }));
+    const turnId = `turn-split-${label}`;
+    const ctx = createCtx(adapter, turnId);
+
+    for (const event of events) await bus.publish(event, ctx);
+
+    const starts = adapter.calls.filter((call) => call[0] === 'startStream');
+    assert.equal(starts.length, 2);
+    assert.deepEqual(new Set([
+      ctx.turn.taskCardStates.qi.streamId,
+      ctx.turn.taskCardStates.plan.streamId,
+    ]).size, 2);
+    assert.equal(starts.some((call) => call[3].initial_chunks.some((chunk) => chunk.id === 'qi-exec')), true);
+    assert.equal(starts.some((call) => call[3].initial_chunks.some((chunk) => String(chunk.id || '').startsWith('todowrite-todo-'))), true);
+  }
 });
 
 test('turn-delivery unified subscriber suppresses silent and deferred middle-state delivery', async () => {

@@ -36,7 +36,7 @@ export function createTextStreamProcessor({ debounceMs = DEFAULT_TEXT_DEBOUNCE_M
     const { ctx } = state;
     if (ctx?.deferDeliveryUntilResult || ctx?.channelSemantics === 'silent') return;
     const turn = ctx?.turn;
-    const taskCardState = turn?.taskCardState;
+    const taskCardState = turn?.taskCardStates?.qi;
     const streamId = taskCardState?.streamId;
 
     if (streamId && !taskCardState?.failed && ctx?.orchestrator) {

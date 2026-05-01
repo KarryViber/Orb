@@ -44,6 +44,7 @@ function makePlanTurnState() {
 }
 
 export function createTaskCardStreamProcessor({
+  streamChannel,
   matchTool,
   makeState,
   buildToolChunks,
@@ -51,6 +52,7 @@ export function createTaskCardStreamProcessor({
   onResult,
   recordSource = 'subscriber.qi',
 } = {}) {
+  if (!streamChannel) throw new Error('streamChannel is required');
   const turns = new Map();
   const getState = (turnId) => {
     const key = getTurnKey(turnId);
@@ -64,7 +66,7 @@ export function createTaskCardStreamProcessor({
       await state.startPromise;
       return Boolean(state.streamId);
     }
-    const taskCardState = ctx?.turn?.taskCardState;
+    const taskCardState = ctx?.turn?.taskCardStates?.[streamChannel];
     if (taskCardState?.streamId) return false;
     const channel = ctx?.channel || ctx?.task?.channel;
     const threadTs = ctx?.effectiveThreadTs || ctx?.threadTs || ctx?.task?.threadTs;
@@ -83,12 +85,19 @@ export function createTaskCardStreamProcessor({
           text: chunksText(initialChunks),
           meta: {
             task_display_mode: 'plan',
+            streamChannel,
             chunks: initialChunks,
             teamId: ctx?.task?.teamId || ctx?.teamId || null,
           },
         });
-        state.streamId = ctx?.turn?.taskCardState?.streamId || ctx?.orchestrator?.getTurnState?.(turnId)?.streamId || null;
-        state.streamTs = result?.ts || ctx?.orchestrator?.getTurnState?.(turnId)?.streamMessageTs || null;
+        const turnState = ctx?.orchestrator?.getTurnState?.(turnId);
+        state.streamId = ctx?.turn?.taskCardStates?.[streamChannel]?.streamId
+          || turnState?.streamIds?.[streamChannel]
+          || null;
+        state.streamTs = result?.ts
+          || ctx?.turn?.taskCardStates?.[streamChannel]?.streamMessageTs
+          || turnState?.streamMessageTsByChannel?.[streamChannel]
+          || null;
       } catch (err) {
         state.failed = true;
         if (taskCardState) taskCardState.failed = true;
@@ -144,7 +153,7 @@ export function createTaskCardStreamProcessor({
             intent: TASK_PROGRESS_APPEND,
             text: chunksText(chunks),
             source: recordSource,
-            meta: { sequence: appendSequence, streamId: state.streamId, chunks, chunkCount: chunks.length },
+            meta: { sequence: appendSequence, streamChannel, streamId: state.streamId, chunks, chunkCount: chunks.length },
           });
         }).catch((err) => {
           warn(TAG, `[task_card] append failed: ${err.message}`);
@@ -172,13 +181,13 @@ export function createTaskCardStreamProcessor({
           intent: TASK_PROGRESS_STOP,
           text: chunksText(chunks),
           source: recordSource,
-          meta: { streamId, chunks, chunkCount: Array.isArray(chunks) ? chunks.length : 0 },
+          meta: { streamChannel, streamId, chunks, chunkCount: Array.isArray(chunks) ? chunks.length : 0 },
         });
       } catch (err) {
         warn(TAG, `[task_card] stop failed: ${err.message}`);
       } finally {
-        if (ctx?.turn?.taskCardState?.streamId === streamId) {
-          ctx.turn.taskCardState.streamId = null;
+        if (ctx?.turn?.taskCardStates?.[streamChannel]?.streamId === streamId) {
+          ctx.turn.taskCardStates[streamChannel].streamId = null;
         }
         turns.delete(key);
       }
@@ -189,12 +198,13 @@ export function createTaskCardStreamProcessor({
 
 export function createQiStreamProcessor() {
   return createTaskCardStreamProcessor({
+    streamChannel: 'qi',
     recordSource: 'subscriber.qi',
     makeState: makeQiTurnState,
     matchTool(msg, ctx) {
       const category = categorizeTool(msg.payload?.name);
       if (!category) return false;
-      const taskCardState = ctx?.turn?.taskCardState;
+      const taskCardState = ctx?.turn?.taskCardStates?.qi;
       if (taskCardState && !taskCardState.enabled && !taskCardState.deferred) return false;
       return !taskCardState?.failed;
     },
@@ -206,9 +216,15 @@ export function createQiStreamProcessor() {
 
 export function createPlanStreamProcessor() {
   return createTaskCardStreamProcessor({
-    recordSource: 'subscriber.qi',
+    streamChannel: 'plan',
+    recordSource: 'subscriber.plan',
     makeState: makePlanTurnState,
-    matchTool: (msg) => msg.payload?.name === 'TodoWrite' && Array.isArray(msg.payload?.input?.todos),
+    matchTool: (msg, ctx) => {
+      if (msg.payload?.name !== 'TodoWrite' || !Array.isArray(msg.payload?.input?.todos)) return false;
+      const taskCardState = ctx?.turn?.taskCardStates?.plan;
+      if (taskCardState && !taskCardState.enabled && !taskCardState.deferred) return false;
+      return !taskCardState?.failed;
+    },
     buildToolChunks(msg, ctx, state) {
       const chunks = buildPlanSnapshotChunks(msg.payload.input.todos);
       state.lastChunks = chunks;
