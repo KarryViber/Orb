@@ -4,12 +4,15 @@ import os
 import re
 import shutil
 import sqlite3
-import sys as _sys
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-_sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "profiles" / "karry" / "scripts"))
+_SCRIPTS_DIR = Path('/Users/karry/Orb/profiles/karry/scripts')
+if str(_SCRIPTS_DIR) not in sys.path:
+  sys.path.insert(0, str(_SCRIPTS_DIR))
 from cron_run_log import RunLog  # noqa: E402
+from lib.archive_audit import append_archive_event  # noqa: E402
 
 
 FM_RE = re.compile(r"\A---\n(.*?)\n---\n", re.S)
@@ -83,6 +86,13 @@ def main():
       if target.exists():
         target = archive_dir / f"{draft.name}-{now.strftime('%Y%m%d%H%M%S')}"
       shutil.move(str(draft), str(target))
+      append_archive_event(
+        kind='skill', item_id=draft.stem, action='archived',
+        source_cron='skill-promotion-tick',
+        reason='stale draft (use_count threshold)',
+        archived_to=str(target.relative_to(target.parents[2])),
+        extra={'draft_path': str(draft)},
+      )
       log.add_change("updated", target, "archived stale draft")
       archived += 1
   log.add_metric("drafts", len(drafts))
