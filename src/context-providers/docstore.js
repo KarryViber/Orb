@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { searchDocs } from '../docstore.js';
 import { warn } from '../log.js';
@@ -11,6 +11,7 @@ import { memoryManifestItem, sha16 } from './interface.js';
 
 const TAG = 'context-provider:docstore';
 const REGISTRY_PATH = DOC_REGISTRY_PATH || (DOC_PROJECTS_ROOT ? join(DOC_PROJECTS_ROOT, 'registry.md') : null);
+let _registryCache = null;
 
 function serializeError(error) {
   if (!error) return 'Error: unknown';
@@ -33,6 +34,10 @@ function logSearchFailure(dataDir, error) {
 function parseRegistry() {
   if (!REGISTRY_PATH) return [];
   try {
+    const stat = statSync(REGISTRY_PATH);
+    if (_registryCache && _registryCache.mtimeMs === stat.mtimeMs) {
+      return _registryCache.data;
+    }
     const projects = [];
     let section = 'projects';
     for (const raw of readFileSync(REGISTRY_PATH, 'utf-8').split('\n')) {
@@ -50,6 +55,7 @@ function parseRegistry() {
       const aliases = [slug, ...aliasesRaw.split('/').map((a) => a.trim()).filter(Boolean)];
       projects.push({ slug, aliases: [...new Set(aliases)] });
     }
+    _registryCache = { mtimeMs: stat.mtimeMs, data: projects };
     return projects;
   } catch {
     return [];
