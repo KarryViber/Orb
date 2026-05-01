@@ -1,5 +1,5 @@
 #!/bin/bash
-# ~/Orb/scripts/cron-deliver.sh
+# ~/Orb/scripts/cron/cron-deliver.sh
 # Cron 任务统一交付脚本：主消息 + thread + reaction + 失败兜底 DM
 #
 # 两种模式：
@@ -55,7 +55,8 @@ DATE_OVERRIDE=""
 DM_CHANNEL="${ORB_FAILURE_DM_CHANNEL:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SLACK_SEND="$SCRIPT_DIR/slack-send-thread.sh"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+SLACK_SEND="$REPO_ROOT/scripts/slack/slack-send-thread.sh"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in

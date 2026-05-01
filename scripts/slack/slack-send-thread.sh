@@ -1,5 +1,5 @@
 #!/bin/bash
-# ~/Orb/scripts/slack-send-thread.sh
+# ~/Orb/scripts/slack/slack-send-thread.sh
 # 通用 Slack 主消息 + Thread 发送脚本
 # 支持：
 # 1) 主消息纯文本
@@ -7,13 +7,13 @@
 # 3) Thread 直接发送 blocks JSON 文件（top-level blocks，非 attachment-only）
 #
 # 用法:
-#   bash ~/Orb/scripts/slack-send-thread.sh \
+#   bash ~/Orb/scripts/slack/slack-send-thread.sh \
 #     --channel C0AP013V056 \
 #     --main-msg "🔮 摘要文字" \
 #     --thread-file /tmp/content.md \
 #     --color "#1ABC9C"
 #
-#   bash ~/Orb/scripts/slack-send-thread.sh \
+#   bash ~/Orb/scripts/slack/slack-send-thread.sh \
 #     --channel CXXXXXXXXXX \
 #     --main-msg "🏃 活动 04/05｜7,123步 420kcal HR58" \
 #     --blocks-file /tmp/activity-blocks.json \

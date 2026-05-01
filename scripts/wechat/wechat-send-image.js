@@ -32,7 +32,7 @@ import {
 } from '../src/adapters/wechat.js';
 
 function usage() {
-  return 'Usage: node ~/Orb/scripts/wechat-send-image.js <recipient-userId> <abs-image-path> [--account <accountId>]';
+  return 'Usage: node ~/Orb/scripts/wechat/wechat-send-image.js <recipient-userId> <abs-image-path> [--account <accountId>]';
 }
 
 function credentialDir() {
