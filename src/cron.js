@@ -10,7 +10,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { info, error as logError, warn } from './log.js';
 import { writeLessonCandidate } from './lesson-candidates.js';
 
@@ -21,12 +21,21 @@ const JOBS_LOCK_STALE_MS = 60_000;
 const PROFILE_DM_CHANNELS = {
   karry: 'D0ANGB3M1CZ',
 };
+const missingJobsLogged = new Set();
+
+export class BadCronExpr extends Error {
+  constructor(field, message) {
+    super(`${field}: ${message}`);
+    this.name = 'BadCronExpr';
+    this.field = field;
+  }
+}
 
 // ── Minimal 5-field cron parser ──
 
 // Parse a cron field (e.g. "0", "*", "1-5", "star/15", "1,3,5").
 // Returns a Set of valid integers for that field.
-function parseCronField(field, min, max) {
+export function parseCronField(field, min, max) {
   const values = new Set();
   for (const part of field.split(',')) {
     const trimmed = part.trim();
@@ -34,6 +43,7 @@ function parseCronField(field, min, max) {
     const stepMatch = trimmed.match(/^\*\/(\d+)$/);
     if (stepMatch) {
       const step = parseInt(stepMatch[1], 10);
+      if (step <= 0) throw new BadCronExpr(trimmed, 'step must be > 0');
       for (let i = min; i <= max; i += step) values.add(i);
       continue;
     }
@@ -47,6 +57,8 @@ function parseCronField(field, min, max) {
     if (rangeMatch) {
       const start = parseInt(rangeMatch[1], 10);
       const end = parseInt(rangeMatch[2], 10);
+      if (start > end) throw new BadCronExpr(trimmed, 'range start must be <= end');
+      if (start < min || end > max) throw new BadCronExpr(trimmed, 'value out of range');
       for (let i = start; i <= end; i++) values.add(i);
       continue;
     }
@@ -56,12 +68,21 @@ function parseCronField(field, min, max) {
       const start = parseInt(rangeStepMatch[1], 10);
       const end = parseInt(rangeStepMatch[2], 10);
       const step = parseInt(rangeStepMatch[3], 10);
+      if (step <= 0) throw new BadCronExpr(trimmed, 'step must be > 0');
+      if (start > end) throw new BadCronExpr(trimmed, 'range start must be <= end');
+      if (start < min || end > max) throw new BadCronExpr(trimmed, 'value out of range');
       for (let i = start; i <= end; i += step) values.add(i);
       continue;
     }
     // N — single value
-    const num = parseInt(trimmed, 10);
-    if (!isNaN(num)) values.add(num);
+    const numMatch = trimmed.match(/^\d+$/);
+    if (numMatch) {
+      const num = parseInt(trimmed, 10);
+      if (num < min || num > max) throw new BadCronExpr(trimmed, 'value out of range');
+      values.add(num);
+      continue;
+    }
+    throw new BadCronExpr(trimmed, 'invalid token');
   }
   return values;
 }
@@ -176,15 +197,115 @@ function jobsPath(dataDir) {
   return join(dataDir, 'cron-jobs.json');
 }
 
+function lastGoodJobsPath(dataDir) {
+  return join(dataDir, 'cron-jobs.last-good.json');
+}
+
+function profileNameFromDataDir(dataDir) {
+  return basename(dirname(dataDir));
+}
+
+function timestampForPath() {
+  return new Date().toISOString().replace(/[:.]/g, '-');
+}
+
+function writeLastGoodJobs(dataDir, raw) {
+  const p = lastGoodJobsPath(dataDir);
+  const tmp = p + '.tmp.' + process.pid;
+  writeFileSync(tmp, raw, 'utf-8');
+  renameSync(tmp, p);
+}
+
+function updateLastGoodJobs(dataDir) {
+  const p = jobsPath(dataDir);
+  writeLastGoodJobs(dataDir, readFileSync(p, 'utf-8'));
+}
+
+function postFailureDm(profileName, corruptPath, fallback) {
+  const channel = PROFILE_DM_CHANNELS[profileName];
+  const token = process.env.SLACK_BOT_TOKEN;
+  if (!channel || !token || typeof fetch !== 'function') return;
+
+  const text = [
+    '🚨 cron-jobs.json 损坏已隔离',
+    `profile: ${profileName}`,
+    `quarantine: ${basename(corruptPath)}`,
+    `fallback: ${fallback}`,
+  ].join('\n').slice(0, 200);
+
+  fetch('https://slack.com/api/chat.postMessage', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json; charset=utf-8',
+    },
+    body: JSON.stringify({ channel, text }),
+  }).catch((err) => {
+    warn(TAG, `failed to send cron corrupt DM: ${err.message}`);
+  });
+}
+
 function loadJobs(dataDir) {
   const p = jobsPath(dataDir);
-  if (!existsSync(p)) return [];
+  if (!existsSync(p)) {
+    if (!missingJobsLogged.has(p)) {
+      info(TAG, `jobs file not found at ${p}; starting empty`);
+      missingJobsLogged.add(p);
+    }
+    return [];
+  }
+
+  let raw;
   try {
-    const raw = readFileSync(p, 'utf-8');
+    raw = readFileSync(p, 'utf-8');
     const jobs = JSON.parse(raw);
+    if (Array.isArray(jobs) && jobs.length > 0) {
+      try { writeLastGoodJobs(dataDir, raw); } catch (err) { warn(TAG, `failed to update last-good jobs snapshot: ${err.message}`); }
+    }
     return Array.isArray(jobs) ? jobs : [];
   } catch (err) {
-    logError(TAG, `failed to load jobs from ${p}: ${err.message}`);
+    if (raw == null) {
+      logError(TAG, `failed to load jobs from ${p}: ${err.message}`);
+      return [];
+    }
+
+    const corruptPath = join(dataDir, `cron-jobs.corrupt.${timestampForPath()}.json`);
+    try {
+      renameSync(p, corruptPath);
+    } catch (renameErr) {
+      logError(TAG, `failed to quarantine corrupt jobs file ${p}: ${renameErr.message}`);
+    }
+
+    try {
+      writeLessonCandidate(dataDir, {
+        source: 'cron-jobs-corrupt',
+        stopReason: 'json_parse_error',
+        errorContext: raw.slice(0, 500),
+        threadId: 'cron:loadJobs',
+        cronName: 'cron-jobs.json',
+        kind: 'cron',
+        origin: { kind: 'cron-load', file: p, corruptPath },
+      });
+    } catch (lessonErr) {
+      warn(TAG, `failed to write cron corrupt lesson candidate: ${lessonErr.message}`);
+    }
+
+    const profileName = profileNameFromDataDir(dataDir);
+    const lastGood = lastGoodJobsPath(dataDir);
+    if (existsSync(lastGood)) {
+      try {
+        const fallbackRaw = readFileSync(lastGood, 'utf-8');
+        const jobs = JSON.parse(fallbackRaw);
+        warn(TAG, `quarantined corrupt jobs file to ${corruptPath}; loaded last-good snapshot`);
+        postFailureDm(profileName, corruptPath, 'last-good');
+        return Array.isArray(jobs) ? jobs : [];
+      } catch (fallbackErr) {
+        logError(TAG, `failed to load last-good jobs from ${lastGood}: ${fallbackErr.message}`);
+      }
+    }
+
+    logError(TAG, `quarantined corrupt jobs file to ${corruptPath}; no last-good snapshot, starting empty`);
+    postFailureDm(profileName, corruptPath, 'empty');
     return [];
   }
 }
@@ -260,6 +381,7 @@ function saveJobs(dataDir, jobs) {
       mkdirSync(join(p, '..'), { recursive: true });
       writeFileSync(tmp, JSON.stringify(jobs, null, 2) + '\n', 'utf-8');
       renameSync(tmp, p);
+      if (Array.isArray(jobs) && jobs.length > 0) updateLastGoodJobs(dataDir);
     });
   } catch (err) {
     logError(TAG, `failed to save jobs to ${p}: ${err.message}`);
@@ -356,32 +478,40 @@ export class CronScheduler {
         const nextRunUpdates = new Map();
 
         for (const job of jobs) {
-          if (!job.enabled) continue;
-          if (!job.nextRunAt) continue;
+          try {
+            if (!job.enabled) continue;
+            if (!job.nextRunAt) continue;
 
-          const nextRun = new Date(job.nextRunAt);
-          if (nextRun > now) continue;
+            const nextRun = new Date(job.nextRunAt);
+            if (nextRun > now) continue;
 
-          // Check grace window — skip if too stale (fast-forward instead)
-          const grace = graceMs(job.schedule);
-          const stale = now.getTime() - nextRun.getTime();
+            // Check grace window — skip if too stale (fast-forward instead)
+            const grace = graceMs(job.schedule);
+            const stale = now.getTime() - nextRun.getTime();
 
-          if (stale > grace) {
-            const next = computeNextRun(job.schedule, now);
-            job.nextRunAt = next ? next.toISOString() : null;
-            warn(TAG, `fast-forwarded stale job ${job.id} "${job.name}" (missed by ${Math.round(stale / 60_000)}m)`);
-            nextRunUpdates.set(job.id, { nextRunAt: job.nextRunAt });
-            continue;
+            if (stale > grace) {
+              const next = computeNextRun(job.schedule, now);
+              job.nextRunAt = next ? next.toISOString() : null;
+              warn(TAG, `fast-forwarded stale job ${job.id} "${job.name}" (missed by ${Math.round(stale / 60_000)}m)`);
+              nextRunUpdates.set(job.id, { nextRunAt: job.nextRunAt });
+              continue;
+            }
+
+            // Advance next run BEFORE execution (at-most-once for recurring)
+            if (job.schedule.kind !== 'once') {
+              const next = computeNextRun(job.schedule, now);
+              job.nextRunAt = next ? next.toISOString() : null;
+              nextRunUpdates.set(job.id, { nextRunAt: job.nextRunAt });
+            }
+
+            dueJobs.push(job);
+          } catch (err) {
+            if (err instanceof BadCronExpr) {
+              await this._disableBadCronJob(paths.dataDir, job, err);
+              continue;
+            }
+            throw err;
           }
-
-          // Advance next run BEFORE execution (at-most-once for recurring)
-          if (job.schedule.kind !== 'once') {
-            const next = computeNextRun(job.schedule, now);
-            job.nextRunAt = next ? next.toISOString() : null;
-            nextRunUpdates.set(job.id, { nextRunAt: job.nextRunAt });
-          }
-
-          dueJobs.push(job);
         }
 
         if (nextRunUpdates.size > 0) {
@@ -590,6 +720,38 @@ export class CronScheduler {
 
       return true;
     });
+  }
+
+  async _disableBadCronJob(dataDir, job, err) {
+    const lastError = `BadCronExpr: ${err.message}`;
+    if (job.lastError !== lastError) {
+      warn(TAG, `cron job ${job.id} (${job.name}) has bad expr: ${err.message}; disabling`);
+    }
+
+    job.enabled = false;
+    job.nextRunAt = null;
+    job.lastStatus = 'failed';
+    job.lastError = lastError;
+
+    try {
+      await this._queueJobWrite(dataDir, (jobs) => {
+        const storedJob = jobs.find((item) => item.id === job.id);
+        if (!storedJob) return false;
+        if (
+          storedJob.enabled === false &&
+          storedJob.nextRunAt == null &&
+          storedJob.lastStatus === 'failed' &&
+          storedJob.lastError === lastError
+        ) {
+          return false;
+        }
+        storedJob.enabled = false;
+        storedJob.nextRunAt = null;
+        storedJob.lastStatus = 'failed';
+        storedJob.lastError = lastError;
+        return true;
+      });
+    } catch {}
   }
 
   /**
