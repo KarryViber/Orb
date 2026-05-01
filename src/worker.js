@@ -70,6 +70,7 @@ const MEMORY_USAGE_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'li
 const DEFAULT_PERMISSION_TIMEOUT_MS = ORB_PERMISSION_TIMEOUT_MS;
 const MCP_PERMISSION_TOOL_NOT_FOUND_RE = /MCP tool mcp__orb_permission__orb_request_permission[\s\S]*not found[\s\S]*Available MCP tools: none/i;
 const CLI_API_ERROR_RE = /\b(?:API Error|Internal server error|5\d\d|rate limit|overloaded|upstream)\b/i;
+const TOOL_USE_TERMINAL_REASONS = new Set(['tool_use', 'max_turns_reached']);
 const DEFAULT_WORKSPACE_ALLOW_RULES = [
   'Read(*)',
   'Skill(*)',
@@ -419,7 +420,8 @@ process.on('message', async (msg) => {
     // Send final result as an exit/status signal only. turn_complete is the only
     // worker IPC message that carries deliverable final text.
     const stderrSummary = summarizeCliStderr(exitResult.stderr);
-    const cliFailure = exitResult.code !== 0 || (!exitResult.stopReason && CLI_API_ERROR_RE.test(stderrSummary));
+    const cliFailure = (exitResult.code !== 0 && !TOOL_USE_TERMINAL_REASONS.has(exitResult.stopReason))
+      || (!exitResult.stopReason && CLI_API_ERROR_RE.test(stderrSummary));
     const resultStopReason = exitResult.stopReason
       || (cliFailure ? (CLI_API_ERROR_RE.test(stderrSummary) ? 'api_error' : 'cli_error') : null);
     await ipcSend(makeResult({

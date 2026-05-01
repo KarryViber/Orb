@@ -1228,6 +1228,33 @@ export class Scheduler {
       try {
         if (!isSuccessfulStopReason(msg.stopReason)) {
           this._autoContinueCount.delete(threadTs);
+          const isMaxTurnsLike = msg.stopReason === 'max_turns_reached' || msg.stopReason === 'tool_use';
+          if (isMaxTurnsLike) {
+            warn(TAG, `worker turn limit result: thread=${threadTs} stopReason=${msg.stopReason} exitCode=${msg.exitCode ?? 'unknown'}`);
+            if (!userVisibleDeliveryObserved) {
+              const turns = task.maxTurns || 'configured';
+              const notice = msg.stopReason === 'tool_use'
+                ? `⏳ LLM 在工具调用中触达 turn 上限（${turns} turn）。任务未完成，可发「继续」让我从此处续做。`
+                : '⏳ 触达 turn 上限。任务未完成，可发「继续」让我从此处续做。';
+              const result = await orchestrator.emit({
+                turnId: currentCcTurnId || makeTurnId({ threadTs, attemptId: task.attemptId }),
+                attemptId: task.attemptId || '',
+                channel,
+                threadTs: effectiveThreadTs,
+                platform,
+                channelSemantics: 'reply',
+                intent: CONTROL_PLANE_MESSAGE,
+                text: notice,
+                source: 'scheduler.turn_limit',
+                meta: {
+                  stopReason: msg.stopReason,
+                  exitCode: msg.exitCode ?? null,
+                },
+              });
+              if (result.delivered) userVisibleDeliveryObserved = true;
+            }
+            return;
+          }
           const receiptText = buildFailureReceiptText({
             task,
             threadTs,

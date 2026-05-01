@@ -187,6 +187,33 @@ test('non-success result sends cron failure receipt instead of auto-continue', a
   assert.match(replies[0][3], /^⚠️ skill-promotion-tick \d{2}\/\d{2}｜失败：LLM｜API Error: 500 Internal server error$/);
 });
 
+test('tool_use exit result sends turn-limit notice instead of failure warning', async () => {
+  const calls = await runTask([
+    { msg: { type: 'turn_start' } },
+    {
+      msg: {
+        type: 'result',
+        text: '',
+        exitOnly: true,
+        stopReason: 'tool_use',
+        exitCode: 1,
+        stderrSummary: '',
+        channelSemantics: 'reply',
+      },
+    },
+    { exit: { code: 0, signal: null } },
+  ], {
+    taskOverrides: {
+      maxTurns: 50,
+    },
+  });
+
+  const replies = calls.filter((call) => call[0] === 'sendReply');
+  assert.equal(fallbackWarnings(calls).length, 0);
+  assert.equal(replies.length, 1);
+  assert.match(replies[0][3], /^⏳ LLM 在工具调用中触达 turn 上限（50 turn）。任务未完成，可发「继续」让我从此处续做。$/);
+});
+
 test('empty silent successful turn_complete suppresses result auto-continue', async (t) => {
   const warnLines = [];
   t.mock.method(console, 'warn', (line) => warnLines.push(String(line)));
