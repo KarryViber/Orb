@@ -331,9 +331,10 @@ export function buildRespawnTaskForInjectFailed({
 }
 
 export class EventBus {
-  constructor({ subscriberTimeoutMs = 5_000 } = {}) {
+  constructor({ subscriberTimeoutMs = 5_000, onSubscriberDisabled = null } = {}) {
     this.subscribers = new Set();
     this.subscriberTimeoutMs = subscriberTimeoutMs;
+    this.onSubscriberDisabled = typeof onSubscriberDisabled === 'function' ? onSubscriberDisabled : null;
     this._subscriberFailures = new Map();
   }
 
@@ -387,6 +388,13 @@ export class EventBus {
         this.subscribers.delete(subscriber);
         this._subscriberFailures.delete(subscriber);
         warn(TAG, `subscriber ${subscriberName} disabled after 3 consecutive failures: ${err.message}`);
+        if (this.onSubscriberDisabled) {
+          try {
+            await this.onSubscriberDisabled({ subscriberName, lastError: err, ctx });
+          } catch (notifyErr) {
+            warn(TAG, `subscriber disabled notification failed: ${notifyErr.message}`);
+          }
+        }
       }
       throw err;
     }
@@ -415,7 +423,20 @@ export class Scheduler {
     this.maxWorkers = maxWorkers || 3;
     this.timeoutMs = timeoutMs || ORB_WORKER_TIMEOUT_MS;
     this.getProfile = getProfile;
-    this.eventBus = new EventBus();
+    this.eventBus = new EventBus({
+      onSubscriberDisabled: async ({ subscriberName, ctx }) => {
+        const channel = ctx?.channel;
+        const threadTs = ctx?.threadTs;
+        const adapter = this._getAdapter(ctx?.platform);
+        if (!adapter || !channel || !threadTs) return;
+        await adapter.sendReply({
+          channel,
+          threadTs,
+          text: `⚠️ 进度渲染暂时不可用（subscriber \`${subscriberName}\` 连续失败 3 次，已临时关闭）。最终结果会在任务完成时一次性发送。`,
+          intent: CONTROL_PLANE_MESSAGE,
+        });
+      },
+    });
     this.adapters = new Map();     // platform → adapter
     this.activeWorkers = new Map();
     this.threadQueues = new Map();
@@ -943,8 +964,15 @@ export class Scheduler {
         count: item?.subscriberFailureCount || null,
       }));
       try {
+        const userNotified = Boolean(
+          ctx.channel
+          && ctx.threadTs
+          && ctx.platform
+          && this._getAdapter(ctx.platform)
+        );
         writeLessonCandidate(ctx.profile?.dataDir || ctx.task?.profile?.dataDir, {
           source: 'event-bus-subscriber-failed',
+          userNotified,
           stopReason: msg.eventType || 'cc_event',
           errorContext: JSON.stringify({
             eventType: msg.eventType || null,
