@@ -2,7 +2,7 @@
 
 借鉴 mattpocock/skills 的 `LANGUAGE.md` pattern。本文件不是教程，是术语硬约束——写 / 改 / 评审 SKILL.md 时用这些词，避免同义漂移。
 
-适用范围：`~/Orb/profiles/<your-profile>/workspace/.claude/skills/` 全部 SKILL.md、`_GOVERNANCE.md`、`_AUDIT_*.md` 以及 lessons 里讨论 skill 体系的段落。
+适用范围：`~/Orb/.claude/skills/`（system-scope）+ `~/Orb/profiles/<your-profile>/workspace/.claude/skills/`（workspace）全部 SKILL.md、`_GOVERNANCE.md`、`_AUDIT_*.md` 以及 lessons 里讨论 skill 体系的段落。
 
 ---
 

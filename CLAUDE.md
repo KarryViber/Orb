@@ -68,6 +68,7 @@ src/
 - `profiles/{name}/workspace/`            — Claude CLI working directory (cwd per profile)
 - `profiles/{name}/workspace/CLAUDE.md`   — Agent persona + runtime constraints (CLI auto-discovers from cwd)
 - `profiles/{name}/workspace/.claude/skills/*/SKILL.md` — Per-profile skills (CLI auto-discovers via cwd)
+- `.claude/skills/*/SKILL.md` (repo root) — System-scope skills shared across profiles (loaded via worker `--add-dir ORB_ROOT`)
 - `profiles/{name}/data/`                 — sessions.json + memory.db + doc-index.db + cron-jobs.json (gitignored)
 - `lib/holographic/`                      — Holographic memory engine (Python)
 - `lib/docstore/`                         — DocStore file index (FTS5, Python)
@@ -79,7 +80,7 @@ src/
 Worker invokes Claude CLI with `--append-system-prompt`, letting CLI
 natively inject (via auto-discovery):
 - CLAUDE.md (three layers: `~/.claude`, `~/Orb/`, `{cwd}/` = workspace/)
-- Skills from `{cwd}/.claude/skills/*/SKILL.md` (per-profile via cwd)
+- Skills from `{cwd}/.claude/skills/*/SKILL.md` (per-profile via cwd) and `~/Orb/.claude/skills/*/SKILL.md` (system-scope, via worker `--add-dir ORB_ROOT`)
 - Agents from `~/.claude/agents/` + `{cwd}/.claude/agents/`
 - Auto-memory from `~/.claude/projects/{encoded-cwd}/memory/MEMORY.md`
 

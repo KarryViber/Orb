@@ -2,7 +2,7 @@
 
 基于 Anthropic《Lessons from Building Claude Code: How We Use Skills》+ Orb workspace 实践沉淀。
 
-适用范围：`~/Orb/profiles/<your-profile>/workspace/.claude/skills/` 下的所有 SKILL.md。全局 `~/.claude/skills/` 沿用同标准但仅建议不强制。
+适用范围：`~/Orb/.claude/skills/`（system-scope，跨 profile 共享）+ `~/Orb/profiles/<your-profile>/workspace/.claude/skills/`（workspace，单 profile）下的所有 SKILL.md。全局 `~/.claude/skills/` 沿用同标准但仅建议不强制。三层 scope 划分见 § 6。
 
 > 词法约束见 `_LANGUAGE.md`——本文件谈规则，那份谈用词。propose / 审 / 改 skill 前先扫一眼词表，避免 skill / lesson / spec / CLAUDE.md / auto-memory 同义漂移。
 
