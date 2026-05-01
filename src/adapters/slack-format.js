@@ -182,13 +182,7 @@ export function markdownToMrkdwn(text) {
   return result;
 }
 
-/**
- * Walk a Block Kit block tree in-place and translate any markdown-bearing
- * text fields to Slack mrkdwn. Covers the surfaces agents actually populate
- * (section/header/context + section.fields); leaves rich_text/table/actions
- * alone because those carry their own styled-element structure.
- */
-function convertBlockTextFields(block) {
+function normalizeBlockMrkdwn(block) {
   if (!block || typeof block !== 'object') return;
   switch (block.type) {
     case 'section': {
@@ -202,13 +196,6 @@ function convertBlockTextFields(block) {
             field.text = markdownToMrkdwn(field.text);
           }
         }
-      }
-      break;
-    }
-    case 'header': {
-      const t = block.text;
-      if (t && typeof t.text === 'string') {
-        t.text = stripMarkdown(t.text);
       }
       break;
     }
@@ -226,16 +213,25 @@ function convertBlockTextFields(block) {
 }
 
 /**
+ * Walk Block Kit blocks in-place and translate markdown-bearing text fields
+ * to Slack mrkdwn. Plain text surfaces, rich_text, tables, actions, and
+ * dividers are intentionally left unchanged.
+ */
+function normalizeBlocksMrkdwn(blocks) {
+  if (!Array.isArray(blocks)) return blocks;
+  for (const block of blocks) normalizeBlockMrkdwn(block);
+  return blocks;
+}
+
+/**
  * Try to parse explicit Block Kit JSON from agent output.
- * Applies markdown→mrkdwn translation to block text fields and cleans the
- * fallback text so we never ship raw `**bold**` / inline code to Slack.
+ * Cleans the fallback text so we never ship raw `**bold**` / inline code to Slack.
  */
 export function parseBlockKit(text) {
   if (!text || !text.trimStart().startsWith('{')) return null;
   try {
     const parsed = JSON.parse(text);
     if (parsed.blocks && Array.isArray(parsed.blocks) && parsed.text) {
-      for (const block of parsed.blocks) convertBlockTextFields(block);
       return { blocks: parsed.blocks, text: buildFallbackText(parsed.text) };
     }
   } catch (_) {}
@@ -523,7 +519,7 @@ function buildBlocks(convertedText, tableBlocks = []) {
     blocks.push(...paraBlocks);
   }
 
-  return blocks;
+  return normalizeBlocksMrkdwn(blocks);
 }
 
 function buildBlockGroups(blocks) {
@@ -608,6 +604,7 @@ export function buildSendPayloads(text, options = {}) {
   // Agent explicitly output Block Kit JSON
   const explicit = parseBlockKit(text);
   if (explicit) {
+    normalizeBlocksMrkdwn(explicit.blocks);
     if (diffContextBlock) explicit.blocks.push(diffContextBlock);
     return [{ blocks: explicit.blocks, text: explicit.text }];
   }
