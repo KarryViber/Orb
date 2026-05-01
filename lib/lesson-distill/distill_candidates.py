@@ -43,7 +43,7 @@ def build_lesson_text(meta):
   stop = meta.get("stopReason") or "unknown"
   context = (meta.get("errorContext") or "").replace("\\n", " ").strip()
   lesson = f"When {source} reports {stop}, preserve the failure context as a reviewed lesson candidate before retrying."
-  apply = f"Check thread_id={meta.get('thread_id') or 'unknown'} and the truncated error context, then decide whether to收录, merge, or discard."
+  apply = f"Check thread_id={meta.get('thread_id') or 'unknown'} and the truncated error context, then decide whether to 收录 or 丢弃."
   if context:
     apply += f" Context: {context[:180]}"
   return lesson, apply
@@ -140,7 +140,6 @@ def card(candidate_path, meta, lesson, apply):
     {"type": "context", "elements": [{"type": "mrkdwn", "text": f"`{candidate_path}`"}]},
     {"type": "actions", "elements": [
       {"type": "button", "text": {"type": "plain_text", "text": "收录"}, "style": "primary", "action_id": "lesson_candidate_approve", "value": value},
-      {"type": "button", "text": {"type": "plain_text", "text": "合并到 X"}, "action_id": "lesson_candidate_merge", "value": value},
       {"type": "button", "text": {"type": "plain_text", "text": "丢弃"}, "style": "danger", "action_id": "lesson_candidate_reject", "value": value},
     ]},
   ]
