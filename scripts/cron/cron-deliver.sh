@@ -134,8 +134,28 @@ SEND_ARGS=(--channel "$CHANNEL" --main-msg "$MAIN_MSG" --color "$COLOR")
 if [[ "$NO_THREAD" == true ]]; then
   SEND_ARGS+=(--no-thread)
 elif [[ -n "$THREAD_FILE" ]]; then
+  if [[ ! -s "$THREAD_FILE" ]]; then
+    echo "❌ thread-file 不存在或为空: ${THREAD_FILE}（main 未发）" >&2
+    exit 2
+  fi
   SEND_ARGS+=(--thread-file "$THREAD_FILE")
 elif [[ -n "$BLOCKS_FILE" ]]; then
+  # 预校验：blocks-file 必须是非空 JSON 数组。失败则 abort，main 不发——
+  # 避免 slack-send-thread.sh 内部 main 已落地后 thread 才报错的孤儿主消息问题。
+  if ! BLOCKS_PATH="$BLOCKS_FILE" python3 - <<'PYEOF'
+import json, os, sys
+path = os.environ['BLOCKS_PATH']
+try:
+    d = json.load(open(path))
+except Exception as e:
+    print(f'parse error: {e}', file=sys.stderr); sys.exit(1)
+if not isinstance(d, list) or len(d) == 0:
+    print('not a non-empty JSON array', file=sys.stderr); sys.exit(1)
+PYEOF
+  then
+    echo "❌ blocks-file 校验失败: ${BLOCKS_FILE}（main 未发）" >&2
+    exit 2
+  fi
   SEND_ARGS+=(--blocks-file "$BLOCKS_FILE")
 else
   echo "❌ 需要 --thread-file / --blocks-file / --no-thread 之一" >&2
