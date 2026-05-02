@@ -119,6 +119,7 @@ Claude Code discovers the stable layers natively:
 - Layer 2: repository-root `CLAUDE.md`
 - Layer 3: `profiles/{name}/workspace/CLAUDE.md`
 - Workspace add-ons: `profiles/{name}/workspace/.claude/skills/` and `profiles/{name}/workspace/.claude/agents/`
+- System-scope skills shared across profiles: repository-root `.claude/skills/` (loaded into every worker via `--add-dir`)
 - CLI-managed memory tied to the workspace `cwd`
 
 Orb only adds what the CLI does not already know:
@@ -218,25 +219,46 @@ See [docs/adapter-development.md](docs/adapter-development.md).
 
 ```text
 src/
-├── main.js              # adapter startup, scheduler, signals
-├── scheduler.js         # worker lifecycle, queueing, approvals
-├── worker.js            # Claude CLI session management
-├── cron.js              # scheduled jobs
-├── context.js           # Orb-managed prompt additions
-├── memory.js            # holographic + docstore bridges
-├── session.js           # thread -> Claude session persistence
-├── format-utils.js      # adapter-agnostic text helpers
+├── main.js                # adapter startup, scheduler, signals
+├── scheduler.js           # worker lifecycle, queueing, approvals
+├── worker.js              # Claude CLI session management
+├── cron.js                # scheduled jobs
+├── context.js             # Orb-managed prompt additions (delegates to providers)
+├── context-providers/     # holographic / docstore / thread-history / skill-review
+├── turn-delivery/         # per-turn delivery orchestration (intents, ledger, status, streams)
+├── memory.js              # holographic + docstore bridges
+├── session.js             # thread -> Claude session persistence
+├── ipc-schema.js          # worker <-> scheduler IPC payload schema
+├── stop-reason.js         # unified stopReason classification
+├── format-utils.js        # adapter-agnostic text helpers
 └── adapters/
     ├── interface.js
     ├── slack.js
-    └── slack-format.js
+    ├── slack-format.js
+    ├── slack-permission-render.js
+    ├── slack-stream-error.js
+    ├── slack-block-actions.js
+    └── slack-dm-routing.js
 
 lib/
-├── holographic/         # Python memory bridge and maintenance
-└── docstore/            # Python FTS5 index and search bridge
+├── holographic/           # Python memory bridge and maintenance
+├── docstore/              # Python FTS5 index and search bridge
+├── lesson-distill/        # lesson candidate distillation
+└── memory-usage/          # memory usage tracking + decay
+
+scripts/
+├── cron/                  # cron-deliver, channel resolve, run log
+├── slack/                 # blockkit, send-thread, send-attachment, extract
+├── wechat/                # WeChat helpers
+├── infra/                 # backup, hardware monitor, mac health, outbound gate
+├── workflow/              # claudemd-lint, external-session-spawn, memory-crud
+└── hooks/                 # PreToolUse / docstore hint hooks
+
+.claude/
+└── skills/                # system-scope skills shared across profiles
 
 profiles/
-└── {name}/              # scripts + workspace + data
+└── {name}/                # scripts + workspace + data
 ```
 
 ## Status
