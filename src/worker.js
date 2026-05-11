@@ -3,13 +3,22 @@ import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { mkdirSync, readFileSync, existsSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, dirname, resolve } from 'node:path';
+import { basename, join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildPrompt } from './context.js';
 import { warn } from './log.js';
-import { collectGitDiffSummary, isFileModifyingTool } from './worker-git-diff.js';
+import { normalizeChannelSemantics } from './turn-delivery/intents.js';
+import { collectGitDiffSummary, recordModifiedPathFromToolUse } from './worker-git-diff.js';
+import { parseDailyNotesAppendToolUse } from './worker-daily-notes.js';
 import { buildImageBlocks } from './worker-image-blocks.js';
 import { buildWorkerMcpConfig, collectWorkspaceMcpServers } from './worker-mcp-boot.js';
+import { createCcStreamParseState, normalizeCcUsage, parseStreamLine } from './worker/cc-stream-parser.js';
+import {
+  buildToolTitle,
+  createToolEventState,
+  shouldEmitTaskCardForTool,
+  stringifyToolValue,
+} from './worker/tool-event-state.js';
 import { getSessionId, updateSession } from './session.js';
 import { storeConversation } from './memory.js';
 import { writeLessonCandidate } from './lesson-candidates.js';
@@ -53,7 +62,7 @@ import {
  * Worker -> Scheduler:
  *   { type: 'turn_start', injectId?, attemptId? }  — explicit turn ownership start on task/inject receipt
  *   { type: 'turn_end' }  — explicit turn ownership end when Claude emits result
- *   { type: 'turn_complete', text, toolCount, lastTool, stopReason, channelSemantics, gitDiffSummary? }
+ *   { type: 'turn_complete', text, toolCount, lastTool, stopReason, channelSemantics, gitDiffSummary?, dailyNotesSummary? }
  *     - one Claude turn finished; text comes from worker turnBuffer assistant text blocks
  *       joined with "\n"; CLI result text is only a fallback when the buffer is empty.
  *       Block-level dedup suppresses repeated result lines within the same turn.
@@ -68,6 +77,7 @@ import {
 const PYTHON = PYTHON_PATH;
 const ORB_ROOT = resolve(join(dirname(fileURLToPath(import.meta.url)), '..'));
 const MEMORY_USAGE_DIR = join(ORB_ROOT, 'lib', 'memory-usage');
+const SKILL_USAGE_TRACKER = join(ORB_ROOT, 'lib', 'skill-usage-tracker.py');
 const DEFAULT_PERMISSION_TIMEOUT_MS = ORB_PERMISSION_TIMEOUT_MS;
 const MCP_PERMISSION_TOOL_NOT_FOUND_RE = /MCP tool mcp__orb_permission__orb_request_permission[\s\S]*not found[\s\S]*Available MCP tools: none/i;
 const CLI_API_ERROR_RE = /\b(?:API Error|Internal server error|5\d\d|rate limit|overloaded|upstream)\b/i;
@@ -89,11 +99,6 @@ const DEFAULT_WORKSPACE_ALLOW_RULES = [
   'Bash(pwd)',
   'Bash(date)',
 ];
-const TASK_CARD_TOOLS = new Set([
-  'TodoWrite', 'Task', 'Agent', 'Skill',
-  'Bash', 'Read', 'Edit', 'Write', 'Grep', 'Glob',
-  'WebFetch', 'WebSearch', 'NotebookEdit',
-]);
 
 let _activeCli = null;   // reference to active interactive CLI session
 let _currentTurnId = null;
@@ -109,7 +114,9 @@ let _currentChannelMeta = null;
 let _currentFragments = [];
 let _currentOrigin = null;
 let _currentChannelSemantics = 'reply';
+let _currentTurnUserText = '';
 let _currentTurnModifiedPaths = new Set();
+let _currentTurnDailyNotesEntries = [];
 let _currentMemoryManifest = [];
 let _stdoutParseFailCount = 0;
 let _stdoutParseFailLastSampleAt = 0;
@@ -120,6 +127,7 @@ process.on('message', async (msg) => {
   if (msg.type === 'inject') {
     if (_activeCli) {
       beginCcTurn({ attemptId: msg.attemptId || null, origin: msg.origin || _currentOrigin || null });
+      _currentTurnUserText = msg.userText || '';
       let injectText = msg.userText;
       if (_currentDataDir) {
         const prompt = await buildPrompt({
@@ -183,6 +191,7 @@ process.on('message', async (msg) => {
 
   let { userText, fileContent, imagePaths, threadTs, channel, userId, platform, profile, threadHistory, model, effort, mode, priorConversation, disablePermissionPrompt, maxTurns, attemptId, channelMeta, fragments, origin } = msg;
   _currentChannelSemantics = normalizeChannelSemantics(msg.channelSemantics);
+  _currentTurnUserText = userText || '';
   if (!profile?.dataDir) {
     await ipcSend(makeError({ error: 'profile.dataDir is required' })).catch(() => {});
     process.exit(1);
@@ -340,17 +349,36 @@ process.on('message', async (msg) => {
           toolInputs: turn.toolInputs || [],
           finalText: turn.text || '',
         }).catch((err) => console.warn(`[worker] memory usage record failed: ${err.message}`));
-        if (turn.text?.trim()) {
-          const gitDiffSummary = await collectGitDiffSummary(WORKSPACE, _currentTurnModifiedPaths);
-          await ipcSend(makeTurnComplete({
-            text: turn.text,
-            toolCount: turn.toolCount,
-            lastTool: turn.lastTool,
-            stopReason: turn.stopReason,
-            channelSemantics: _currentChannelSemantics,
-            gitDiffSummary,
-          }));
+        const { gitDiffSummary, dailyNotesSummary } = turn.summarySnapshot
+          || await collectCurrentTurnSummarySnapshot(WORKSPACE);
+        const hasTurnText = Boolean(turn.text?.trim());
+        if (!hasTurnText && !gitDiffSummary?.hasChanges && !dailyNotesSummary) {
+          return;
         }
+        if (hasTurnText) {
+          const turnUserText = turn.userText || _currentTurnUserText || userText || '';
+          if (turnUserText) {
+            storeConversation({
+              userText: turnUserText,
+              responseText: turn.text,
+              threadTs,
+              userId,
+              dbPath: join(dataDir, 'memory.db'),
+              turnId: turn.turnId || _currentTurnId,
+            }).catch((err) => console.warn(`[worker] storeConversation per-turn failed: ${err.message}`));
+          }
+        }
+        const turnCompleteMsg = makeTurnComplete({
+          text: turn.text || '',
+          toolCount: turn.toolCount,
+          lastTool: turn.lastTool,
+          stopReason: turn.stopReason,
+          channelSemantics: _currentChannelSemantics,
+          gitDiffSummary,
+          dailyNotesSummary,
+        });
+        if (turn.usage) turnCompleteMsg.usage = turn.usage;
+        await ipcSend(turnCompleteMsg);
       });
       cli.setOnTurnEnd(async () => {
         await ipcSend(makeTurnEnd()).catch(() => {});
@@ -425,7 +453,7 @@ process.on('message', async (msg) => {
       || (!exitResult.stopReason && CLI_API_ERROR_RE.test(stderrSummary));
     const resultStopReason = exitResult.stopReason
       || (cliFailure ? (CLI_API_ERROR_RE.test(stderrSummary) ? 'api_error' : 'cli_error') : null);
-    await ipcSend(makeResult({
+    const resultMsg = makeResult({
       text: '',
       toolCount: exitResult.toolCount,
       lastTool: exitResult.lastTool,
@@ -434,10 +462,9 @@ process.on('message', async (msg) => {
       exitOnly: true,
       exitCode: exitResult.code,
       stderrSummary,
-    }));
-
-    const memDbPath = join(dataDir, 'memory.db');
-    storeConversation({ userText, responseText: exitResult.lastTurnText || '', threadTs, userId, dbPath: memDbPath }).catch(() => {});
+    });
+    if (exitResult.usage) resultMsg.usage = exitResult.usage;
+    await ipcSend(resultMsg);
 
   } catch (err) {
     await ipcSend(makeError({
@@ -469,20 +496,6 @@ function summarizeCliStderr(stderr) {
   return truncateText(lines.slice(-6).join('\n'), 1000);
 }
 
-function normalizeChannelSemantics(value) {
-  return value === 'silent' || value === 'broadcast' ? value : 'reply';
-}
-
-export function recordModifiedPathFromToolUse(toolUse, modifiedPaths = _currentTurnModifiedPaths) {
-  const toolName = toolUse?.name;
-  if (!isFileModifyingTool(toolName)) return false;
-  const input = parseToolInput(toolUse?.input);
-  const filePath = toolName === 'NotebookEdit' ? input?.notebook_path : input?.file_path;
-  if (!filePath || typeof filePath !== 'string') return false;
-  modifiedPaths.add(filePath);
-  return true;
-}
-
 export { collectGitDiffSummary };
 
 function beginCcTurn({ threadTs, attemptId, origin, profileName, dataDir } = {}) {
@@ -495,6 +508,7 @@ function beginCcTurn({ threadTs, attemptId, origin, profileName, dataDir } = {})
   if (profileName !== undefined) _currentProfileName = profileName || 'default';
   if (dataDir !== undefined) _currentDataDir = dataDir;
   _currentTurnModifiedPaths.clear();
+  _currentTurnDailyNotesEntries = [];
   _currentTurnId = randomUUID();
 }
 
@@ -573,6 +587,57 @@ async function recordMemoryUsage({ dataDir, threadId, turnId, manifest, toolInpu
   });
 }
 
+async function recordSkillUsage({ dataDir, threadId, turnId, skills }) {
+  if (!dataDir || !Array.isArray(skills) || skills.length === 0) return;
+  const items = skills
+    .map((skill) => String(skill || '').trim())
+    .filter(Boolean)
+    .map((skill) => ({
+      item_kind: 'skill',
+      item_id: skill,
+      content: skill,
+    }));
+  await recordMemoryInjection({ dataDir, threadId, turnId, items });
+
+  await new Promise((resolve, reject) => {
+    const child = execFile(
+      PYTHON || 'python3',
+      [SKILL_USAGE_TRACKER],
+      { timeout: 10_000, maxBuffer: 256 * 1024 },
+      (err) => {
+        if (err) reject(err);
+        else resolve();
+      },
+    );
+    child.stdin.on('error', reject);
+    child.stdin.end(JSON.stringify({
+      db_path: join(dataDir, 'memory-usage.db'),
+      skills,
+      ts: new Date().toISOString(),
+      thread_id: threadId || null,
+      turn_id: turnId || null,
+    }));
+  });
+}
+
+function extractSkillNamesFromToolInput(input) {
+  const values = [
+    input?.skill_name,
+    input?.name,
+    input?.skill,
+    input?.id,
+    input?.path,
+  ];
+  return [...new Set(values
+    .map((value) => String(value || '').trim())
+    .filter(Boolean)
+    .map((value) => {
+      if (value.endsWith('/SKILL.md')) return basename(dirname(value));
+      return value;
+    })
+    .filter((value) => value && value !== 'unknown' && !value.startsWith('_')))];
+}
+
 function todayJstDate() {
   return new Date(Date.now() + 9 * 60 * 60 * 1000).toISOString().slice(0, 10);
 }
@@ -603,6 +668,30 @@ function writeCcEvent({ event_type, payload }) {
   }
 }
 
+function writeTurnReceipt({ stopReason, toolCount, lastTool, usage }) {
+  if (!_currentTurnId || !_currentDataDir) return;
+  try {
+    const dir = join(_currentDataDir, 'receipts');
+    mkdirSync(dir, { recursive: true });
+    appendFileSync(join(dir, `${todayJstDate()}.jsonl`), `${JSON.stringify({
+      ts: timestampJst(),
+      thread_ts: _currentThreadTs || null,
+      turn_id: _currentTurnId,
+      job_id: _currentJobId,
+      profile: _currentProfileName || 'default',
+      attempt_id: _currentAttemptId || null,
+      origin: _currentOrigin || null,
+      stop_reason: stopReason || null,
+      tool_count: toolCount || 0,
+      last_tool: lastTool || null,
+      channel_semantics: _currentChannelSemantics,
+      ...(usage ? { usage } : {}),
+    })}\n`);
+  } catch (err) {
+    console.warn(`[worker] failed to write turn receipt: ${err.message}`);
+  }
+}
+
 function sendCcEvent(eventType, payload) {
   if (!_currentTurnId) return;
   ipcSend(makeCcEvent({
@@ -614,156 +703,15 @@ function sendCcEvent(eventType, payload) {
   })).catch(() => {});
 }
 
-function truncate256(text) {
-  const normalized = String(text || '').replace(/\s+\n/g, '\n').trim();
-  if (normalized.length <= 256) return normalized;
-  return `${normalized.slice(0, 255)}…`;
+async function collectCurrentTurnSummarySnapshot(workspace) {
+  const gitDiffSummary = await collectGitDiffSummary(workspace, _currentTurnModifiedPaths);
+  const dailyNotesSummary = _currentTurnDailyNotesEntries.length > 0
+    ? { count: _currentTurnDailyNotesEntries.length, entries: [..._currentTurnDailyNotesEntries] }
+    : null;
+  return { gitDiffSummary, dailyNotesSummary };
 }
 
-export function shouldEmitTaskCardForTool(toolName, input, toolUseId = null) {
-  const isTodoWriteSnapshot = toolName === 'TodoWrite' && Array.isArray(input?.todos);
-  return isTodoWriteSnapshot
-    ? TASK_CARD_TOOLS.has(toolName)
-    : TASK_CARD_TOOLS.has(toolName) && Boolean(toolUseId);
-}
-
-function tokenizeShellCommand(command) {
-  return String(command || '')
-    .match(/'[^']*'|"[^"]*"|\S+/g)
-    ?.map((token) => token.replace(/^['"]|['"]$/g, '')) || [];
-}
-
-function parseToolInput(toolInput) {
-  if (toolInput && typeof toolInput === 'object') return toolInput;
-  if (typeof toolInput !== 'string') return null;
-  const trimmed = toolInput.trim();
-  if (!trimmed) return null;
-  if (!((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']')))) {
-    return null;
-  }
-  try {
-    const parsed = JSON.parse(trimmed);
-    return parsed && typeof parsed === 'object' ? parsed : null;
-  } catch {
-    return null;
-  }
-}
-
-function stringifyToolValue(value) {
-  if (typeof value === 'string') return value;
-  try {
-    return JSON.stringify(value, null, 2);
-  } catch {
-    return String(value);
-  }
-}
-
-function summarizePrimitiveParams(input, limit = 4) {
-  if (!input || typeof input !== 'object' || Array.isArray(input)) return '';
-  const parts = [];
-  for (const [key, value] of Object.entries(input)) {
-    if (value == null) continue;
-    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
-      parts.push(`${key}: ${String(value)}`);
-    } else if (Array.isArray(value)) {
-      parts.push(`${key}: [${value.slice(0, 3).map((item) => String(item)).join(', ')}${value.length > 3 ? ', ...' : ''}]`);
-    }
-    if (parts.length >= limit) break;
-  }
-  return parts.join('\n');
-}
-
-function firstNonFlagToken(command) {
-  const tokens = tokenizeShellCommand(command);
-  return tokens.find((token) => token && token !== '--' && !token.startsWith('-')) || tokens[0] || 'sh';
-}
-
-function summarizeWriteDetails(parsedInput) {
-  const filePath = parsedInput?.file_path ? `path: ${parsedInput.file_path}` : '';
-  const content = parsedInput?.content != null
-    ? `content: ${truncateText(stringifyToolValue(parsedInput.content), 120)}`
-    : '';
-  return [filePath, content].filter(Boolean).join('\n');
-}
-
-function summarizeEditDetails(parsedInput) {
-  const filePath = parsedInput?.file_path ? `path: ${parsedInput.file_path}` : '';
-  const oldString = parsedInput?.old_string != null
-    ? `old: ${truncateText(stringifyToolValue(parsedInput.old_string), 80)}`
-    : '';
-  const newString = parsedInput?.new_string != null
-    ? `new: ${truncateText(stringifyToolValue(parsedInput.new_string), 80)}`
-    : '';
-  return [filePath, oldString, newString].filter(Boolean).join('\n');
-}
-
-function summarizeTodos(todos) {
-  if (!Array.isArray(todos) || todos.length === 0) return 'No todos';
-  return todos.map((todo) => {
-    const icon = todo.status === 'completed' ? 'complete' : todo.status === 'in_progress' ? 'in progress' : 'pending';
-    return `- [${icon}] ${todo.content || '(untitled)'}`;
-  }).join('\n');
-}
-
-function buildToolTitle(toolName, input) {
-  const parsedInput = parseToolInput(input);
-  const title = (value) => truncate256(value);
-  const basename = (filePath) => {
-    const rawPath = filePath || 'unknown';
-    return String(rawPath).split('/').filter(Boolean).pop() || String(rawPath);
-  };
-
-  if (toolName === 'TodoWrite') return title('Plan update');
-  if (toolName === 'Bash') {
-    const description = parsedInput?.description;
-    if (description && typeof description === 'string' && description.trim()) {
-      return title(`Bash: ${description.trim()}`);
-    }
-    const command = parsedInput?.command ?? parsedInput?.cmd ?? input;
-    return title(`Bash: ${firstNonFlagToken(command)}`);
-  }
-  if (toolName === 'Read') {
-    return title(`Read: ${basename(parsedInput?.file_path)}`);
-  }
-  if (toolName === 'Edit') {
-    return title(`Edit: ${basename(parsedInput?.file_path)}`);
-  }
-  if (toolName === 'Write') {
-    return title(`Write: ${basename(parsedInput?.file_path)}`);
-  }
-  if (toolName === 'Grep') {
-    return title(`Grep: ${parsedInput?.pattern || 'unknown'}`);
-  }
-  if (toolName === 'Glob') {
-    return title(`Glob: ${parsedInput?.pattern || 'unknown'}`);
-  }
-  if (toolName === 'WebSearch') {
-    return title(`WebSearch: ${parsedInput?.query || 'unknown'}`);
-  }
-  if (toolName === 'NotebookEdit') {
-    return title(`NotebookEdit: ${basename(parsedInput?.notebook_path)}`);
-  }
-  if (toolName === 'Skill') {
-    const description = parsedInput?.description || parsedInput?.skill_description;
-    const skillName = parsedInput?.skill_name || parsedInput?.name || parsedInput?.skill || 'unknown';
-    return title(`Skill: ${description || skillName}`);
-  }
-  if (toolName === 'Task' || toolName === 'Agent') {
-    const desc = parsedInput?.description || parsedInput?.subagent_type || 'sub-agent';
-    return title(`Agent: ${desc}`);
-  }
-  if (toolName === 'WebFetch') {
-    const url = parsedInput?.url || '';
-    try {
-      return title(`WebFetch: ${new URL(url).hostname || url}`);
-    } catch {
-      return title(`WebFetch: ${truncateText(url, 80) || 'unknown'}`);
-    }
-  }
-
-  const summary = summarizePrimitiveParams(parsedInput);
-  return title(summary ? `${toolName}: ${summary}` : `${toolName || 'unknown'}:`);
-}
+export { shouldEmitTaskCardForTool };
 
 function runClaudeInteractive(args, initialContent, workspace) {
   const child = spawn(CLAUDE_PATH, args, {
@@ -779,6 +727,7 @@ function runClaudeInteractive(args, initialContent, workspace) {
   let turnToolInputs = [];
   let lastTool = null;
   let lastStopReason = null;
+  let lastUsage = null;
   let lastSessionId = null;
   let lastTurnText = '';
   let lastEmittedTurnText = '';
@@ -791,8 +740,11 @@ function runClaudeInteractive(args, initialContent, workspace) {
   let taskCardChunkType = 'plan';
   let taskCardDisplayMode = 'timeline';
   let turnStopReasonOverride = null;
+  const recordedSkillNamesInTurn = new Set();
   const pendingTaskCards = new Map();
   const inProgressTaskCards = new Map();
+  let stdoutParseState = createCcStreamParseState();
+  const toolEventState = createToolEventState();
 
   const resetTurnStreamingState = () => {
     taskCardEmittedInTurn = false;
@@ -801,8 +753,11 @@ function runClaudeInteractive(args, initialContent, workspace) {
     turnToolCount = 0;
     turnToolInputs = [];
     turnStopReasonOverride = null;
+    recordedSkillNamesInTurn.clear();
     pendingTaskCards.clear();
     inProgressTaskCards.clear();
+    _currentTurnDailyNotesEntries = [];
+    toolEventState.resetTurn();
   };
 
   const resetTurnTextDedupState = () => {
@@ -820,10 +775,10 @@ function runClaudeInteractive(args, initialContent, workspace) {
 
     for (const line of lines) {
       if (!line.trim()) continue;
-      try {
-        const parsed = JSON.parse(line);
-        handleStreamMsg(parsed).catch(() => {});
-      } catch {
+      const parsedLine = parseStreamLine(line, stdoutParseState);
+      stdoutParseState = parsedLine.newState;
+      const parseError = parsedLine.events.find((event) => event.type === 'parse_error');
+      if (parseError) {
         _stdoutParseFailCount += 1;
         const now = Date.now();
         if (now - _stdoutParseFailLastSampleAt > STDOUT_PARSE_FAIL_SAMPLE_INTERVAL_MS) {
@@ -831,12 +786,18 @@ function runClaudeInteractive(args, initialContent, workspace) {
           warn('worker', `cli stdout JSON parse failed (sample, count=${_stdoutParseFailCount}): ${line.slice(0, 120)}`);
         }
         if (_stdoutParseFailCount >= STDOUT_PARSE_FAIL_THRESHOLD) {
-          process.send?.({
-            type: 'error',
+          process.send?.(makeError({
             error: `cli stdout JSON parse failed ${_stdoutParseFailCount} times`,
             errorContext: { lastLinePrefix: line.slice(0, 120) },
-          });
+          }));
           process.exit(1);
+        }
+        continue;
+      }
+      for (const event of parsedLine.events) {
+        if (event.type === 'stream_msg') {
+          handleStreamMsg(event.payload).catch(() => {});
+          break;
         }
       }
     }
@@ -869,12 +830,28 @@ function runClaudeInteractive(args, initialContent, workspace) {
           sendCcEvent('text', block);
         }
         if (block.type === 'tool_use') {
+          toolEventState.recordToolUse(block);
           totalToolCount++;
           turnToolCount++;
           totalToolInputs.push(block.input || {});
           turnToolInputs.push(block.input || {});
           lastTool = block.name || null;
-          recordModifiedPathFromToolUse(block);
+          recordModifiedPathFromToolUse(block, _currentTurnModifiedPaths);
+          const dailyNotesEntry = parseDailyNotesAppendToolUse(block);
+          if (dailyNotesEntry) _currentTurnDailyNotesEntries.push(dailyNotesEntry);
+          if (block.name === 'Skill') {
+            const skillNames = extractSkillNamesFromToolInput(block.input)
+              .filter((name) => !recordedSkillNamesInTurn.has(name));
+            for (const name of skillNames) recordedSkillNamesInTurn.add(name);
+            if (skillNames.length > 0) {
+              recordSkillUsage({
+                dataDir: _currentDataDir,
+                threadId: _currentThreadTs,
+                turnId: _currentTurnId,
+                skills: skillNames,
+              }).catch((err) => console.warn(`[worker] skill usage record failed: ${err.message}`));
+            }
+          }
           writeCcEvent({
             event_type: 'tool_use',
             payload: {
@@ -896,7 +873,7 @@ function runClaudeInteractive(args, initialContent, workspace) {
             continue;
           }
           if (emitsTaskCard) {
-            const title = truncate256(buildToolTitle(block.name, block.input));
+            const title = buildToolTitle(block.name, block.input);
             pendingTaskCards.set(block.id, { toolName: block.name });
             inProgressTaskCards.set(block.id, {
               taskId: block.id,
@@ -913,6 +890,7 @@ function runClaudeInteractive(args, initialContent, workspace) {
     if (msg.type === 'user' && Array.isArray(msg.message?.content)) {
       for (const block of msg.message.content) {
         if (block?.type === 'tool_result') {
+          toolEventState.recordToolResult(block);
           writeCcEvent({
             event_type: 'tool_result',
             payload: {
@@ -929,15 +907,26 @@ function runClaudeInteractive(args, initialContent, workspace) {
       }
     }
     if (msg.type === 'result') {
+      const completedTurnId = _currentTurnId;
+      const completedTurnUserText = _currentTurnUserText;
+      const summarySnapshot = await collectCurrentTurnSummarySnapshot(workspace);
       lastSessionId = msg.session_id || lastSessionId;
       lastStopReason = turnStopReasonOverride || msg.stop_reason || msg.subtype || null;
+      lastUsage = normalizeCcUsage(msg.usage);
+      sendCcEvent('summary_snapshot', summarySnapshot);
       writeCcEvent({
         event_type: 'result',
         payload: {
           stop_reason: lastStopReason,
           ...(msg.num_turns != null ? { num_turns: msg.num_turns } : {}),
-          ...(msg.usage != null ? { usage: msg.usage } : {}),
+          ...(lastUsage ? { usage: lastUsage } : {}),
         },
+      });
+      writeTurnReceipt({
+        stopReason: lastStopReason,
+        toolCount: totalToolCount,
+        lastTool,
+        usage: lastUsage,
       });
       sendCcEvent('result', msg);
       if (turnOpen && onTurnEnd) {
@@ -955,7 +944,8 @@ function runClaudeInteractive(args, initialContent, workspace) {
         console.warn(`[worker] turn_complete text mismatch: bufferLen=${turnBuffer.join('\n').length} resultLen=${String(msg.result || '').length} stopReason=${lastStopReason || 'unknown'} toolCount=${turnToolCount}`);
       }
 
-      if (resolvedTurn.shouldEmit) {
+      const shouldEmitTurnComplete = resolvedTurn.shouldEmit || _currentTurnDailyNotesEntries.length > 0;
+      if (shouldEmitTurnComplete) {
         lastTurnText = resolvedTurn.text;
         lastEmittedTurnText = resolvedTurn.text;
         blocksSinceLastEmit = 0;
@@ -965,7 +955,11 @@ function runClaudeInteractive(args, initialContent, workspace) {
             toolCount: totalToolCount,
             lastTool,
             stopReason: lastStopReason,
+            usage: lastUsage,
             toolInputs: [...turnToolInputs],
+            turnId: completedTurnId,
+            userText: completedTurnUserText,
+            summarySnapshot,
           });
         }
       }
@@ -1023,6 +1017,7 @@ function runClaudeInteractive(args, initialContent, workspace) {
         toolInputs: [...totalToolInputs],
         lastTool,
         stopReason: turnStopReasonOverride || lastStopReason,
+        usage: lastUsage,
         lastTurnText,
       });
     });

@@ -6,11 +6,13 @@ Usage:
     python3 bridge.py <db_path> <command> [json_args]
 
 Commands:
-    search          {"query": "...", "category": null, "min_trust": 0.3, "limit": 5}
+    search          {"query": "...", "category": null, "min_trust": 0.3, "limit": 5,
+                     "importance_weight": 0.0, "recency_halflife_hours": null}
     session_search  {"query": "", "thread_ts": "...", "user_id": "...", "limit": 20}
     add             {"content": "...", "category": "general", "tags": "",
                      "confidence": "default", "source_kind": "extracted",
-                     "source_confidence": 0.5, "skip_arbitrate": false}
+                     "source_confidence": 0.5, "source": "unknown",
+                     "importance": 0.5, "skip_arbitrate": false}
     probe           {"entity": "...", "category": null, "limit": 10}
     related         {"entity": "...", "category": null, "limit": 10}
     reason          {"entities": ["a","b"], "category": null, "limit": 10}
@@ -238,6 +240,7 @@ def apply_fact_write(
     confidence: str,
     source_kind: str,
     source_confidence: float | None,
+    importance: float,
     skip_arbitrate: bool,
 ) -> dict:
     """One-shot fact write with arbitration.
@@ -305,6 +308,7 @@ def apply_fact_write(
             content=content, category=category, tags=tags,
             source=source, confidence=confidence,
             source_kind=source_kind, confidence_score=source_confidence,
+            importance=importance,
         )
         store.tombstone_fact(target, superseded_by=fact_id)
         return {
@@ -318,6 +322,7 @@ def apply_fact_write(
         content=content, category=category, tags=tags,
         source=source, confidence=confidence,
         source_kind=source_kind, confidence_score=source_confidence,
+        importance=importance,
     )
     return {
         "fact_id": fact_id, "action": "ADD",
@@ -333,6 +338,8 @@ def search(
     category: str | None = None,
     min_trust: float = 0.3,
     db_path: str | None = None,
+    importance_weight: float = 0.0,
+    recency_halflife_hours: float | None = None,
 ) -> list[dict]:
     """Importable convenience wrapper used by acceptance checks."""
     resolved_db = db_path or os.environ.get("HOLOGRAPHIC_DB") or str(
@@ -346,6 +353,8 @@ def search(
             category=category,
             min_trust=min_trust,
             limit=limit,
+            importance_weight=importance_weight,
+            recency_halflife_hours=recency_halflife_hours,
         )
     finally:
         store.close()
@@ -373,6 +382,8 @@ def main():
                 category=args.get("category"),
                 min_trust=args.get("min_trust", 0.3),
                 limit=args.get("limit", 5),
+                importance_weight=args.get("importance_weight", 0.0),
+                recency_halflife_hours=args.get("recency_halflife_hours"),
             )
         elif command == "add":
             result = apply_fact_write(
@@ -384,6 +395,7 @@ def main():
                 confidence=args.get("confidence", "default"),
                 source_kind=args.get("source_kind", "extracted"),
                 source_confidence=args.get("source_confidence"),
+                importance=args.get("importance", 0.5),
                 skip_arbitrate=args.get("skip_arbitrate", False),
             )
         elif command == "session_search":
@@ -459,6 +471,7 @@ def main():
                         confidence=op_args.get("confidence", "default"),
                         source_kind=op_args.get("source_kind", "extracted"),
                         source_confidence=op_args.get("source_confidence"),
+                        importance=op_args.get("importance", 0.5),
                         skip_arbitrate=op_args.get("skip_arbitrate", False),
                     ))
                 elif cmd == "remove":

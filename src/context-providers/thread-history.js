@@ -1,4 +1,4 @@
-export function threadHistoryToFragments(threadHistory, channel, threadTs, retrievedAt) {
+function threadHistoryToFragments(threadHistory, channel, threadTs, retrievedAt) {
   if (!threadHistory) return [];
   return [{
     source_type: 'thread_history',

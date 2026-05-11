@@ -1,4 +1,4 @@
-export function priorConversationToFragments(priorConversation, threadTs, retrievedAt, mode = 'skill-review') {
+function priorConversationToFragments(priorConversation, threadTs, retrievedAt, mode = 'skill-review') {
   if (mode !== 'skill-review' || !Array.isArray(priorConversation)) return [];
   return priorConversation.map((m, i) => ({
     source_type: 'skill_review_conversation',

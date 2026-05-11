@@ -15,20 +15,10 @@ import {
 import { resolveDeliveryChannel } from './adapter-strategy.js';
 import { TurnDeliveryLedger } from './ledger.js';
 import { createTurnDeliveryCcEventSubscriber } from './cc-event-subscriber.js';
+import { chunksText } from './cc-event-format.js';
 
 const STREAM_INTERRUPTED_TEXT = 'stream interrupted, continuing here';
-
-function chunksText(chunks) {
-  return (Array.isArray(chunks) ? chunks : [])
-    .map((chunk) => {
-      if (!chunk || typeof chunk !== 'object') return '';
-      return [chunk.text, chunk.markdown_text, chunk.details, chunk.output, chunk.title]
-        .filter((value) => typeof value === 'string' && value)
-        .join('\n');
-    })
-    .filter(Boolean)
-    .join('\n');
-}
+const STREAM_CONTINUED_TEXT = '↩️ 续';
 
 function makeMutableTurnState(seed = {}) {
   const taskCardStates = seed.taskCardStates || (seed.taskCardState ? { qi: seed.taskCardState } : {});
@@ -167,7 +157,7 @@ export class TurnDeliveryOrchestrator {
       if (deliveredKey) turnState.deliveredKeys.add(deliveredKey);
       this._record(intent, turnState, strategy.channel, result, deliveredKey);
       if (strategy.reason === 'stream-failed-fallback' && intent.intent === ASSISTANT_TEXT_FINAL) {
-        await this.emitStreamInterruptedMarker(intent, turnState);
+        await this.emitStreamInterruptedMarker(intent, turnState, { reason: 'stream-failed-fallback' });
       }
       return result;
     } catch (err) {
@@ -271,19 +261,20 @@ export class TurnDeliveryOrchestrator {
     return result;
   }
 
-  async emitStreamInterruptedMarker(intent, turnState) {
+  async emitStreamInterruptedMarker(intent, turnState, { reason = 'stream-failed-fallback' } = {}) {
     if (turnState.streamFailureNotified) return null;
     turnState.streamFailureNotified = true;
+    const text = reason === 'auto-rotate' ? STREAM_CONTINUED_TEXT : STREAM_INTERRUPTED_TEXT;
     return this.emit({
       ...intent,
       intent: CONTROL_PLANE_MESSAGE,
       source: 'orchestrator.stream_failure',
-      text: STREAM_INTERRUPTED_TEXT,
+      text,
       meta: {
         ...intent.meta,
         blocks: [{
           type: 'context',
-          elements: [{ type: 'mrkdwn', text: STREAM_INTERRUPTED_TEXT }],
+          elements: [{ type: 'mrkdwn', text }],
         }],
       },
     });
@@ -307,7 +298,10 @@ export class TurnDeliveryOrchestrator {
       streamMessageTs: turnState.streamMessageTsByChannel?.[streamChannel] || turnState.streamMessageTs,
       postMessageTs: result?.channel === 'postMessage' ? result.ts || null : null,
       source: intent.source || 'unknown',
-      meta: { ...intent.meta, reason: result?.reason || null },
+      meta: {
+        ...Object.fromEntries(Object.entries(intent.meta || {}).filter(([, value]) => typeof value !== 'function')),
+        reason: result?.reason || null,
+      },
     });
     try {
       this.ledger?.record?.(record, result?.delivered ? deliveredKey : null);

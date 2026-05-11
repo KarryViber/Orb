@@ -177,10 +177,12 @@ async function handleToolCall(message) {
     return;
   }
 
+  const requestToolName = String(args.tool_name);
+  const isAskUserQuestion = requestToolName === 'AskUserQuestion';
   const decision = await requestSchedulerDecision({
     type: 'permission_request',
     requestId: randomUUID(),
-    toolName: String(args.tool_name),
+    toolName: requestToolName,
     toolInput: args.input,
     toolUseId: String(args.tool_use_id),
     threadTs,
@@ -189,9 +191,22 @@ async function handleToolCall(message) {
     metaToolUseId: message.params?._meta?.['claudecode/toolUseId'] || null,
   });
 
-  const text = decision.allow
-    ? JSON.stringify({ behavior: 'allow', updatedInput: args.input })
-    : JSON.stringify({ message: decision.reason || 'Denied by Orb approval flow' });
+  let text;
+  if (decision.allow) {
+    if (isAskUserQuestion) {
+      text = JSON.stringify({
+        behavior: 'allow',
+        updatedInput: {
+          questions: args.input.questions,
+          answers: decision.answers || {},
+        },
+      });
+    } else {
+      text = JSON.stringify({ behavior: 'allow', updatedInput: args.input });
+    }
+  } else {
+    text = JSON.stringify({ behavior: 'deny', message: decision.reason || 'Denied by Orb approval flow' });
+  }
 
   sendMessage({
     jsonrpc: '2.0',
@@ -212,20 +227,22 @@ function requestSchedulerDecision(payload) {
     const socket = net.createConnection(schedulerSocketPath);
     let settled = false;
     let responseBuffer = '';
-    const timeoutHandle = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      socket.destroy();
-      resolve({
-        allow: false,
-        reason: `timeout: no response from Slack approval in ${Math.round(PERMISSION_TIMEOUT_MS / 1000)}s`,
-      });
-    }, PERMISSION_TIMEOUT_MS);
+    const timeoutHandle = payload.toolName === 'AskUserQuestion'
+      ? null
+      : setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        socket.destroy();
+        resolve({
+          allow: false,
+          reason: `timeout: no response from Slack approval in ${Math.round(PERMISSION_TIMEOUT_MS / 1000)}s`,
+        });
+      }, PERMISSION_TIMEOUT_MS);
 
     const finish = (decision) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timeoutHandle);
+      if (timeoutHandle) clearTimeout(timeoutHandle);
       socket.destroy();
       resolve(normalizeDecision(decision));
     };
@@ -264,6 +281,7 @@ function normalizeDecision(decision) {
     return {
       allow: true,
       reason: decision.reason || 'allow',
+      answers: decision.answers && typeof decision.answers === 'object' ? decision.answers : {},
     };
   }
 

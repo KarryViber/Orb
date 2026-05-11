@@ -2,6 +2,7 @@ export class PlatformAdapter {
   async start(onMessage, onInteractive) { throw new Error('not implemented'); }
   async disconnect() { throw new Error('not implemented'); }
   async sendReply(channel, threadTs, text, extra) { throw new Error('not implemented'); }
+  async deliverCronOutput(_payload) { throw new Error('deliverCronOutput not implemented'); }
   async editMessage(channel, ts, text, extra) { throw new Error('not implemented'); }
   async deliver(intent, ctx) { throw new Error('not implemented'); }
   async uploadFile(channel, threadTs, filePath, filename) { throw new Error('not implemented'); }
@@ -20,6 +21,8 @@ export class PlatformAdapter {
   async sendApproval(channel, threadTs, prompt) { throw new Error('not implemented'); }
   buildPayloads(text) { throw new Error('not implemented'); }
   async cleanupIndicator(channel, threadTs, typingSet, errorMsg) { throw new Error('not implemented'); }
+  async sendAskUserQuestion(_payload) { throw new Error('unsupported'); }
+  async updateAskUserQuestionCard(_requestId, _answers, _options) { throw new Error('unsupported'); }
 
   /**
    * Fetch conversation history for a thread.

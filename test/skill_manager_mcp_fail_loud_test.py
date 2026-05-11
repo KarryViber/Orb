@@ -9,11 +9,13 @@ from unittest.mock import patch
 
 SERVER_PATH = (
     Path(__file__).resolve().parents[1]
-    / "profiles/karry/workspace/tools/skill-manager-mcp/server.py"
+    / "profiles/example/workspace/tools/skill-manager-mcp/server.py"
 )
 
 
 def load_server():
+    if not SERVER_PATH.exists():
+        raise unittest.SkipTest(f"skill-manager MCP fixture missing: {SERVER_PATH}")
     spec = importlib.util.spec_from_file_location("skill_manager_server", SERVER_PATH)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -30,12 +32,14 @@ class SkillManagerFailLoudTest(unittest.TestCase):
                 patch.object(server, "PROPOSALS_DIR", proposals_dir),
                 patch.object(server, "_new_pending_id", return_value=pending_id),
                 patch.object(server, "_post_karry_dm", return_value="1746144000.000100") as dm,
+                patch.object(server, "_karry_dm_channel", return_value=""),
                 patch.dict(os.environ, {"ORB_CHANNEL": "", "ORB_THREAD_TS": ""}, clear=False),
             ):
                 with self.assertRaisesRegex(RuntimeError, "Slack delivery failed: no slack channel env"):
                     server.tool_skill_propose(
                         name="unit-test-fail-loud-skill",
                         description="A reusable test skill proposal",
+                        scope="system",
                         body="## When to Use\nUse in tests.\n",
                         rationale="Regression coverage for Slack delivery failures.",
                     )

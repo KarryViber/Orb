@@ -17,6 +17,9 @@ function createMockAdapter({ failAppend = false } = {}) {
     get capabilities() {
       return { stream: true, metadata: true };
     },
+    createQiSubscriber() {
+      return null;
+    },
     async startStream(channel, threadTs, options) {
       streamSeq += 1;
       const stream = { stream_id: `stream-${streamSeq}`, ts: `${streamSeq}.000` };
@@ -167,6 +170,27 @@ test('turn-delivery text stream marks task card failed on Slack ownership loss',
   assert.equal(ctx.turn.taskCardStates.qi.failed, true);
 });
 
+test('turn-delivery includes early receipt summaries when stopping Qi stream', async () => {
+  const adapter = createMockAdapter();
+  const bus = new EventBus();
+  bus.subscribe(createTurnDeliveryCcEventSubscriber({ textDebounceMs: 1 }));
+  const ctx = createCtx(adapter, 'turn-summary');
+
+  await bus.publish(toolUse('turn-summary', 'Bash', { description: 'Append note' }), ctx);
+  await bus.publish({
+    type: 'cc_event',
+    turnId: 'turn-summary',
+    eventType: 'summary_snapshot',
+    payload: { dailyNotesSummary: { count: 2 }, gitDiffSummary: { hasChanges: true, files: ['src/a.js'] } },
+  }, ctx);
+  await bus.publish({ type: 'cc_event', turnId: 'turn-summary', eventType: 'result', payload: { stop_reason: 'end_turn' } }, ctx);
+
+  const stopRecord = ctx.orchestrator.ledger.getRecordsForTurn('turn-summary')
+    .find((record) => record.intent === 'task_progress.stop' && record.deliveryChannel === 'stream');
+  assert.equal(stopRecord.meta.dailyNotesSummary.count, 2);
+  assert.equal(stopRecord.meta.gitDiffSummary.hasChanges, true);
+});
+
 test('turn-delivery starts separate Qi and TodoWrite streams in either order', async () => {
   for (const [label, events] of [
     ['qi-first', [
@@ -212,9 +236,20 @@ test('turn-delivery unified subscriber suppresses silent and deferred middle-sta
   }
 });
 
-test('turn-delivery unified subscriber ignores non-Slack platform contexts', async () => {
+test('turn-delivery unified subscriber matches subscriber-capable adapter contexts', async () => {
+  const subscriber = createTurnDeliveryCcEventSubscriber();
+  const msg = toolUse('turn-capability', 'Bash', {});
+
+  assert.equal(subscriber.match(msg, { adapter: { createQiSubscriber() {} } }), true);
+  assert.equal(subscriber.match(msg, { adapter: { installCcEventSubscriber() {} } }), true);
+  assert.equal(subscriber.match(msg, { adapter: {} }), false);
+  assert.equal(subscriber.match(msg, { adapter: null }), false);
+});
+
+test('turn-delivery unified subscriber ignores contexts without subscriber capability', async () => {
   const adapter = createMockAdapter();
   const subscriber = createTurnDeliveryCcEventSubscriber();
-  const ctx = createCtx(adapter, 'turn-wechat', { platform: 'wechat' });
+  delete adapter.createQiSubscriber;
+  const ctx = createCtx(adapter, 'turn-wechat', { platform: 'wechat', adapter });
   assert.equal(subscriber.match(toolUse('turn-wechat', 'Bash', {}), ctx), false);
 });

@@ -51,6 +51,8 @@ class FactRetriever:
         category: str | None = None,
         min_trust: float = 0.3,
         limit: int = 10,
+        importance_weight: float = 0.0,
+        recency_halflife_hours: float | None = None,
     ) -> list[dict]:
         """Hybrid search: FTS5 candidates → Jaccard rerank → trust weighting.
 
@@ -59,6 +61,7 @@ class FactRetriever:
         2. Jaccard boost: Token overlap between query and fact content
         3. Trust weighting: final_score = relevance * trust_score
         4. Temporal decay (optional): decay = 0.5^(age_days / half_life)
+        5. Importance and recency-hour multipliers are opt-in and disabled by default.
 
         Returns list of dicts with fact data + 'score' field, sorted by score desc.
         """
@@ -99,6 +102,15 @@ class FactRetriever:
             # Optional temporal decay
             if self.half_life > 0:
                 score *= self._temporal_decay(fact.get("updated_at") or fact.get("created_at"))
+            if importance_weight:
+                raw_importance = fact.get("importance")
+                importance = 0.5 if raw_importance is None else float(raw_importance)
+                score *= 1 + float(importance_weight) * max(0.0, min(1.0, importance))
+            if recency_halflife_hours is not None:
+                score *= self._recency_decay_hours(
+                    fact.get("updated_at") or fact.get("created_at"),
+                    recency_halflife_hours,
+                )
 
             fact["score"] = score
             scored.append(fact)
@@ -560,7 +572,7 @@ class FactRetriever:
             rows = conn.execute(
                 f"""
                 SELECT fact_id, content, category, tags, source_kind, confidence, trust_score,
-                       retrieval_count, helpful_count, created_at, updated_at,
+                       retrieval_count, helpful_count, importance, created_at, updated_at,
                        hrr_vector, 1.0 as fts_rank
                 FROM facts
                 {where}
@@ -698,5 +710,28 @@ class FactRetriever:
                 return 1.0
 
             return math.pow(0.5, age_days / self.half_life)
+        except (ValueError, TypeError):
+            return 1.0
+
+    @staticmethod
+    def _recency_decay_hours(timestamp_str: str | None, half_life_hours: float | None) -> float:
+        """Exponential recency decay in hours for opt-in callers."""
+        if not half_life_hours or half_life_hours <= 0 or not timestamp_str:
+            return 1.0
+
+        try:
+            if isinstance(timestamp_str, str):
+                ts = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+            else:
+                ts = timestamp_str
+
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+
+            age_hours = (datetime.now(timezone.utc) - ts).total_seconds() / 3600
+            if age_hours < 0:
+                return 1.0
+
+            return math.pow(0.5, age_hours / float(half_life_hours))
         except (ValueError, TypeError):
             return 1.0

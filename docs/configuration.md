@@ -214,7 +214,9 @@ Slack plus WeChat, two profiles:
 
 ## Environment Variables
 
-These variables are commonly relevant in a real deployment:
+The authoritative list is `src/runtime-env.js` (loaded at startup). Below mirrors that file plus a few bridge-only / hook-only knobs.
+
+### Adapter credentials
 
 | Variable | Meaning |
 | --- | --- |
@@ -222,15 +224,62 @@ These variables are commonly relevant in a real deployment:
 | `SLACK_APP_TOKEN` | Slack Socket Mode app token |
 | `WECHAT_ACCOUNT_ID` | WeChat account identifier |
 | `WECHAT_TOKEN` | WeChat token |
-| `CLAUDE_PATH` | Override the Claude Code binary path |
-| `CLAUDE_MODEL` | Default Claude model for workers |
-| `CLAUDE_EFFORT` | Default effort setting for workers |
-| `PYTHON_PATH` | Override the Python executable used by bridges |
-| `MEMORY_ENABLED` | Disable holographic memory when set to `false` |
-| `DOC_INDEX_ENABLED` | Disable DocStore when set to `false` |
-| `ORB_PERMISSION_APPROVAL_MODE` | `auto-allow` by default, `slack` for Slack approval cards |
-| `ORB_PERMISSION_TIMEOUT_MS` | Approval timeout |
-| `WORKER_IDLE_TIMEOUT_MS` | Idle lifetime for a live Claude CLI session |
+
+### Claude CLI / runtime
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `CLAUDE_PATH` | `claude` | Override the Claude Code binary path |
+| `CLAUDE_MODEL` | unset | Default Claude model for workers |
+| `CLAUDE_EFFORT` | unset | Default effort setting for workers |
+| `PYTHON_PATH` | `python3` | Override the Python executable used by bridges |
+| `MAX_TURNS` | `50` | Default Claude CLI `--max-turns` cap (per-task `maxTurns` overrides) |
+| `WORKER_IDLE_TIMEOUT_MS` | `60000` | Idle lifetime for a live Claude CLI session before the worker exits |
+| `ORB_WORKER_TIMEOUT_MS` | `1800000` | Hard worker process timeout (30 min default; raise for long skill writes / refactors) |
+
+### Permission / approval
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `ORB_PERMISSION_APPROVAL_MODE` | `auto-allow` | `auto-allow` by default, `slack` for Slack approval cards |
+| `ORB_PERMISSION_TIMEOUT_MS` | `300000` | Approval timeout |
+| `ORB_MCP_PERMISSION_LOG` | unset | Optional log path for MCP permission server events |
+
+### Memory / DocStore
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `MEMORY_ENABLED` | `true` | Disable holographic memory when set to `false` |
+| `DOC_INDEX_ENABLED` | `true` | Disable DocStore when set to `false` |
+| `DOC_INDEX_DB` | unset | Override DocStore SQLite path |
+| `DOC_REGISTRY_PATH` | unset | Override DocStore registry path |
+| `DOC_PROJECTS_ROOT` | unset | Override DocStore project root |
+| `ORB_MEMORY_RECALL_LIMIT` | `10` | Holographic recall fact count cap |
+| `ORB_MEMORY_MIN_TRUST` | `0.3` | Minimum trust score for holographic recall |
+| `ORB_DOC_RECALL_LIMIT` | `8` | DocStore recall snippet cap |
+
+### Prompt / delivery instrumentation
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `ORB_PROMPT_TOKEN_BUDGET` | unset | Optional token budget hint for prompt assembly |
+| `ORB_PROMPT_SOURCE_LABELING` | `true` | Prompt source labeling flag (compatibility readback) |
+| `ORB_LEDGER_HYDRATE` | `true` | Hydrate delivery ledger at startup |
+| `ORB_STREAM_TRACE` | `false` | Verbose stream client tracing |
+| `ORB_EVENTBUS_SMOKE_LOG` | `false` | Event bus smoke-test logging |
+
+### Paths / workspace
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `IMAGE_CACHE_DIR` | `~/.orb/cache/images` | Adapter-shared image download cache |
+| `WORKSPACE_DIR` | unset | Override per-profile workspace directory resolution |
+
+### Git hooks (commit-time only)
+
+| Variable | Meaning |
+| --- | --- |
+| `ORB_BOUNDARY_OVERRIDE` | Set to `1` to bypass `scripts/git-hooks/pre-commit` repo-boundary lineage enforcement on `src/**`, `.claude/skills/**`, `package.json`, `config.json`, `start.sh`. Stderr leaves a trace. Use only for emergency overrides |
 
 ## Reload Behavior
 

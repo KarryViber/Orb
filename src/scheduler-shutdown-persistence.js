@@ -5,8 +5,7 @@ import { taskQueue } from './queue.js';
 
 const TAG = 'scheduler';
 export const SHUTDOWN_QUEUE_FILE = 'shutdown-queue.json';
-export const INTERRUPTED_RUNS_FILE = 'interrupted-runs.json';
-export const SHUTDOWN_QUEUE_VERSION = 2;
+const SHUTDOWN_QUEUE_VERSION = 2;
 
 const PERSISTED_TASK_FIELDS = [
   'userText',
@@ -58,6 +57,97 @@ function taskDedupKey(task, fallbackThreadTs = null) {
   const threadTs = task?.threadTs || fallbackThreadTs;
   if (!threadTs) return null;
   return `${threadTs}:${attemptId}`;
+}
+
+export function normalizeThreadQueueForPersistence(queue) {
+  return (Array.isArray(queue) ? queue : [])
+    .filter((task) => task && !isCronTask(task))
+    .map((task) => sanitizeTaskForPersistence(task))
+    .filter(Boolean);
+}
+
+export function serializeShutdownState(snapshot, normalizedQueue) {
+  return {
+    version: SHUTDOWN_QUEUE_VERSION,
+    globalQueue: normalizeThreadQueueForPersistence(normalizedQueue?.globalQueue),
+    threadQueues: Object.fromEntries(
+      Object.entries(normalizedQueue?.threadQueues || {})
+        .map(([threadTs, queue]) => [threadTs, normalizeThreadQueueForPersistence(queue)])
+        .filter(([, queue]) => queue.length > 0),
+    ),
+  };
+}
+
+function drainGlobalQueue() {
+  const pending = taskQueue.drain ? taskQueue.drain() : [];
+  if (pending?.length || typeof taskQueue.dequeue !== 'function') return pending || [];
+  const drained = [];
+  let task;
+  while ((task = taskQueue.dequeue())) drained.push(task);
+  return drained;
+}
+
+function groupShutdownStateByProfile({ drained, threadQueues, getProfile }) {
+  const byProfile = new Map();
+  const resolveProfileForTask = (persistedTask) => {
+    let profileName = 'unknown';
+    let dataDir = null;
+    if (persistedTask?.profile?.dataDir) {
+      return {
+        profileName: persistedTask.profile.name || profileName,
+        dataDir: persistedTask.profile.dataDir,
+      };
+    }
+    try {
+      const profile = getProfile(persistedTask.userId);
+      profileName = profile.name;
+      dataDir = profile.dataDir;
+    } catch {}
+    return { profileName, dataDir };
+  };
+  const ensureQueuePayload = (profileName, dataDir) => {
+    if (!byProfile.has(profileName)) byProfile.set(profileName, { dataDir, globalQueue: [], threadQueues: {} });
+    return byProfile.get(profileName);
+  };
+  const addPersistedTask = (persistedTask, threadTs = null) => {
+    const { profileName, dataDir } = resolveProfileForTask(persistedTask);
+    if (!dataDir) return;
+    const entry = ensureQueuePayload(profileName, dataDir);
+    if (!threadTs) entry.globalQueue.push(persistedTask);
+    else {
+      if (!entry.threadQueues[threadTs]) entry.threadQueues[threadTs] = [];
+      entry.threadQueues[threadTs].push(persistedTask);
+    }
+  };
+
+  for (const task of normalizeThreadQueueForPersistence(drained)) addPersistedTask(task);
+  for (const [threadTs, queue] of threadQueues) {
+    for (const task of normalizeThreadQueueForPersistence(queue)) addPersistedTask(task, threadTs);
+  }
+  return { byProfile };
+}
+
+function writeShutdownQueuePayloads(byProfile) {
+  if (byProfile.size === 0) return;
+  let totalPersisted = 0;
+  for (const [name, payload] of byProfile) {
+    try {
+      mkdirSync(payload.dataDir, { recursive: true });
+      const outPath = join(payload.dataDir, SHUTDOWN_QUEUE_FILE);
+      const serialized = serializeShutdownState([], {
+        globalQueue: payload.globalQueue,
+        threadQueues: payload.threadQueues,
+      });
+      writeFileSync(outPath, `${JSON.stringify(serialized, null, 2)}\n`);
+      const profileCount = payload.globalQueue.length
+        + Object.values(payload.threadQueues).reduce((sum, queue) => sum + queue.length, 0);
+      totalPersisted += profileCount;
+      info(TAG, `shutdown: persisted ${profileCount} task(s) for profile=${name} → ${outPath}`);
+    } catch (e) {
+      warn(TAG, `shutdown: failed to persist queue for profile=${name}: ${e.message}`);
+    }
+  }
+  warn(TAG, `shutdown: persisted ${totalPersisted} queued task(s) to ${SHUTDOWN_QUEUE_FILE}`);
 }
 
 export function normalizeShutdownQueue(raw, queuePath) {
@@ -139,118 +229,15 @@ export function restoreShutdownQueues({ threadQueues }) {
   }
 }
 
-export function persistShutdownQueues({ threadQueues, activeWorkers, getProfile }) {
+export function persistShutdownQueues({ threadQueues, getProfile }) {
   try {
-    const pending = taskQueue.drain ? taskQueue.drain() : [];
-    let drained = pending;
-    if ((!drained || drained.length === 0) && typeof taskQueue.dequeue === 'function') {
-      drained = [];
-      let t;
-      while ((t = taskQueue.dequeue())) drained.push(t);
-    }
-    const byProfile = new Map();
-    const interruptedByProfile = new Map();
-    const resolveProfileForTask = (persistedTask) => {
-      let profileName = 'unknown';
-      let dataDir = null;
-      if (persistedTask?.profile?.dataDir) {
-        profileName = persistedTask.profile.name || profileName;
-        dataDir = persistedTask.profile.dataDir;
-        return { profileName, dataDir };
-      }
-      try {
-        const profile = getProfile(persistedTask.userId);
-        profileName = profile.name;
-        dataDir = profile.dataDir;
-      } catch {}
-      return { profileName, dataDir };
-    };
-    const addPersistedTask = (task, threadTs = null) => {
-      if (isCronTask(task)) return;
-      const persistedTask = sanitizeTaskForPersistence(task);
-      if (!persistedTask) return;
-      const { profileName, dataDir } = resolveProfileForTask(persistedTask);
-      if (!dataDir) return;
-      if (!byProfile.has(profileName)) {
-        byProfile.set(profileName, { dataDir, globalQueue: [], threadQueues: {} });
-      }
-      const entry = byProfile.get(profileName);
-      if (threadTs) {
-        if (!entry.threadQueues[threadTs]) entry.threadQueues[threadTs] = [];
-        entry.threadQueues[threadTs].push(persistedTask);
-      } else {
-        entry.globalQueue.push(persistedTask);
-      }
-    };
-    const addInterrupted = (task, role) => {
-      if (isCronTask(task)) return;
-      const persistedTask = sanitizeTaskForPersistence(task);
-      if (!persistedTask) return;
-      const { profileName, dataDir } = resolveProfileForTask(persistedTask);
-      if (!dataDir) return;
-      if (!interruptedByProfile.has(profileName)) {
-        interruptedByProfile.set(profileName, { dataDir, runs: [] });
-      }
-      interruptedByProfile.get(profileName).runs.push({
-        role,
-        task: persistedTask,
-        interruptedAt: new Date().toISOString(),
-        attemptId: persistedTask.attemptId || null,
-        threadTs: persistedTask.threadTs || null,
-        origin: persistedTask.origin || null,
-      });
-    };
-
-    for (const task of drained || []) addPersistedTask(task);
-    for (const [threadTs, queue] of threadQueues) {
-      for (const task of queue) addPersistedTask(task, threadTs);
-    }
-    for (const entry of activeWorkers.values()) {
-      if (entry.task) addInterrupted(entry.task, 'active-task');
-      if (entry.pendingInjects && entry.pendingInjects.size > 0) {
-        for (const injectTask of entry.pendingInjects.values()) {
-          addInterrupted(injectTask, 'pending-inject');
-        }
-      }
-    }
-
-    if (byProfile.size > 0) {
-      let totalPersisted = 0;
-      for (const [name, payload] of byProfile) {
-        try {
-          mkdirSync(payload.dataDir, { recursive: true });
-          const outPath = join(payload.dataDir, SHUTDOWN_QUEUE_FILE);
-          writeFileSync(outPath, `${JSON.stringify({
-            version: SHUTDOWN_QUEUE_VERSION,
-            globalQueue: payload.globalQueue,
-            threadQueues: payload.threadQueues,
-          }, null, 2)}\n`);
-          const profileCount = payload.globalQueue.length
-            + Object.values(payload.threadQueues).reduce((sum, queue) => sum + queue.length, 0);
-          totalPersisted += profileCount;
-          info(TAG, `shutdown: persisted ${profileCount} task(s) for profile=${name} → ${outPath}`);
-        } catch (e) {
-          warn(TAG, `shutdown: failed to persist queue for profile=${name}: ${e.message}`);
-        }
-      }
-      warn(TAG, `shutdown: persisted ${totalPersisted} queued task(s) to ${SHUTDOWN_QUEUE_FILE}`);
-    }
-    for (const [name, payload] of interruptedByProfile) {
-      try {
-        mkdirSync(payload.dataDir, { recursive: true });
-        const outPath = join(payload.dataDir, INTERRUPTED_RUNS_FILE);
-        let existing = [];
-        if (existsSync(outPath)) {
-          try { existing = JSON.parse(readFileSync(outPath, 'utf8')) || []; } catch {}
-          if (!Array.isArray(existing)) existing = [];
-        }
-        const merged = [...existing, ...payload.runs];
-        writeFileSync(outPath, `${JSON.stringify(merged, null, 2)}\n`);
-        warn(TAG, `shutdown: marked ${payload.runs.length} run(s) interrupted for profile=${name} → ${outPath}`);
-      } catch (e) {
-        warn(TAG, `shutdown: failed to mark interrupted for profile=${name}: ${e.message}`);
-      }
-    }
+    const drained = drainGlobalQueue();
+    const { byProfile } = groupShutdownStateByProfile({
+      drained,
+      threadQueues,
+      getProfile,
+    });
+    writeShutdownQueuePayloads(byProfile);
   } catch (e) {
     warn(TAG, `shutdown: queue persistence error: ${e.message}`);
   }

@@ -8,19 +8,22 @@
  * This module only reads the file and executes due jobs.
  */
 
-import { randomUUID } from 'node:crypto';
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { info, error as logError, warn } from './log.js';
 import { writeLessonCandidate } from './lesson-candidates.js';
 import { getProfileNotifyDm as getConfiguredProfileNotifyDm } from './config.js';
-import { classifyStopReason, isSuccessfulStopReason } from './stop-reason.js';
+import { resolveDeliveryMode } from './cron-delivery.js';
+import { applyJobCompletion } from './cron/job-completion.js';
+import { runCronJob, runCronJobFailureHandler } from './cron/run-cron-job.js';
 
 const TAG = 'cron';
 const TICK_INTERVAL = 60_000; // 60 seconds
 const JOBS_LOCK_TIMEOUT_MS = 5_000;
 const JOBS_LOCK_STALE_MS = 60_000;
 const missingJobsLogged = new Set();
+const invalidScriptCommandNotified = new Set();
+const INJECT_QUEUE_FILE = 'inject-queue.json';
 
 export class BadCronExpr extends Error {
   constructor(field, message) {
@@ -136,6 +139,57 @@ function parseDurationMinutes(amount, unit) {
   if (u.startsWith('h')) return n * 60;
   if (u.startsWith('d')) return n * 1440;
   return n; // minutes
+}
+
+function loadInjectQueue(dataDir) {
+  const path = join(dataDir, INJECT_QUEUE_FILE);
+  if (!existsSync(path)) return { path, queue: [] };
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf-8'));
+    return { path, queue: Array.isArray(parsed) ? parsed : [] };
+  } catch (err) {
+    warn(TAG, `inject queue parse failed: ${path}: ${err.message}`);
+    return { path, queue: [] };
+  }
+}
+
+function writeInjectQueue(path, queue) {
+  const tmp = `${path}.${process.pid}.tmp`;
+  writeFileSync(tmp, JSON.stringify(queue, null, 2) + '\n', 'utf-8');
+  renameSync(tmp, path);
+}
+
+async function consumeInjectQueue({ dataDir, scheduler }) {
+  if (!scheduler) return;
+  const { path, queue } = loadInjectQueue(dataDir);
+  if (!queue.length) return;
+  const remaining = [];
+  for (const item of queue) {
+    if (!item || typeof item !== 'object') continue;
+    const channel = String(item.channel || '').trim();
+    const threadTs = String(item.threadTs || '').trim();
+    const userText = String(item.userText || '').trim();
+    if (!channel || !threadTs || !userText) {
+      warn(TAG, `inject queue drop invalid item id=${item.id || 'unknown'}`);
+      continue;
+    }
+    try {
+      await scheduler.submit({
+        platform: item.platform || 'slack',
+        channel,
+        threadTs,
+        userId: item.userId || '',
+        userText,
+        forceNewWorker: true,
+        origin: { kind: 'system', name: item.source || 'inject-queue', parentAttemptId: null },
+      });
+      info(TAG, `inject queue submitted: id=${item.id || 'unknown'} thread=${threadTs}`);
+    } catch (err) {
+      warn(TAG, `inject queue submit failed id=${item.id || 'unknown'}: ${err.message}`);
+      remaining.push(item);
+    }
+  }
+  writeInjectQueue(path, remaining);
 }
 
 /**
@@ -277,6 +331,39 @@ function postCronPersistenceFailureDm(profileName, dataDir, reason) {
   });
 }
 
+function postInvalidScriptCommandDm(profileName, job) {
+  const key = `${profileName}:${job?.id || 'unknown'}`;
+  if (invalidScriptCommandNotified.has(key)) return;
+  invalidScriptCommandNotified.add(key);
+
+  const channel = getConfiguredProfileNotifyDm(profileName);
+  const token = process.env.SLACK_BOT_TOKEN;
+  if (!channel) {
+    warn(TAG, `cron script command DM skipped for profile=${profileName}: notifyChannels.dm not configured`);
+    return;
+  }
+  if (!token || typeof fetch !== 'function') return;
+
+  const text = [
+    '🚨 cron script job disabled for this tick',
+    `profile: ${profileName}`,
+    `id: ${job?.id || 'unknown'}`,
+    `name: ${job?.name || job?.id || 'unknown'}`,
+    'reason: runMode=script requires non-empty command',
+  ].join('\n').slice(0, 500);
+
+  fetch('https://slack.com/api/chat.postMessage', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json; charset=utf-8',
+    },
+    body: JSON.stringify({ channel, text }),
+  }).catch((err) => {
+    warn(TAG, `failed to send cron script command DM: ${err.message}`);
+  });
+}
+
 function recordCronPersistenceFailure(dataDir, reason, job = null) {
   const profileName = profileNameFromDataDir(dataDir);
   try {
@@ -293,6 +380,17 @@ function recordCronPersistenceFailure(dataDir, reason, job = null) {
     warn(TAG, `failed to write cron persistence failure lesson candidate: ${err.message}`);
   }
   postCronPersistenceFailureDm(profileName, dataDir, reason);
+}
+
+function schedulableJobs(dataDir, jobs) {
+  const profileName = profileNameFromDataDir(dataDir);
+  return jobs.filter((job) => {
+    if (job?.runMode !== 'script') return true;
+    if (typeof job.command === 'string' && job.command.trim()) return true;
+    warn(TAG, `skipping job ${job?.id || 'unknown'} "${job?.name || ''}": runMode=script missing command`);
+    postInvalidScriptCommandDm(profileName, job);
+    return false;
+  });
 }
 
 function loadJobs(dataDir) {
@@ -423,7 +521,7 @@ function withJobsFileLock(dataDir, fn) {
   }
 }
 
-export function saveJobs(dataDir, jobs) {
+function saveJobs(dataDir, jobs) {
   const p = jobsPath(dataDir);
   const tmp = p + '.tmp.' + process.pid;
   try {
@@ -449,20 +547,6 @@ function graceMs(schedule) {
   }
   // cron: default 2 hours
   return 7_200_000;
-}
-
-function failureReasonFromResult(responseText, stopReason, errorSummary = '') {
-  const text = String(responseText || '').trim();
-  if (text.toLowerCase().startsWith('failed:')) return text.slice('failed:'.length).trim() || 'failed';
-  if (!isSuccessfulStopReason(stopReason)) {
-    const summary = truncateErrorContext(errorSummary, 160);
-    return summary ? `${stopReason}: ${summary}` : `stopReason=${stopReason}`;
-  }
-  return null;
-}
-
-function truncateErrorContext(value, limit = 500) {
-  return String(value || '').replace(/\s+$/g, '').slice(0, limit);
 }
 
 // ── CronScheduler ──
@@ -519,7 +603,8 @@ export class CronScheduler {
         }
 
         await this._awaitJobWrites(paths.dataDir);
-        const jobs = loadJobs(paths.dataDir);
+        await consumeInjectQueue({ dataDir: paths.dataDir, scheduler: this._scheduler });
+        const jobs = schedulableJobs(paths.dataDir, loadJobs(paths.dataDir));
         if (jobs.length === 0) continue;
 
         const dueJobs = [];
@@ -528,7 +613,16 @@ export class CronScheduler {
         for (const job of jobs) {
           try {
             if (!job.enabled) continue;
-            if (!job.nextRunAt) continue;
+
+            if (!job.nextRunAt) {
+              if (job.schedule?.kind === 'once') continue;
+              const next = computeNextRun(job.schedule, now);
+              if (!next) continue;
+              job.nextRunAt = next.toISOString();
+              nextRunUpdates.set(job.id, { nextRunAt: job.nextRunAt });
+              warn(TAG, `initialized missing nextRunAt for job ${job.id} "${job.name}" → ${job.nextRunAt}`);
+              continue;
+            }
 
             const nextRun = new Date(job.nextRunAt);
             if (nextRun > now) continue;
@@ -612,8 +706,7 @@ export class CronScheduler {
     this._inflightJobs.add(inflightKey);
     info(TAG, `executing job ${job.id} "${job.name}" (profile=${job.profileName})`);
     const origin = { kind: 'cron', name: job.id, parentAttemptId: null };
-    let applyCompletionRules = true;
-    const recordFailureLesson = (reason, errorContext = '') => {
+    const recordFailureLesson = (reason, errorContext = '', meta = {}) => {
       try {
         writeLessonCandidate(paths.dataDir, {
           source: 'cron-failure',
@@ -622,6 +715,7 @@ export class CronScheduler {
           threadId: `cron:${profileName}:${job.id}`,
           cronName: job.name || job.id,
           kind: 'cron',
+          failureKind: meta.failureKind || 'execution',
           origin,
         });
       } catch (err) {
@@ -631,94 +725,24 @@ export class CronScheduler {
 
     try {
       const scheduler = this._getScheduler();
-      if (typeof scheduler?.executeTask !== 'function') {
-        throw new Error('scheduler executeTask unavailable for cron job');
-      }
+      const deliveryMode = this._resolveDeliveryMode(job);
       const delivery = this._resolveDelivery(job);
-      const jobRunId = `${job.id}:${now.getTime()}:${randomUUID()}`;
-      let responseText = '';
-      let stopReason = null;
-
-      const result = await scheduler.executeTask({
-        userText: job.prompt,
-        fileContent: '',
-        imagePaths: [],
-        threadTs: `cron:${profileName}:${job.id}`,
-        deliveryThreadTs: delivery.threadTs || null,
-        channel: delivery.channel,
-        userId: null,
-        platform: delivery.platform,
-        channelSemantics: 'silent',
-        threadHistory: null,
-        model: job.model || null,
-        effort: job.effort || null,
-        maxTurns: job.maxTurns || null,
-        enableTaskCard: false,
-        forceNewWorker: true,
-        jobRunId,
-        cronName: job.name || job.id,
-        origin,
-        profile: {
-          name: job.profileName,
-          workspaceDir: paths.workspaceDir,
-          dataDir: paths.dataDir,
-          scriptsDir: paths.scriptsDir,
-        },
-      });
-      responseText = result?.text || '';
-      stopReason = result?.stopReason || null;
-
-      const stopReasonClass = classifyStopReason(stopReason);
-      const failureReason = failureReasonFromResult(responseText, stopReason, result?.errorSummary || '');
-
-      job.lastRunAt = now.toISOString();
-      if (failureReason && stopReasonClass === 'failed') {
-        job.lastStatus = 'failed';
-        job.lastError = truncateErrorContext(failureReason);
-        recordFailureLesson(failureReason, responseText || stopReason || '');
-        job.lastDeliveryError = null;
-      } else if (stopReasonClass === 'truncated') {
-        job.lastStatus = 'truncated';
-        job.lastError = `${stopReason}: 触达 turn 上限，任务未完成（非失败）`;
-        job.lastDeliveryError = null;
-      } else if (failureReason) {
-        job.lastStatus = 'failed';
-        job.lastError = truncateErrorContext(failureReason);
-        recordFailureLesson(failureReason, responseText || stopReason || '');
-        job.lastDeliveryError = null;
-      } else {
-        job.lastStatus = 'ok';
-        job.lastError = null;
-        job.lastDeliveryError = null;
-      }
+      const deliveryAdapter = this._resolveDeliveryAdapter(scheduler, deliveryMode.platform);
+      const result = await runCronJob({ job, scheduler, paths, now, delivery, deliveryMode, deliveryAdapter, origin, recordFailureLesson });
+      Object.assign(job, applyJobCompletion(job, result, job));
     } catch (err) {
-      job.lastRunAt = now.toISOString();
-      job.lastStatus = 'failed';
-      job.lastError = truncateErrorContext(err.message);
-      if (err?.code === 'ORB_CRON_NOTIFY_DM_MISSING') {
-        job.enabled = false;
-        job.nextRunAt = null;
-        applyCompletionRules = false;
-      }
-      logError(TAG, `job ${job.id} failed: ${err.message}`);
-      recordFailureLesson(err.message || 'worker_error', err.stack || err.message);
-      job.lastDeliveryError = null;
+      let deliveryMode = null;
+      let deliveryAdapter = null;
+      try {
+        deliveryMode = this._resolveDeliveryMode(job);
+        deliveryAdapter = this._resolveDeliveryAdapter(this._getScheduler(), deliveryMode.platform);
+      } catch {}
+      const result = await runCronJobFailureHandler({ err, job, now, paths, deliveryMode, deliveryAdapter, recordFailureLesson });
+      Object.assign(job, applyJobCompletion(job, result, job));
     }
 
-    // Repeat tracking
-    if (applyCompletionRules && job.repeat?.times != null) {
-      job.repeat.completed = (job.repeat.completed || 0) + 1;
-      if (job.repeat.completed >= job.repeat.times) {
-        job.enabled = false;
-        job.nextRunAt = null;
-        info(TAG, `job ${job.id} completed (${job.repeat.completed}/${job.repeat.times})`);
-      }
-    }
-
-    // One-shot: disable after execution
-    if (applyCompletionRules && job.schedule.kind === 'once') {
-      job.enabled = false;
-      job.nextRunAt = null;
+    if (job.repeat?.times != null && job.repeat.completed >= job.repeat.times) {
+      info(TAG, `job ${job.id} completed (${job.repeat.completed}/${job.repeat.times})`);
     }
 
     try {
@@ -746,14 +770,27 @@ export class CronScheduler {
       err.code = 'ORB_CRON_NOTIFY_DM_MISSING';
       throw err;
     }
+    const deliveryMode = this._resolveDeliveryMode(job);
     return {
-      platform: 'slack',
-      channel,
-      threadTs: null,
+      platform: deliveryMode.platform,
+      channel: deliveryMode.channel || channel,
+      threadTs: deliveryMode.threadTs || null,
     };
   }
 
+  _resolveDeliveryMode(job) {
+    return resolveDeliveryMode(job, this._getProfileNotifyDm(job.profileName));
+  }
+
+  _resolveDeliveryAdapter(scheduler, platform) {
+    if (!platform) return null;
+    if (typeof scheduler?._getAdapter === 'function') return scheduler._getAdapter(platform);
+    if (scheduler?.adapters instanceof Map) return scheduler.adapters.get(platform) || null;
+    return null;
+  }
+
   async _awaitJobWrites(dataDir) {
+    await Promise.resolve();
     const pending = this._jobWriteChains.get(dataDir);
     if (!pending) return;
     await pending.catch(() => {});

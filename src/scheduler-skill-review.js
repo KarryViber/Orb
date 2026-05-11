@@ -73,30 +73,18 @@ export function checkSkillReview({
   }
 }
 
-export function spawnSkillReview({
-  task,
-  priorMessages = [],
-  getProfile,
-  backgroundWorkers,
-  maxBackgroundWorkers,
-}) {
-  const { userId } = task;
-  const profile = getProfile(userId);
-  const agentsDir = join(profile.workspaceDir, '.claude', 'skills');
-  const draftsDir = join(agentsDir, '_drafts');
-
-  const existing = scanExistingSkills(agentsDir);
-  const existingSection = existing.length > 0
+export function buildSkillReviewPrompt({ existingSkills = [], draftsDir, threadTs }) {
+  const existingSection = existingSkills.length > 0
     ? [
         '',
         '## Existing Skills',
         'These skills already exist. If the conversation improved or extended one, UPDATE it instead of creating a duplicate.',
         '',
-        ...existing.map(s => `### ${s.file}\n${s.summary}\n`),
+        ...existingSkills.map(s => `### ${s.file}\n${s.summary}\n`),
       ].join('\n')
     : '\n## Existing Skills\nNone yet.\n';
 
-  const reviewPrompt = [
+  return [
     'You are a skill extraction agent. Review the conversation that just completed.',
     '',
     '## Decision Flow',
@@ -123,7 +111,7 @@ export function spawnSkillReview({
     'description: One-line description of when/why to use this',
     'stage: draft',
     `created_at: ${new Date().toISOString()}`,
-    `source_thread_id: ${task.threadTs || 'unknown'}`,
+    `source_thread_id: ${threadTs || 'unknown'}`,
     '---',
     '# Skill Title',
     '',
@@ -141,6 +129,25 @@ export function spawnSkillReview({
     'When UPDATING: preserve existing content that\'s still valid, add new learnings, bump any version notes.',
     'Be concise. One skill per directory. Directory name = kebab-case skill name; file name must be SKILL.md.',
   ].join('\n');
+}
+
+export function spawnSkillReview({
+  task,
+  priorMessages = [],
+  getProfile,
+  backgroundWorkers,
+  maxBackgroundWorkers,
+}) {
+  const { userId } = task;
+  const profile = getProfile(userId);
+  const agentsDir = join(profile.workspaceDir, '.claude', 'skills');
+  const draftsDir = join(agentsDir, '_drafts');
+
+  const reviewPrompt = buildSkillReviewPrompt({
+    existingSkills: scanExistingSkills(agentsDir),
+    draftsDir,
+    threadTs: task.threadTs,
+  });
 
   if (backgroundWorkers.size >= maxBackgroundWorkers) {
     info(TAG, 'background worker limit reached, skipping skill review');

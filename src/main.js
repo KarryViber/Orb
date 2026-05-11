@@ -67,43 +67,9 @@ function acquireDaemonLock() {
   }
 }
 
-async function start() {
-  const releaseDaemonLock = acquireDaemonLock();
-  process.once('exit', releaseDaemonLock);
-
-  const config = loadConfig();
-
-  const profiles = config.profiles;
-  if (!profiles || Object.keys(profiles).length === 0) {
-    logError(TAG, 'no profiles defined in config.json');
-    process.exit(1);
-  }
-  info(TAG, `profiles: ${Object.keys(profiles).join(', ')}`);
-
-  // Validate: at least one adapter enabled
-  const enabledAdapters = Object.entries(config.adapters || {}).filter(([, v]) => v.enabled);
-  if (enabledAdapters.length === 0) {
-    logError(TAG, 'no adapters enabled in config.json');
-    process.exit(1);
-  }
-
-  // Profile resolver function — passed to scheduler
-  const getProfile = (userId) => {
-    const profile = resolveProfile(userId);
-    return resolveProfilePaths(profile);
-  };
-
-  const schedulerConfig = config.scheduler || {};
-  const scheduler = new Scheduler({
-    maxWorkers: schedulerConfig.maxWorkers || 3,
-    timeoutMs: schedulerConfig.timeoutMs || 900_000,
-    getProfile,
-  });
-
-  // Start all enabled adapters
+async function buildAdapters(enabledAdapters, scheduler, getProfile) {
   for (const [name, adapterConfig] of enabledAdapters) {
     if (name === 'slack') {
-      // Validate required Slack config
       if (!adapterConfig.botToken || !adapterConfig.appToken) {
         logError(TAG, 'slack adapter: missing botToken or appToken');
         process.exit(1);
@@ -121,14 +87,8 @@ async function start() {
       });
 
       scheduler.addAdapter(name, adapter);
-
       adapter.onReaction = (task) => scheduler.submit(task);
-
-      await adapter.start(
-        (task) => scheduler.submit(task),
-        null,
-      );
-
+      await adapter.start((task) => scheduler.submit(task), null);
       info(TAG, `adapter started: ${name}`);
     }
     else if (name === 'wechat') {
@@ -147,17 +107,56 @@ async function start() {
       });
 
       scheduler.addAdapter(name, adapter);
-
-      await adapter.start(
-        (task) => scheduler.submit(task),
-      );
-
+      await adapter.start((task) => scheduler.submit(task));
       info(TAG, `adapter started: ${name}`);
     }
-    // Future: else if (name === 'discord') { ... }
+  }
+}
+
+function installSignalHandlers({ scheduler, cronScheduler, reload }) {
+  process.on('SIGTERM', () => { cronScheduler.stop(); scheduler.shutdown('SIGTERM'); });
+  process.on('SIGINT', () => { cronScheduler.stop(); scheduler.shutdown('SIGINT'); });
+
+  process.on('SIGHUP', () => {
+    info(TAG, 'SIGHUP received, reloading config...');
+    try {
+      const reloaded = reload();
+      cronScheduler.setProfileNames(Object.keys(reloaded.profiles));
+      info(TAG, 'config reloaded');
+    } catch (err) {
+      logError(TAG, `SIGHUP reload failed, keeping current config: ${err.message}`);
+    }
+  });
+}
+
+async function start() {
+  const releaseDaemonLock = acquireDaemonLock();
+  process.once('exit', releaseDaemonLock);
+
+  const config = loadConfig();
+
+  if (!config.profiles || Object.keys(config.profiles).length === 0) {
+    logError(TAG, 'no profiles defined in config.json');
+    process.exit(1);
+  }
+  info(TAG, `profiles: ${Object.keys(config.profiles).join(', ')}`);
+
+  const enabledAdapters = Object.entries(config.adapters || {}).filter(([, v]) => v.enabled);
+  if (enabledAdapters.length === 0) {
+    logError(TAG, 'no adapters enabled in config.json');
+    process.exit(1);
   }
 
-  // ── Cron scheduler ──
+  const getProfile = (userId) => resolveProfilePaths(resolveProfile(userId));
+
+  const schedulerConfig = config.scheduler || {};
+  const scheduler = new Scheduler({
+    maxWorkers: schedulerConfig.maxWorkers || 3,
+    timeoutMs: schedulerConfig.timeoutMs || 900_000,
+    getProfile,
+  });
+
+  await buildAdapters(enabledAdapters, scheduler, getProfile);
 
   const cronScheduler = new CronScheduler({
     getProfilePaths: (profileName) => {
@@ -171,30 +170,16 @@ async function start() {
   cronScheduler.setProfileNames(Object.keys(config.profiles));
   cronScheduler.start();
 
-  process.on('SIGTERM', () => { cronScheduler.stop(); scheduler.shutdown('SIGTERM'); });
-  process.on('SIGINT', () => { cronScheduler.stop(); scheduler.shutdown('SIGINT'); });
-
-  process.on('SIGHUP', () => {
-    info(TAG, 'SIGHUP received, reloading config...');
-    try {
-      const reloaded = loadConfig(true);
-      cronScheduler.setProfileNames(Object.keys(reloaded.profiles));
-      info(TAG, 'config reloaded');
-    } catch (err) {
-      logError(TAG, `SIGHUP reload failed, keeping current config: ${err.message}`);
-    }
-  });
+  installSignalHandlers({ scheduler, cronScheduler, reload: () => loadConfig(true) });
 
   info(TAG, `Orb started with ${enabledAdapters.length} adapter(s), ${Object.keys(config.profiles).length} profile(s)`);
 
-  // Heartbeat — periodic health log + session cleanup
-  const HEARTBEAT_INTERVAL = 30 * 60 * 1000; // 30 minutes
+  const HEARTBEAT_INTERVAL = 30 * 60 * 1000;
   setInterval(async () => {
     const workers = scheduler.activeWorkers.size;
     const mem = Math.round(process.memoryUsage().rss / 1024 / 1024);
     info(TAG, `heartbeat: workers=${workers} mem=${mem}MB uptime=${Math.round(process.uptime())}s`);
 
-    // Prune stale sessions (> 7 days inactive) — use latest cached config (#20)
     const currentConfig = loadConfig();
     for (const [, profileDef] of Object.entries(currentConfig.profiles)) {
       try {

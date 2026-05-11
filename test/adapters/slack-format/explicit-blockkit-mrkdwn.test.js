@@ -47,3 +47,52 @@ test('markdown buildBlocks path keeps heading conversion behavior', () => {
   assert.equal(payloads[0].blocks[0].text.text, '*:droplet: 一句话定性*');
   assert.equal(payloads[0].blocks[1].text.text, 'body');
 });
+
+test('daily notes summary appends after git diff context block', () => {
+  const payloads = buildSendPayloads('done', {
+    gitDiffSummary: {
+      hasChanges: true,
+      totals: { filesChanged: 1, insertions: 2, deletions: 0 },
+      files: [{ status: 'M', path: 'src/worker.js', linesAdded: 2, linesDeleted: 0 }],
+    },
+    dailyNotesSummary: {
+      count: 2,
+      entries: [
+        { mode: 'line', time: '12:46', layer: '配置层', snippet: 'daemon 重启 + 验真 落地' },
+        { mode: 'narrative', time: '13:10', snippet: 'daily-notes 回执时序修复 A+B 上线' },
+      ],
+    },
+  });
+
+  const blocks = payloads[0].blocks;
+  assert.equal(blocks.at(-2).type, 'context');
+  assert.match(blocks.at(-2).elements[0].text, /改动/);
+  assert.equal(blocks.at(-1).type, 'context');
+  assert.equal(
+    blocks.at(-1).elements[0].text,
+    '📓 12:46｜[配置层]｜daemon 重启 + 验真 落地\n📓 13:10｜narrative｜daily-notes 回执时序修复 A+B 上线',
+  );
+});
+
+test('daily notes summary can render as context-only fallback', () => {
+  const payloads = buildSendPayloads('', { dailyNotesSummary: { count: 1 } });
+
+  assert.deepEqual(payloads, [{
+    blocks: [{
+      type: 'context',
+      elements: [{ type: 'mrkdwn', text: '📓 _日记已追加_' }],
+    }],
+    text: '📓',
+  }]);
+});
+
+test('daily notes summary renders karry entries with mirror prefix', () => {
+  const payloads = buildSendPayloads('', {
+    dailyNotesSummary: {
+      count: 1,
+      entries: [{ mode: 'karry', time: '09:30', title: '自我校准' }],
+    },
+  });
+
+  assert.equal(payloads[0].blocks[0].elements[0].text, '🪞 09:30｜karry｜自我校准');
+});

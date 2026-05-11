@@ -1,18 +1,27 @@
-import { readFileSync, existsSync, readdirSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { existsSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { warn } from './log.js';
+import { channelMetaProvider } from './context-providers/channel-meta.js';
+import { cronProtocolProvider } from './context-providers/cron-protocol.js';
 import { docstoreProvider } from './context-providers/docstore.js';
+import { cronHistoryProvider } from './context-providers/cron-history.js';
 import { holographicProvider } from './context-providers/holographic.js';
-import { memoryManifestItem } from './context-providers/interface.js';
+import { legacyAttachmentProvider } from './context-providers/legacy-attachment.js';
 import { skillReviewProvider } from './context-providers/skill-review.js';
+import { scratchpadProvider } from './context-providers/scratchpad.js';
 import { threadHistoryProvider } from './context-providers/thread-history.js';
 
 const TAG = 'context';
 const PROVIDERS = [
   holographicProvider,
   docstoreProvider,
+  scratchpadProvider,
   threadHistoryProvider,
   skillReviewProvider,
+  cronProtocolProvider,
+  cronHistoryProvider,
+  channelMetaProvider,
+  legacyAttachmentProvider,
 ];
 
 const IMMUTABLE_PROMPT_BOUNDARY = `## Immutable Prompt Boundary
@@ -29,12 +38,13 @@ const NEVER_TRUNCATE_SOURCE_TYPES = new Set([
 ]);
 
 // Prompt budget pruning order, first removed first:
-// linked_thread -> attachment -> web_content -> thread_history -> doc_snippet
+// linked_thread -> attachment -> web_content -> scratchpad -> thread_history -> doc_snippet
 // -> memory_fact -> slack_channel_meta. tool_result is outside context.js.
 const TRUNCATE_SOURCE_ORDER = [
   'linked_thread',
   'attachment',
   'web_content',
+  'scratchpad',
   'thread_history',
   'doc_snippet',
   'memory_fact',
@@ -53,6 +63,7 @@ function normalizeOriginString(origin) {
   if (!origin || typeof origin !== 'object') return String(origin || 'user');
   if (origin.kind === 'cron') return `cron:${origin.name || 'unknown'}`;
   if (origin.kind === 'inject') return `inject:${origin.parentAttemptId || 'unknown'}`;
+  if (origin.kind === 'launcher_result') return `launcher_result:${origin.name || 'unknown'}`;
   if (origin.kind === 'system') return `system:${origin.name || 'unknown'}`;
   return 'user';
 }
@@ -66,9 +77,11 @@ function normalizedFragment(fragment, fallback = {}) {
   };
 }
 
-export function renderExternalFragment(fragment) {
+// @internal: test-only
+function renderExternalFragment(fragment) {
   const f = normalizedFragment(fragment);
   const attrs = [
+    ['label', f.label],
     ['source_type', f.source_type],
     ['trusted', f.trusted],
     ['origin', f.origin],
@@ -115,30 +128,6 @@ function renderCurrentUserMessage({ source_type, trusted, origin, content }) {
     String(content || '(仅附件)'),
     '</current_user_message>',
   ].join('\n');
-}
-
-function channelMetaToFragments(channelMeta, channel, retrievedAt) {
-  if (!channelMeta || (!channelMeta.topic && !channelMeta.purpose)) return [];
-  return [{
-    source_type: 'slack_channel_meta',
-    trusted: false,
-    origin: `slack:channel:${channel || 'unknown'}`,
-    content: JSON.stringify({ topic: channelMeta.topic || '', purpose: channelMeta.purpose || '' }, null, 2),
-    retrieved_at: retrievedAt,
-    platform: 'slack',
-    channel,
-  }];
-}
-
-function fileContentToFragments(fileContent, retrievedAt) {
-  if (!fileContent) return [];
-  return [{
-    source_type: 'attachment',
-    trusted: 'semi',
-    origin: 'legacy:fileContent',
-    content: fileContent,
-    retrieved_at: retrievedAt,
-  }];
 }
 
 function promptBudgetTokens() {
@@ -189,21 +178,7 @@ function truncateFragmentsForBudget({ fragments, fixedText }) {
   return kept;
 }
 
-function walkSkillDirs(skillsDir) {
-  if (!existsSync(skillsDir)) return [];
-  const out = [];
-  for (const entry of readdirSync(skillsDir, { withFileTypes: true })) {
-    if (!entry.isDirectory() || entry.name.startsWith('_archive')) continue;
-    const skillPath = join(skillsDir, entry.name, 'SKILL.md');
-    if (!existsSync(skillPath)) continue;
-    try {
-      const body = readFileSync(skillPath, 'utf-8');
-      out.push(memoryManifestItem('skill', skillPath, body));
-    } catch {}
-  }
-  return out;
-}
-
+// @internal: test-only
 export function encodeCwd(cwd) {
   if (typeof cwd !== 'string' || cwd.length === 0) {
     throw new TypeError('encodeCwd(cwd) requires a non-empty string');
@@ -250,10 +225,12 @@ export async function buildPrompt({ userText, fileContent, threadTs, userId, cha
     workspaceDir,
     mode,
     channelMeta,
+    fileContent,
     threadHistory,
     priorConversation,
     fragments,
     retrievedAt,
+    origin,
   };
   const labeledFragments = [];
 
@@ -270,19 +247,13 @@ export async function buildPrompt({ userText, fileContent, threadTs, userId, cha
     }
   }
 
-  if (workspaceDir) {
-    memoryManifest.push(...walkSkillDirs(join(workspaceDir, '.claude', 'skills')));
-  }
-
   labeledFragments.push(
-    ...channelMetaToFragments(channelMeta, channel, retrievedAt),
-    ...fileContentToFragments(fileContent, retrievedAt),
     ...(Array.isArray(fragments) ? fragments.map((fragment) => normalizedFragment(fragment)) : []),
   );
 
   const metadataText = renderMessageMetadata({ channel, threadTs, userId, time: retrievedAt });
   const currentUserText = renderCurrentUserMessage({
-    source_type: origin?.kind === 'cron' ? 'cron_prompt' : 'user_message',
+    source_type: origin?.kind === 'cron' ? 'cron_prompt' : (origin?.kind === 'launcher_result' ? 'launcher_result' : 'user_message'),
     trusted: true,
     origin,
     content: userText || '(仅附件)',

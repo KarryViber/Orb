@@ -1,15 +1,15 @@
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import net from 'node:net';
 import { randomUUID } from 'node:crypto';
-import { existsSync, readdirSync, readFileSync, renameSync, unlinkSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { info, error as logError, warn } from './log.js';
 import { taskQueue } from './queue.js';
 import { sanitizeErrorText } from './format-utils.js';
 import { listFacts, storeLesson, storeCorrectionLesson } from './memory.js';
 import { spawnWorker } from './spawn.js';
-import { getDefaults, getProfileNotifyDm } from './config.js';
-import { writeLessonCandidate, isUserCorrectionText } from './lesson-candidates.js';
+import { getDefaults } from './config.js';
+import { writeLessonCandidate } from './lesson-candidates.js';
 import { isSuccessfulStopReason, isTruncatedStopReason } from './stop-reason.js';
 import {
   checkSkillReview,
@@ -22,7 +22,6 @@ import {
 } from './scheduler-memory-maintenance.js';
 import {
   normalizeShutdownQueue,
-  INTERRUPTED_RUNS_FILE,
   persistShutdownQueues,
   restoreShutdownQueues,
   sanitizeTaskForPersistence,
@@ -32,23 +31,25 @@ import {
   CONTROL_PLANE_MESSAGE,
   METADATA_TITLE,
   makeTurnId,
+  normalizeChannelSemantics,
 } from './turn-delivery/intents.js';
 import { TurnDeliveryLedger, ledgerPathForDataDir } from './turn-delivery/ledger.js';
 import { TurnDeliveryOrchestrator } from './turn-delivery/orchestrator.js';
-import { makeCcEvent, makeInject, makeTask, validateIncomingIpc } from './ipc-schema.js';
+import { makeCcEvent, makeInject, makeTask, validateExternalSessionResult, validateIncomingIpc } from './ipc-schema.js';
 import {
   ORB_EVENTBUS_SMOKE_LOG,
   ORB_PERMISSION_APPROVAL_MODE,
+  ORB_RUNTIME,
   ORB_PERMISSION_TIMEOUT_MS,
   ORB_WORKER_TIMEOUT_MS,
 } from './runtime-env.js';
+import { runWorkerForTask } from './scheduler/worker-runner.js';
 const TAG = 'scheduler';
 const DRAIN_TIMEOUT = 30_000;
 const MAX_AUTO_CONTINUE = 2;  // max auto-retries on empty result (context overflow)
 const PERMISSION_APPROVAL_TIMEOUT_MS = ORB_PERMISSION_TIMEOUT_MS;
 const STATUS_REFRESH_MS = 20_000;
 const SILENT_PREFIX = '[SILENT]';
-const KEEP_ACKED_INTERRUPTED_RUNS = 20;
 const LOADING_MESSAGES = [
   'Cooking…',
   'Reading files…',
@@ -101,7 +102,7 @@ function ensureAttemptId(task) {
 
 function normalizeOrigin(origin) {
   if (!origin || typeof origin !== 'object') return null;
-  const allowed = new Set(['cron', 'inject', 'user', 'system']);
+  const allowed = new Set(['cron', 'inject', 'launcher_result', 'user', 'system']);
   const kind = allowed.has(origin.kind) ? origin.kind : null;
   if (!kind) return null;
   return {
@@ -137,9 +138,6 @@ function injectOriginForTask(task, parentAttemptId) {
 }
 function isSilentResultText(text) {
   return typeof text === 'string' && text.startsWith(SILENT_PREFIX);
-}
-function normalizeChannelSemantics(value) {
-  return value === 'silent' || value === 'broadcast' ? value : 'reply';
 }
 function shortFailureReason(value, fallback = 'worker failed') {
   const text = sanitizeErrorText(value || fallback)
@@ -179,69 +177,6 @@ function getTaskCardStreamErrorCode(err) {
   return match?.[1] || null;
 }
 
-function timestampForPath(date = new Date()) {
-  return date.toISOString().replace(/[:.]/g, '-');
-}
-
-function originLabel(origin) {
-  if (!origin || typeof origin !== 'object') return 'unknown';
-  if (origin.kind === 'cron') return `cron:${origin.name || 'unknown'}`;
-  if (origin.kind === 'inject') return `inject from ${origin.parentAttemptId || 'unknown'}`;
-  if (origin.kind === 'system') return `system:${origin.name || 'unknown'}`;
-  return origin.kind || 'unknown';
-}
-
-function formatInterruptedRunsText(profileName, runs, detailPath) {
-  const byRole = new Map();
-  for (const run of Array.isArray(runs) ? runs : []) {
-    const role = run?.role || 'unknown';
-    if (!byRole.has(role)) byRole.set(role, []);
-    byRole.get(role).push(run);
-  }
-  const lines = [`⚠️ 上次 daemon 关闭时有 ${runs.length} 个任务在执行中`, ''];
-  for (const [role, roleRuns] of byRole) {
-    lines.push(`${role} (${roleRuns.length}):`);
-    for (const run of roleRuns.slice(0, 8)) {
-      const when = run?.interruptedAt || 'unknown time';
-      const attempt = run?.attemptId ? ` (attemptId=${run.attemptId})` : '';
-      lines.push(`• ${originLabel(run?.origin)} → 触发于 ${when}${attempt}`);
-    }
-    if (roleRuns.length > 8) lines.push(`• ... 另 ${roleRuns.length - 8} 个`);
-    lines.push('');
-  }
-  lines.push('这些任务未自动重放。如需重做，请手动触发。');
-  lines.push(`详情：profiles/${profileName}/data/${detailPath}`);
-  return lines.join('\n').slice(0, 800);
-}
-
-export function makeTaskCardState({ enabled = false, deferred = false } = {}) {
-  return {
-    enabled: Boolean(enabled),
-    deferred: Boolean(deferred),
-    streamId: null,
-    streamMessageTs: null,
-    failed: false,
-  };
-}
-
-export function makeTaskCardStates(config = {}) {
-  return {
-    qi: makeTaskCardState(config),
-    plan: makeTaskCardState(config),
-  };
-}
-
-function makeTurnState(taskCardConfig) {
-  return {
-    typingActive: false,
-    pendingThreadStatus: '',
-    pendingStatusLoadingMessages: null,
-    statusRefreshTimer: null,
-    abandoned: false,
-    taskCardStates: makeTaskCardStates(taskCardConfig),
-  };
-}
-
 async function emitEphemeralControlPlane({ adapter, channel, threadTs, platform, text, source = 'scheduler.control_plane' }) {
   const orchestrator = new TurnDeliveryOrchestrator({ adapter, logger: (line) => warn(TAG, line) });
   const turnId = makeTurnId({ threadTs, attemptId: `control-${Date.now()}` });
@@ -255,76 +190,6 @@ async function emitEphemeralControlPlane({ adapter, channel, threadTs, platform,
     text,
     source,
   });
-}
-
-export async function abandonTurnState({
-  turn,
-  adapter,
-  channel,
-  threadTs,
-  canManageThreadStatus = channel != null && threadTs != null && typeof adapter?.setThreadStatus === 'function',
-}) {
-  if (!turn || turn.abandoned) return false;
-  const shouldClearThreadStatus = Boolean(turn.typingActive && canManageThreadStatus);
-  turn.abandoned = true;
-  if (turn.statusRefreshTimer) {
-    clearTimeout(turn.statusRefreshTimer);
-    turn.statusRefreshTimer = null;
-  }
-  if (shouldClearThreadStatus) {
-    try {
-      await adapter.setThreadStatus(channel, threadTs, '', null);
-      turn.typingActive = false;
-      turn.pendingThreadStatus = '';
-      turn.pendingStatusLoadingMessages = null;
-    } catch (err) {
-      warn(TAG, `failed to clear abandoned thread status: ${err.message}`);
-    }
-  }
-  return true;
-}
-
-export function buildRespawnTaskForInjectFailed({
-  msg,
-  failedTask,
-  task,
-  threadTs,
-  effectiveThreadTs,
-  channel,
-  userId,
-  platform,
-  profile,
-  deferDeliveryUntilResult,
-  channelSemantics,
-}) {
-  return {
-    ...(failedTask || {}),
-    userText: msg.userText ?? failedTask?.userText ?? '',
-    fileContent: msg.fileContent ?? failedTask?.fileContent ?? '',
-    imagePaths: Array.isArray(msg.imagePaths)
-      ? msg.imagePaths
-      : (failedTask?.imagePaths || []),
-    fragments: Array.isArray(msg.fragments)
-      ? msg.fragments
-      : (Array.isArray(failedTask?.fragments) ? failedTask.fragments : []),
-    threadTs,
-    deliveryThreadTs: failedTask?.deliveryThreadTs === undefined
-      ? effectiveThreadTs
-      : failedTask.deliveryThreadTs,
-    channel,
-    userId,
-    platform,
-    teamId: failedTask?.teamId ?? task.teamId ?? null,
-    threadHistory: failedTask?.threadHistory ?? task.threadHistory,
-    profile: failedTask?.profile ?? profile,
-    maxTurns: failedTask?.maxTurns ?? task.maxTurns ?? null,
-    enableTaskCard: failedTask?.enableTaskCard ?? task.enableTaskCard,
-    deferDeliveryUntilResult: failedTask?.deferDeliveryUntilResult ?? deferDeliveryUntilResult,
-    channelSemantics: normalizeChannelSemantics(failedTask?.channelSemantics ?? task.channelSemantics ?? channelSemantics),
-    attemptId: failedTask?.attemptId ?? msg.attemptId ?? task.attemptId ?? makeAttemptId(),
-    origin: normalizeOrigin(failedTask?.origin)
-      || injectOriginForTask(task, task?.attemptId ?? msg.attemptId ?? null),
-  };
 }
 
 export class EventBus {
@@ -416,7 +281,7 @@ export class EventBus {
 }
 
 export class Scheduler {
-  constructor({ maxWorkers, timeoutMs, getProfile, startPermissionServer = true, spawnWorkerFn = spawnWorker }) {
+  constructor({ maxWorkers, timeoutMs, getProfile, startPermissionServer = true, startExternalSessionListener = null, externalSessionSocketPath = null, spawnWorkerFn = spawnWorker }) {
     this.maxWorkers = maxWorkers || 3;
     this.timeoutMs = timeoutMs || ORB_WORKER_TIMEOUT_MS;
     this.getProfile = getProfile;
@@ -449,7 +314,11 @@ export class Scheduler {
     this._pendingPermissionRequests = new Map();
     this._permissionApprovalMode = ORB_PERMISSION_APPROVAL_MODE;
     this._permissionSocketPath = join(tmpdir(), `orb-permission-scheduler-${process.pid}.sock`);
+    process.env.ORB_SCHEDULER_SOCKET = this._permissionSocketPath;
     this._permissionServer = null;
+    this._externalSessionSocketPath = externalSessionSocketPath || join(ORB_RUNTIME, 'external-session.sock');
+    process.env.ORB_EXTERNAL_SESSION_SOCKET = this._externalSessionSocketPath;
+    this._externalSessionServer = null;
     if (ORB_EVENTBUS_SMOKE_LOG) {
       this.eventBus.subscribe({
         match: (msg) => msg?.type === 'cc_event',
@@ -458,10 +327,8 @@ export class Scheduler {
     }
     globalThis.__orbSchedulerInstance = this;
     if (startPermissionServer !== false) this._startPermissionServer();
+    if ((startExternalSessionListener ?? startPermissionServer) !== false) this._startExternalSessionListener();
     this._restoreShutdownQueues();
-    void this._notifyInterruptedRuns().catch((err) => {
-      warn(TAG, `startup interrupted-run notification failed: ${err.message}`);
-    });
   }
 
   addAdapter(name, adapter) {
@@ -566,6 +433,21 @@ export class Scheduler {
   }
 
   async _handlePermissionRequest(msg, socket) {
+    if (msg?.type === 'permission_response') {
+      const key = this._permissionResponseKey(msg);
+      if (!key) {
+        this._writePermissionSocketResponse(socket, { allow: false, reason: `unknown permission response requestId: ${msg?.requestId || 'missing'}` });
+        return;
+      }
+      this._resolvePermissionRequest(key, {
+        allow: Boolean(msg.allow),
+        reason: msg.reason,
+        answers: msg.answers && typeof msg.answers === 'object' ? msg.answers : undefined,
+      });
+      this._writePermissionSocketResponse(socket, { allow: true, reason: 'permission response accepted' });
+      return;
+    }
+
     if (msg?.type !== 'permission_request') {
       this._writePermissionSocketResponse(socket, { allow: false, reason: `unsupported socket message type: ${msg?.type || 'unknown'}` });
       return;
@@ -588,12 +470,19 @@ export class Scheduler {
     const activeEntry = this.activeWorkers.get(threadTs);
     const platform = activeEntry?.platform || 'slack';
     const adapter = this._getAdapter(platform);
+    let profile = activeEntry?.task?.profile || null;
+    if (!profile && typeof this.getProfile === 'function') {
+      try {
+        profile = this.getProfile(msg.userId) || null;
+      } catch {}
+    }
     this._pendingPermissionRequests.set(key, {
       socket,
       requestId,
       threadTs,
       channel,
       toolName,
+      profileDataDir: profile?.dataDir || null,
       createdAt: Date.now(),
       settled: false,
     });
@@ -603,12 +492,29 @@ export class Scheduler {
       if (pending && !pending.settled) {
         this._pendingPermissionRequests.delete(key);
         warn(TAG, `permission socket closed before response: ${key}`);
+        if (pending.isAskUserQuestion) {
+          this._deleteAskUserQuestionPending(pending);
+        }
+        if (pending.isAskUserQuestion && typeof pending.adapter?.cancelAskUserQuestionCard === 'function') {
+          pending.adapter.cancelAskUserQuestionCard({
+            channel: pending.channel,
+            messageTs: pending.messageTs,
+            reason: 'worker exited',
+          }).catch((err) => {
+            warn(TAG, `failed to cancel AskUserQuestion card: ${err.message}`);
+          });
+        }
       }
     });
 
     if (this._permissionApprovalMode === 'auto-allow') {
       info(TAG, `permission auto-allow: thread=${threadTs} tool=${toolName} request=${requestId}`);
       this._resolvePermissionRequest(key, { allow: true, reason: 'auto-allow stub' });
+      return;
+    }
+
+    if (toolName === 'AskUserQuestion') {
+      await this._dispatchAskUserQuestion(msg, key, adapter);
       return;
     }
 
@@ -669,8 +575,58 @@ export class Scheduler {
     });
   }
 
+  async _dispatchAskUserQuestion(msg, key, adapter) {
+    const pending = this._pendingPermissionRequests.get(key);
+    if (!pending) return;
+    if (typeof adapter?.sendAskUserQuestion !== 'function') {
+      this._resolvePermissionRequest(key, { allow: false, reason: 'AskUserQuestion adapter unavailable' });
+      return;
+    }
+    const questions = Array.isArray(msg.toolInput?.questions) ? msg.toolInput.questions : [];
+    if (questions.length < 1 || questions.length > 4) {
+      this._resolvePermissionRequest(key, { allow: false, reason: `AskUserQuestion expected 1-4 questions, got ${questions.length}` });
+      return;
+    }
+    pending.isAskUserQuestion = true;
+    pending.adapter = adapter;
+    pending.questions = questions;
+    info(TAG, `AskUserQuestion requested: thread=${pending.threadTs} request=${pending.requestId} questions=${questions.length}`);
+    const sent = await adapter.sendAskUserQuestion({
+      channel: pending.channel,
+      threadTs: pending.threadTs,
+      requestId: pending.requestId,
+      questions,
+      socketPath: this._permissionSocketPath,
+    });
+    pending.messageTs = sent?.ts || null;
+  }
+
+  _deleteAskUserQuestionPending(pending) {
+    if (!pending?.profileDataDir || !pending.requestId) return;
+    const pendingPath = join(pending.profileDataDir, 'auq-pending', `${pending.requestId}.json`);
+    try {
+      if (existsSync(pendingPath)) unlinkSync(pendingPath);
+    } catch (err) {
+      warn(TAG, `failed to delete AskUserQuestion pending file: ${err.message}`);
+    }
+  }
+
   _permissionRequestKey(threadTs, requestId) {
     return `${threadTs}:${requestId}`;
+  }
+
+  _permissionResponseKey(msg) {
+    const requestId = String(msg?.requestId || '');
+    if (!requestId) return null;
+    const threadTs = String(msg?.threadTs || '');
+    if (threadTs) {
+      const key = this._permissionRequestKey(threadTs, requestId);
+      if (this._pendingPermissionRequests.has(key)) return key;
+    }
+    for (const [key, pending] of this._pendingPermissionRequests.entries()) {
+      if (pending.requestId === requestId) return key;
+    }
+    return null;
   }
 
   _permissionResolutionAction(payload) {
@@ -700,85 +656,121 @@ export class Scheduler {
     }
   }
 
+  _startExternalSessionListener() {
+    try {
+      mkdirSync(dirname(this._externalSessionSocketPath), { recursive: true, mode: 0o700 });
+      if (existsSync(this._externalSessionSocketPath)) unlinkSync(this._externalSessionSocketPath);
+    } catch (err) {
+      warn(TAG, `failed to prepare external session socket: ${err.message}`);
+    }
+
+    this._externalSessionServer = net.createServer((socket) => this._handleExternalSessionSocket(socket));
+    this._externalSessionServer.on('error', (err) => {
+      logError(TAG, `external session socket server error: ${err.message}`);
+    });
+    this._externalSessionServer.listen(this._externalSessionSocketPath, () => {
+      try {
+        chmodSync(this._externalSessionSocketPath, 0o600);
+      } catch (err) {
+        warn(TAG, `failed to chmod external session socket: ${err.message}`);
+      }
+      info(TAG, `external session socket listening: ${this._externalSessionSocketPath}`);
+    });
+  }
+
+  _handleExternalSessionSocket(socket) {
+    socket.setEncoding('utf8');
+    let buffer = '';
+    socket.on('data', (chunk) => {
+      buffer += chunk;
+      let newlineIndex = buffer.indexOf('\n');
+      while (newlineIndex !== -1) {
+        const line = buffer.slice(0, newlineIndex).trim();
+        buffer = buffer.slice(newlineIndex + 1);
+        newlineIndex = buffer.indexOf('\n');
+        if (!line) continue;
+        let msg;
+        try {
+          msg = JSON.parse(line);
+        } catch (err) {
+          warn(TAG, `invalid external session payload: ${err.message}`);
+          continue;
+        }
+        this._handleExternalSessionResult(msg).catch((err) => {
+          logError(TAG, `external session result failed: ${err.message}`);
+        });
+      }
+    });
+    socket.on('error', (err) => {
+      warn(TAG, `external session socket client error: ${err.message}`);
+    });
+  }
+
+  async _handleExternalSessionResult(msg) {
+    const validationError = validateExternalSessionResult(msg);
+    if (validationError) {
+      warn(TAG, `dropped invalid external session result: ${validationError}`);
+      return;
+    }
+    const channel = msg.channel;
+    const threadTs = msg.thread_ts;
+    const label = msg.label;
+    const adapter = this._getAdapter('slack');
+    if (adapter) {
+      await adapter.deliver({
+        intent: 'launcher_result_card',
+        channel,
+        threadTs,
+        platform: 'slack',
+        text: msg.text,
+        source: 'scheduler.external_session_result',
+        meta: { externalSessionResult: msg },
+      }, { channel: 'postMessage' });
+    }
+    const entry = this.activeWorkers.get(threadTs);
+    if (!entry?.worker) return;
+    const injectId = `inject-${this._nextInjectId++}`;
+    const attemptId = makeAttemptId();
+    const origin = {
+      kind: 'launcher_result',
+      name: label,
+      parentAttemptId: entry?.task?.attemptId || null,
+    };
+    const injectTask = {
+      userText: `外部 session \`${label}\` rc=${msg.rc} took=${msg.took_seconds ?? '?'}s，详情见上方卡片。`,
+      fileContent: '',
+      imagePaths: [],
+      fragments: [],
+      threadTs,
+      deliveryThreadTs: entry.deliveryThreadTs ?? threadTs,
+      channel,
+      userId: entry.userId || null,
+      platform: entry.platform || 'slack',
+      attemptId,
+      origin,
+      channelSemantics: normalizeChannelSemantics(entry.channelSemantics ?? entry.task?.channelSemantics),
+    };
+    if (!entry.pendingInjects) entry.pendingInjects = new Map();
+    entry.pendingInjects.set(injectId, injectTask);
+    try {
+      entry.worker.send(makeInject({
+        injectId,
+        attemptId,
+        userText: injectTask.userText,
+        fileContent: '',
+        imagePaths: [],
+        fragments: [],
+        origin,
+      }));
+      info(TAG, `launcher result injected into active worker: thread=${threadTs} label=${label}`);
+    } catch (err) {
+      entry.pendingInjects.delete(injectId);
+      warn(TAG, `launcher result inject failed: thread=${threadTs} label=${label} err=${err.message}`);
+    }
+  }
+
   _restoreShutdownQueues() {
     return restoreShutdownQueues({ threadQueues: this.threadQueues });
-  }
-
-  async _notifyInterruptedRuns({ profilesDir = join(import.meta.dirname, '..', 'profiles') } = {}) {
-    if (!existsSync(profilesDir)) return;
-
-    let profiles = [];
-    try {
-      profiles = readdirSync(profilesDir, { withFileTypes: true }).filter((entry) => entry.isDirectory());
-    } catch (err) {
-      warn(TAG, `startup interrupted-run scan failed: ${err.message}`);
-      return;
-    }
-
-    this._cleanupAckedInterruptedRuns(profiles, profilesDir);
-
-    const pending = [];
-    for (const entry of profiles) {
-      const profileName = entry.name;
-      const dataDir = join(profilesDir, profileName, 'data');
-      const interruptedPath = join(dataDir, INTERRUPTED_RUNS_FILE);
-      if (existsSync(interruptedPath)) pending.push({ profileName, dataDir, interruptedPath });
-    }
-    if (pending.length === 0) return;
-
-    const token = process.env.SLACK_BOT_TOKEN;
-    if (!token || typeof fetch !== 'function') {
-      warn(TAG, `startup interrupted-run notification skipped: SLACK_BOT_TOKEN unavailable`);
-      return;
-    }
-
-    for (const { profileName, dataDir, interruptedPath } of pending) {
-      const channel = getProfileNotifyDm(profileName);
-      if (!channel) {
-        warn(TAG, `startup interrupted-run notification skipped for profile=${profileName}: notifyChannels.dm not configured`);
-        continue;
-      }
-
-      try {
-        const runs = JSON.parse(readFileSync(interruptedPath, 'utf8'));
-        if (!Array.isArray(runs) || runs.length === 0) continue;
-        const text = formatInterruptedRunsText(profileName, runs, INTERRUPTED_RUNS_FILE);
-        const resp = await fetch('https://slack.com/api/chat.postMessage', {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${token}`,
-            'Content-Type': 'application/json; charset=utf-8',
-          },
-          body: JSON.stringify({ channel, text }),
-        });
-        if (!resp?.ok) throw new Error(`Slack HTTP ${resp?.status || 'unknown'}`);
-        const body = await resp.json().catch(() => ({}));
-        if (body?.ok === false) throw new Error(`Slack API ${body.error || 'unknown_error'}`);
-        const ackPath = join(dataDir, `interrupted-runs.acked.${timestampForPath()}.json`);
-        renameSync(interruptedPath, ackPath);
-        info(TAG, `startup interrupted-run notification sent for profile=${profileName}; archived ${ackPath}`);
-      } catch (err) {
-        warn(TAG, `startup interrupted-run notification failed for profile=${profileName}: ${err.message}`);
-      }
-    }
-  }
-
-  _cleanupAckedInterruptedRuns(profiles, profilesDir) {
-    for (const profileEntry of profiles) {
-      const dataDir = join(profilesDir, profileEntry.name, 'data');
-      if (!existsSync(dataDir)) continue;
-      try {
-        const ackedFiles = readdirSync(dataDir)
-          .filter((name) => /^interrupted-runs\.acked\.[\dT:.\-Z]+\.json$/.test(name))
-          .map((name) => ({ name, path: join(dataDir, name) }))
-          .sort((a, b) => b.name.localeCompare(a.name));
-        for (const old of ackedFiles.slice(KEEP_ACKED_INTERRUPTED_RUNS)) {
-          try {
-            unlinkSync(old.path);
-          } catch {}
-        }
-      } catch {}
-    }
   }
 
   _normalizeShutdownQueue(raw, queuePath) {
@@ -818,7 +810,7 @@ export class Scheduler {
       const injectTask = {
         ...task,
         attemptId: task.attemptId,
-        origin: injectOriginForTask(task, entry?.task?.attemptId || task.attemptId),
+        origin: normalizeOrigin(task.origin) || injectOriginForTask(task, entry?.task?.attemptId || task.attemptId),
         deliveryThreadTs: task.deliveryThreadTs === undefined
           ? (entry?.deliveryThreadTs ?? threadTs ?? null)
           : task.deliveryThreadTs,
@@ -987,854 +979,7 @@ export class Scheduler {
   }
 
   async _spawnWorker(task) {
-    const { userText, fileContent, imagePaths, threadTs, channel, userId, platform } = task;
-    const deferDeliveryUntilResult = task.deferDeliveryUntilResult === true;
-    const channelSemantics = normalizeChannelSemantics(task.channelSemantics);
-    task.channelSemantics = channelSemantics;
-    task.origin = normalizeOrigin(task.origin) || inferTaskOrigin(task);
-    const adapter = this._getAdapter(platform);
-    if (!adapter && platform !== 'system') {
-      logError(TAG, `spawn failed: no adapter for platform=${platform} thread=${threadTs}`);
-      task._completion?.reject?.(new Error(`no adapter for platform=${platform}`));
-      return;
-    }
-
-    // Resolve profile for this user
-    let profile;
-    try {
-      profile = task.profile || this.getProfile(userId);
-    } catch (err) {
-      logError(TAG, `profile resolution failed for user=${userId}: ${err.message}`);
-      await emitEphemeralControlPlane({
-        adapter,
-        channel,
-        threadTs,
-        platform,
-        text: ':warning: 未识别的用户，无法处理请求。',
-        source: 'scheduler.profile_error',
-      }).catch(() => {});
-      task._completion?.reject?.(err);
-      return;
-    }
-    info(TAG, `profile resolved: user=${userId} → ${profile.name} (${profile.workspaceDir})`);
-    const ledger = this._getTurnDeliveryLedger(profile);
-    const orchestrator = new TurnDeliveryOrchestrator({
-      adapter,
-      ledger,
-      logger: (line) => warn(TAG, line),
-    });
-
-    // 优先级最高：task 已显式指定（cron / executeTask 程序化调用）
-    let effectiveModel = task.model || null;
-    let effectiveEffort = task.effort || null;
-    let effectiveText = userText || '';
-
-    // 消息前缀解析模型 / effort（可选覆盖）
-    if (!effectiveModel) {
-      const modelMatch = effectiveText.match(/^\[(haiku|sonnet|opus)\]\s+/i);
-      if (modelMatch) {
-        effectiveModel = modelMatch[1].toLowerCase();
-        effectiveText = effectiveText.slice(modelMatch[0].length);
-      }
-    }
-    if (!effectiveEffort) {
-      const effortMatch = effectiveText.match(/^\[effort:(low|medium|high|xhigh|max)\]\s+/i);
-      if (effortMatch) {
-        effectiveEffort = effortMatch[1].toLowerCase();
-        effectiveText = effectiveText.slice(effortMatch[0].length);
-      }
-    }
-
-    // 关键词自动升 xhigh（若未手动指定 effort）
-    if (!effectiveEffort && shouldEscalateEffort(effectiveText)) {
-      effectiveEffort = 'xhigh';
-      info(TAG, `effort escalated to xhigh by keyword match`);
-    }
-
-    // Fallback: task fields > 前缀 > 关键词 > config.defaults > 内置兜底（getDefaults 已保证 effort 非空）
-    const defaults = getDefaults();
-    if (!effectiveModel) effectiveModel = defaults.model;
-    if (!effectiveEffort) effectiveEffort = defaults.effort;
-
-    let responded = false;
-    let userVisibleDeliveryObserved = false;
-    let suppressedSuccessObserved = false;
-    let pendingAutoContinue = null;
-    let effectiveThreadTs = task.deliveryThreadTs === undefined ? (threadTs || null) : task.deliveryThreadTs;
-    let turnCount = 0;
-    let metadataUpdatedForTurn = false;
-    let finalResultText = '';
-    let finalStopReason = null;
-    let finalErrorSummary = null;
-    let workerFailure = null;
-    let completionSettled = false;
-    let currentCcTurnId = null;
-    const toolHistory = [];
-    const toolResults = [];
-    let worker;
-    const canManageThreadStatus = !deferDeliveryUntilResult
-      && channel != null
-      && typeof adapter?.setThreadStatus === 'function';
-    const taskCardConfig = {
-      enabled: !deferDeliveryUntilResult
-        && platform === 'slack' && channel != null && effectiveThreadTs != null
-        && task.enableTaskCard !== false
-        && typeof adapter?.startStream === 'function'
-        && typeof adapter?.appendStream === 'function'
-        && typeof adapter?.stopStream === 'function',
-      deferred: deferDeliveryUntilResult
-        && platform === 'slack' && channel != null && effectiveThreadTs != null
-        && task.enableTaskCard !== false
-        && typeof adapter?.startStream === 'function'
-        && typeof adapter?.stopStream === 'function',
-    };
-    let turn = makeTurnState(taskCardConfig);
-
-    const settleCompletion = (method, payload) => {
-      if (completionSettled) return;
-      completionSettled = true;
-      task._completion?.[method]?.(payload);
-    };
-
-    const suppressSuccessfulText = (phase, text, stopReason, messageChannelSemantics = channelSemantics) => {
-      const effectiveChannelSemantics = normalizeChannelSemantics(messageChannelSemantics);
-      if (!shouldSuppressForChannelSemantics(effectiveChannelSemantics, stopReason)) return false;
-      const textLength = String(text || '').length;
-      info(TAG, `silent ${phase} suppressed: thread=${threadTs} textLen=${textLength}`);
-      suppressedSuccessObserved = true;
-      return true;
-    };
-
-    const clearStatusRefresh = (targetTurn = turn) => {
-      if (targetTurn?.statusRefreshTimer) {
-        clearTimeout(targetTurn.statusRefreshTimer);
-        targetTurn.statusRefreshTimer = null;
-      }
-    };
-    const armStatusRefresh = () => {
-      clearStatusRefresh();
-      if (!canManageThreadStatus || !effectiveThreadTs) return;
-      if (!turn.pendingThreadStatus) return;
-      const capturedTurn = turn;
-      turn.statusRefreshTimer = setTimeout(async () => {
-        capturedTurn.statusRefreshTimer = null;
-        if (turn !== capturedTurn || capturedTurn.abandoned) return;
-        if (!capturedTurn.pendingThreadStatus || !canManageThreadStatus || !effectiveThreadTs) return;
-        try {
-          await adapter.setThreadStatus(channel, effectiveThreadTs, capturedTurn.pendingThreadStatus, capturedTurn.pendingStatusLoadingMessages || undefined);
-          if (turn !== capturedTurn || capturedTurn.abandoned || !capturedTurn.pendingThreadStatus) {
-            await adapter.setThreadStatus(channel, effectiveThreadTs, '', null).catch(() => {});
-            return;
-          }
-          armStatusRefresh();
-        } catch (err) {
-          warn(TAG, `status refresh failed: ${err.message}`);
-        }
-      }, STATUS_REFRESH_MS);
-    };
-
-    const applyThreadStatus = async (status, loadingMessages) => {
-      turn.pendingThreadStatus = String(status || '');
-      turn.pendingStatusLoadingMessages = Array.isArray(loadingMessages) ? loadingMessages : null;
-      if (!canManageThreadStatus || !effectiveThreadTs) return;
-      try {
-        await adapter.setThreadStatus(channel, effectiveThreadTs, turn.pendingThreadStatus, loadingMessages);
-        if (turn.pendingThreadStatus) armStatusRefresh();
-        else clearStatusRefresh();
-      } catch (err) {
-        warn(TAG, `failed to set thread status: ${err.message}`);
-        clearStatusRefresh();
-      }
-    };
-
-    const startThreadStatusRefresh = async (status = THINKING_STATUS) => {
-      if (!canManageThreadStatus) return;
-      await applyThreadStatus(status, LOADING_MESSAGES);
-    };
-
-    const startTyping = async () => {
-      if (deferDeliveryUntilResult) return;
-      await startThreadStatusRefresh();
-      turn.typingActive = true;
-    };
-
-    const stopTyping = async () => {
-      if (deferDeliveryUntilResult) return;
-      if (!turn.typingActive) return;
-      turn.typingActive = false;
-      await applyThreadStatus('');
-    };
-
-    const abandonTurn = async (prevTurn) => {
-      if (!prevTurn || prevTurn.abandoned) return;
-      clearStatusRefresh(prevTurn);
-      for (const key of [...this._pendingPermissionRequests.keys()]) {
-        if (key.startsWith(`${threadTs}:`)) {
-          this._resolvePermissionRequest(key, { allow: false, reason: 'turn abandoned' });
-        }
-      }
-      await abandonTurnState({
-        turn: prevTurn,
-        adapter,
-        channel,
-        threadTs: effectiveThreadTs,
-        canManageThreadStatus: canManageThreadStatus && effectiveThreadTs != null,
-      });
-    };
-
-    const resetTaskCardState = () => {
-      for (const taskCardState of Object.values(turn.taskCardStates || {})) {
-        taskCardState.streamId = null;
-        taskCardState.failed = false;
-      }
-    };
-
-    const finalizeStreamsOnAbnormalExit = async () => {
-      try {
-        if (channel != null && effectiveThreadTs != null && !userVisibleDeliveryObserved) {
-          await orchestrator.emit({
-            turnId: currentCcTurnId || makeTurnId({ threadTs, attemptId: task.attemptId }),
-            attemptId: task.attemptId || '',
-            channel,
-            threadTs: effectiveThreadTs,
-            platform,
-            channelSemantics,
-            intent: CONTROL_PLANE_MESSAGE,
-            text: '⚠️ 本轮任务异常终止（worker timeout 或 crash），可发「继续」让我从失败点续做。',
-            source: 'scheduler.abnormal_exit',
-          });
-          userVisibleDeliveryObserved = true;
-        }
-      } catch (err) {
-        warn(TAG, `failed to send worker abnormal-exit notice: ${err.message}`);
-      } finally {
-        resetTaskCardState();
-      }
-    };
-
-    const updateThreadMetadata = async (text) => {
-      if (metadataUpdatedForTurn) return;
-      if (platform !== 'slack' || !channel || !effectiveThreadTs || !text) return;
-      metadataUpdatedForTurn = true;
-      if (turnCount === 0) {
-        await orchestrator.emit({
-          turnId: currentCcTurnId || makeTurnId({ threadTs, attemptId: task.attemptId }),
-          attemptId: task.attemptId || '',
-          channel,
-          threadTs: effectiveThreadTs,
-          platform,
-          channelSemantics,
-          intent: METADATA_TITLE,
-          text,
-          source: 'scheduler.metadata',
-        }).catch((err) => warn(TAG, `metadata delivery failed: ${err.message}`));
-      }
-      turnCount += 1;
-    };
-
-    const emitAssistantFinal = async ({ text, msg = null, source, meta = {}, channelSemanticsOverride = null }) => {
-      if (!String(text || '').trim()) return { delivered: false, reason: 'empty-final' };
-      const result = await orchestrator.emit({
-        turnId: makeTurnId({ turnId: msg?.turnId || currentCcTurnId, threadTs, attemptId: msg?.attemptId || task.attemptId }),
-        attemptId: msg?.attemptId || task.attemptId || '',
-        channel,
-        threadTs: effectiveThreadTs,
-        platform,
-        channelSemantics: normalizeChannelSemantics(channelSemanticsOverride ?? msg?.channelSemantics ?? channelSemantics),
-        intent: ASSISTANT_TEXT_FINAL,
-        text,
-        source,
-        meta,
-      });
-      if (result.delivered) userVisibleDeliveryObserved = true;
-      return result;
-    };
-
-    const handleExitResult = async (msg) => {
-      const text = '';
-      finalResultText = '';
-      finalStopReason = msg.stopReason || finalStopReason;
-      finalErrorSummary = msg.stderrSummary || finalErrorSummary;
-
-      try {
-        if (!isSuccessfulStopReason(msg.stopReason)) {
-          this._autoContinueCount.delete(threadTs);
-          const isMaxTurnsLike = isTruncatedStopReason(msg.stopReason);
-          if (isMaxTurnsLike) {
-            warn(TAG, `worker turn limit result: thread=${threadTs} stopReason=${msg.stopReason} exitCode=${msg.exitCode ?? 'unknown'}`);
-            if (!userVisibleDeliveryObserved) {
-              const turns = task.maxTurns || 'configured';
-              const notice = msg.stopReason === 'tool_use'
-                ? `⏳ LLM 在工具调用中触达 turn 上限（${turns} turn）。任务未完成，可发「继续」让我从此处续做。`
-                : '⏳ 触达 turn 上限。任务未完成，可发「继续」让我从此处续做。';
-              const result = await orchestrator.emit({
-                turnId: currentCcTurnId || makeTurnId({ threadTs, attemptId: task.attemptId }),
-                attemptId: task.attemptId || '',
-                channel,
-                threadTs: effectiveThreadTs,
-                platform,
-                channelSemantics: 'reply',
-                intent: CONTROL_PLANE_MESSAGE,
-                text: notice,
-                source: 'scheduler.turn_limit',
-                meta: {
-                  stopReason: msg.stopReason,
-                  exitCode: msg.exitCode ?? null,
-                },
-              });
-              if (result.delivered) userVisibleDeliveryObserved = true;
-            }
-            return;
-          }
-          const receiptText = buildFailureReceiptText({
-            task,
-            threadTs,
-            stopReason: msg.stopReason,
-            stderrSummary: msg.stderrSummary,
-            exitCode: msg.exitCode,
-          });
-          warn(TAG, `worker non-success result: thread=${threadTs} stopReason=${msg.stopReason || 'unknown'} exitCode=${msg.exitCode ?? 'unknown'}`);
-          if (!userVisibleDeliveryObserved) {
-            const result = await orchestrator.emit({
-              turnId: currentCcTurnId || makeTurnId({ threadTs, attemptId: task.attemptId }),
-              attemptId: task.attemptId || '',
-              channel,
-              threadTs: effectiveThreadTs,
-              platform,
-              channelSemantics: 'reply',
-              intent: CONTROL_PLANE_MESSAGE,
-              text: receiptText,
-              source: 'scheduler.result_failure',
-              meta: {
-                stopReason: msg.stopReason || null,
-                exitCode: msg.exitCode ?? null,
-              },
-            });
-            if (result.delivered) userVisibleDeliveryObserved = true;
-          }
-          return;
-        }
-
-        // Exit signal: empty text after turn_complete delivery is expected and
-        // should not enter auto-continue or fallback delivery.
-        if (userVisibleDeliveryObserved || suppressedSuccessObserved) {
-          this._autoContinueCount.delete(threadTs);
-          return;
-        }
-
-        const isMaxTurnsReached = msg.stopReason === 'max_turns_reached';
-        const isToolOnlyCompletion = !isMaxTurnsReached && (msg.toolCount || 0) > 0;
-
-        // tool-only turn（如 GitHub 调研卡片流）：最后一个 turn 只有 tool_use、
-        // 外投通过 Bash → Slack API 完成，没有 assistant text。这是预期的正常结束，
-        // 不应触发 auto-continue 也不应发提示。
-        if (isToolOnlyCompletion) {
-          info(TAG, `tool-only turn completed without text, skipping auto-continue: thread=${threadTs} toolCount=${msg.toolCount} lastTool=${msg.lastTool || 'none'}`);
-          this._autoContinueCount.delete(threadTs);
-          return;
-        }
-
-        const retries = this._autoContinueCount.get(threadTs) || 0;
-        if (retries < MAX_AUTO_CONTINUE) {
-          this._autoContinueCount.set(threadTs, retries + 1);
-          const reasonTag = isMaxTurnsReached ? 'max_turns_reached' : 'empty';
-          warn(TAG, `${reasonTag} result, auto-continue ${retries + 1}/${MAX_AUTO_CONTINUE} for thread=${threadTs}`);
-          const suppressAutoContinueNotice = platform === 'slack'
-            && typeof channel === 'string'
-            && channel.startsWith('D');
-          if (!deferDeliveryUntilResult && !suppressAutoContinueNotice) {
-            const notice = isMaxTurnsReached
-              ? `⏳ 到达回合上限，自动续接中 (${retries + 1}/${MAX_AUTO_CONTINUE})…`
-              : `⏳ 本轮无输出，自动续接中 (${retries + 1}/${MAX_AUTO_CONTINUE})…`;
-            await orchestrator.emit({
-              turnId: currentCcTurnId || makeTurnId({ threadTs, attemptId: task.attemptId }),
-              attemptId: task.attemptId || '',
-              channel,
-              threadTs: effectiveThreadTs,
-              platform,
-              channelSemantics,
-              intent: CONTROL_PLANE_MESSAGE,
-              text: notice,
-              source: 'scheduler.auto_continue',
-            }).catch(() => {});
-          } else if (suppressAutoContinueNotice) {
-            info(TAG, `${reasonTag} result auto-continue notice suppressed in Slack DM: thread=${threadTs}`);
-          }
-          // Defer submit to onExit — avoid race with worker's process.exit(0)
-          pendingAutoContinue = {
-            userText: '继续',
-            fileContent: '',
-            imagePaths: [],
-            threadTs,
-            deliveryThreadTs: effectiveThreadTs,
-            channel,
-            userId,
-            platform,
-            teamId: task.teamId || null,
-            attemptId: task.attemptId,
-            threadHistory: task.threadHistory,
-            fragments: task.fragments || [],
-            profile,
-            maxTurns: task.maxTurns || null,
-            enableTaskCard: task.enableTaskCard,
-            deferDeliveryUntilResult,
-            channelSemantics,
-            origin: task.origin,
-            _autoContinue: true,
-            _completion: task._completion,
-          };
-          return;
-        }
-        warn(TAG, `empty result after ${MAX_AUTO_CONTINUE} auto-continues for thread=${threadTs}`);
-        this._autoContinueCount.delete(threadTs);
-
-        // Fallback delivery remains here only for exit-only completions that
-        // never reached turn_complete. result.text is intentionally ignored.
-        if (!userVisibleDeliveryObserved) {
-          const finalText = '⚠️ 多次续接仍未生成回复，任务可能需要拆分。请用更小的指令重试。';
-          await emitAssistantFinal({
-            text: finalText,
-            msg,
-            source: 'scheduler.result',
-            meta: { stopReason: msg.stopReason || null },
-          });
-          userVisibleDeliveryObserved = true;
-        }
-
-        resetTaskCardState();
-        await updateThreadMetadata(text);
-
-        if (text) {
-          const errorPatterns = /(?:error|failed|permission denied|ENOENT|not found|timed?\s*out|EACCES)/i;
-          if (errorPatterns.test(text) && text.length > 50) {
-            storeLesson({
-              userText: task.userText || '',
-              errorText: '',
-              responseText: text.slice(0, 2000),
-              threadTs,
-              userId,
-              dbPath: join(profile.dataDir, 'memory.db'),
-            }).catch(() => {});
-          }
-        }
-        const correctionPatterns = /不对|不是这样|重来|重新|按我说的|你搞错了|我要的是|不是我想要|改一下|错了|再试|not what I|wrong|redo|try again/i;
-        if (correctionPatterns.test(task.userText || '')) {
-          storeCorrectionLesson({
-            userText: task.userText || '',
-            responseText: (text || '').slice(0, 2000),
-            threadHistory: (task.threadHistory || '').slice(0, 3000),
-            threadTs,
-            userId,
-            dbPath: join(profile.dataDir, 'memory.db'),
-          }).catch(() => {});
-          try {
-            writeLessonCandidate(profile.dataDir, {
-              source: 'user-correction',
-              stopReason: 'user correction keyword',
-              errorContext: JSON.stringify({ userText: task.userText || '', origin: task.origin }).slice(0, 500),
-              threadId: threadTs,
-              kind: 'user',
-              origin: task.origin,
-            });
-          } catch (candidateErr) {
-            warn(TAG, `failed to write user-correction lesson candidate: ${candidateErr.message}`);
-          }
-        }
-      } catch (err) {
-        const errCode = typeof getTaskCardStreamErrorCode === 'function' ? getTaskCardStreamErrorCode(err) : null;
-        logError(TAG, `failed to send result: ${err.message}${errCode ? ` (code=${errCode})` : ''}`);
-        await orchestrator.emit({
-          turnId: currentCcTurnId || makeTurnId({ threadTs, attemptId: task.attemptId }),
-          attemptId: task.attemptId || '',
-          channel,
-          threadTs: effectiveThreadTs,
-          platform,
-          channelSemantics,
-          intent: CONTROL_PLANE_MESSAGE,
-          text: ':warning: 回复发送失败。',
-          source: 'scheduler.result_error',
-        }).catch(() => {});
-      }
-
-      if (msg.toolCount > 0) {
-        try { this._checkSkillReview(profile.name, msg.toolCount, task, text, toolHistory, toolResults); } catch (_) {}
-        try { this._checkMemorySync(profile.name, msg.toolCount, task); } catch (_) {}
-      }
-    };
-
-    try {
-      ({ worker } = this._spawnWorkerFn({
-        task: makeTask({
-          userText: effectiveText,
-          fileContent,
-          imagePaths: imagePaths || [],
-          threadTs,
-          channel,
-          userId,
-          platform,
-          teamId: task.teamId || null,
-          attemptId: task.attemptId,
-          channelSemantics,
-          origin: task.origin,
-          threadHistory: task.threadHistory,
-          model: effectiveModel,
-          effort: effectiveEffort,
-          maxTurns: task.maxTurns || null,
-          fragments: task.fragments || [],
-          profile: {
-            name: profile.name,
-            scriptsDir: profile.scriptsDir,
-            workspaceDir: profile.workspaceDir,
-            dataDir: profile.dataDir,
-          },
-        }),
-        timeout: this.timeoutMs,
-        label: threadTs,
-        onMessage: async (msg) => {
-          // Worker IPC is now lifecycle + event-stream only:
-          // turn_start, turn_end, turn_complete, cc_event, inject_failed,
-          // error, and the process-exit result signal. Slack UI rendering is
-          // driven by cc_event subscribers; legacy UI IPC handlers were removed.
-          const validationError = validateIncomingIpc(msg);
-          if (validationError) {
-            warn(TAG, `dropped invalid worker ipc: ${validationError} thread=${threadTs}`);
-            return;
-          }
-          info(TAG, `worker response: type=${msg.type} thread=${threadTs} textLen=${msg.text?.length || 0}`);
-
-          if (msg.type === 'cc_event') {
-            currentCcTurnId = msg.turnId || currentCcTurnId;
-            if (msg.eventType === 'tool_use') {
-              toolHistory.push({
-                name: msg.payload?.name || null,
-                input: msg.payload?.input || msg.payload || {},
-              });
-            } else if (msg.eventType === 'tool_result') {
-              toolResults.push(msg.payload || {});
-            }
-            try {
-              await this._publishWorkerCcEvent(msg, {
-                task,
-                turn,
-                worker,
-                adapter,
-                channel,
-                threadTs,
-                effectiveThreadTs,
-                platform,
-                profile,
-                deferDeliveryUntilResult,
-                channelSemantics,
-                applyThreadStatus,
-                orchestrator,
-              });
-            } catch (err) {
-              warn(TAG, `eventBus publish failed: ${err.message}`);
-            }
-            return;
-          }
-          if (msg.type === 'inject_failed') {
-            responded = true;
-            const activeEntry = this.activeWorkers.get(threadTs);
-            const failedTask = activeEntry?.pendingInjects?.get(msg.injectId) || null;
-            try {
-              writeLessonCandidate(profile.dataDir, {
-                source: 'inject-failed',
-                stopReason: 'inject_failed',
-                errorContext: JSON.stringify({
-                  userText: msg.userText || '',
-                  injectId: msg.injectId || null,
-                  origin: failedTask?.origin || msg.origin || null,
-                }).slice(0, 500),
-                threadId: threadTs,
-                kind: 'inject',
-                origin: failedTask?.origin || msg.origin || null,
-              });
-            } catch (err) {
-              warn(TAG, `failed to write inject_failed lesson candidate: ${err.message}`);
-            }
-            if (activeEntry?.pendingInjects && msg.injectId) {
-              activeEntry.pendingInjects.delete(msg.injectId);
-            }
-            const respawnTask = buildRespawnTaskForInjectFailed({
-              msg,
-              failedTask,
-              task,
-              threadTs,
-              effectiveThreadTs,
-              channel,
-              userId,
-              platform,
-              profile,
-              deferDeliveryUntilResult,
-              channelSemantics,
-            });
-            if (!this.threadQueues.has(threadTs)) this.threadQueues.set(threadTs, []);
-            this.threadQueues.get(threadTs).unshift(respawnTask);
-            await abandonTurn(turn);
-            turn = makeTurnState(taskCardConfig);
-            try {
-              activeEntry?.worker?.kill?.('SIGTERM');
-            } catch (err) {
-              warn(TAG, `inject_failed kill worker failed: ${err.message}`);
-            }
-            warn(TAG, `inject failed, respawning worker for thread=${threadTs}`);
-            return;
-          }
-
-          if (msg.type === 'turn_start') {
-            if (msg.injectId) {
-              const activeEntry = this.activeWorkers.get(threadTs);
-              activeEntry?.pendingInjects?.delete(msg.injectId);
-            }
-            await abandonTurn(turn);
-            turn = makeTurnState(taskCardConfig);
-            userVisibleDeliveryObserved = false;
-            suppressedSuccessObserved = false;
-            currentCcTurnId = makeTurnId({ turnId: msg.turnId, threadTs, attemptId: msg.attemptId || task.attemptId });
-            orchestrator.beginTurn({
-              turnId: currentCcTurnId,
-              attemptId: msg.attemptId || task.attemptId || '',
-              channel,
-              threadTs: effectiveThreadTs,
-              platform,
-              channelSemantics: normalizeChannelSemantics(msg.channelSemantics ?? channelSemantics),
-              taskCardStates: turn.taskCardStates,
-            });
-            metadataUpdatedForTurn = false;
-            await startTyping();
-            return;
-          }
-
-          if (msg.type === 'turn_end') {
-            await stopTyping();
-            responded = true;
-            return;
-          }
-
-          responded = true;
-
-          if (msg.type === 'turn_complete') {
-            finalStopReason = msg.stopReason || finalStopReason;
-            if (msg.channelSemantics === 'silent' && isSuccessfulStopReason(msg.stopReason)) {
-              suppressedSuccessObserved = true;
-            }
-            await stopTyping();
-            const deliveryText = typeof msg?.text === 'string' ? msg.text : '';
-            const metadataText = deliveryText;
-            try {
-              if (deliveryText.trim() && suppressSuccessfulText('turn_complete', deliveryText, msg.stopReason, msg.channelSemantics)) {
-                await emitAssistantFinal({
-                  text: deliveryText,
-                  msg,
-                  source: 'scheduler.turn_complete',
-                  meta: { stopReason: msg.stopReason || null },
-                });
-                resetTaskCardState();
-                return;
-              }
-              if (deferDeliveryUntilResult && isSilentResultText(deliveryText)) {
-                info(TAG, `silent deferred turn suppressed: thread=${threadTs}`);
-                suppressedSuccessObserved = true;
-                await emitAssistantFinal({
-                  text: deliveryText,
-                  msg,
-                  source: 'scheduler.turn_complete',
-                  meta: { stopReason: msg.stopReason || null, deferred: true },
-                  channelSemanticsOverride: 'silent',
-                });
-                resetTaskCardState();
-                return;
-              }
-              if (deliveryText.trim()) {
-                await emitAssistantFinal({
-                  text: deliveryText,
-                  msg,
-                  source: 'scheduler.turn_complete',
-                  meta: { gitDiffSummary: msg.gitDiffSummary || null, deferred: deferDeliveryUntilResult },
-                });
-              } else if (metadataText?.trim()) {
-                userVisibleDeliveryObserved = true;
-                info(TAG, `turn_complete text already delivered`);
-              }
-              await updateThreadMetadata(metadataText);
-              resetTaskCardState();
-            } catch (err) {
-              logError(TAG, `failed to send turn_complete: ${err.message}`);
-              const fallbackText = deliveryText;
-              const silentDeferredFallback = deferDeliveryUntilResult && isSilentResultText(fallbackText);
-              if (silentDeferredFallback) {
-                info(TAG, `silent deferred turn suppressed after delivery failure: thread=${threadTs}`);
-                suppressedSuccessObserved = true;
-                await emitAssistantFinal({
-                  text: fallbackText,
-                  msg,
-                  source: 'scheduler.fallback',
-                  meta: { stopReason: msg.stopReason || null, deferred: true },
-                  channelSemanticsOverride: 'silent',
-                });
-              } else if (fallbackText.trim()) {
-                await emitAssistantFinal({
-                  text: fallbackText,
-                  msg,
-                  source: 'scheduler.fallback',
-                  meta: { gitDiffSummary: msg.gitDiffSummary || null, deferred: deferDeliveryUntilResult },
-                });
-              } else if (metadataText?.trim()) {
-                userVisibleDeliveryObserved = true;
-                info(TAG, `turn_complete fallback text already delivered`);
-              }
-              if (!silentDeferredFallback) await updateThreadMetadata(metadataText);
-              resetTaskCardState();
-            }
-            return;
-          }
-
-          if (msg.type === 'result') {
-            await handleExitResult(msg);
-          } else if (msg.type === 'error') {
-            const safeError = sanitizeErrorText(msg.error || '未知错误');
-            workerFailure = new Error(safeError);
-            logError(TAG, `worker error for thread=${threadTs}: ${safeError}`);
-            try {
-              writeLessonCandidate(profile.dataDir, {
-                source: 'worker-error',
-                stopReason: safeError,
-                errorContext: JSON.stringify({ ...(msg.errorContext || {}), origin: task.origin }).slice(0, 500),
-                threadId: threadTs,
-                kind: 'worker',
-                origin: task.origin,
-              });
-            } catch (err) {
-              warn(TAG, `failed to write worker-error lesson candidate: ${err.message}`);
-            }
-            await stopTyping();
-            await orchestrator.emit({
-              turnId: currentCcTurnId || makeTurnId({ threadTs, attemptId: task.attemptId }),
-              attemptId: task.attemptId || '',
-              channel,
-              threadTs: effectiveThreadTs,
-              platform,
-              channelSemantics: 'reply',
-              intent: CONTROL_PLANE_MESSAGE,
-              text: `:warning: 出错了: ${safeError}`,
-              source: 'scheduler.worker_error',
-            }).catch(() => {});
-            storeLesson({
-              userText: msg.errorContext?.userText || '',
-              errorText: msg.error || '',
-              responseText: '',
-              threadTs,
-              userId,
-              dbPath: join(profile.dataDir, 'memory.db'),
-            }).catch(() => {});
-          }
-        },
-        onExit: async (code, signal) => {
-          await stopTyping();
-          await applyThreadStatus('');
-          adapter?.clearStatusByContext?.({ channel, threadTs: effectiveThreadTs });
-          if (currentCcTurnId) {
-            try {
-              await this._publishWorkerCcEvent(makeCcEvent({
-                eventType: 'turn_abort',
-                turnId: currentCcTurnId,
-                origin: task.origin,
-                payload: { synthetic: true },
-              }), {
-                task,
-                turn,
-                worker,
-                adapter,
-                channel,
-                threadTs,
-                effectiveThreadTs,
-                platform,
-                profile,
-                deferDeliveryUntilResult,
-                channelSemantics,
-                applyThreadStatus,
-                orchestrator,
-              });
-            } catch (err) {
-              warn(TAG, `eventBus turn_abort publish failed: ${err.message}`);
-            }
-          }
-          this.activeWorkers.delete(threadTs);
-
-          const next = taskQueue.dequeue();
-          if (next) {
-            info(TAG, `draining queue: thread=${next.threadTs} waited=${Date.now() - next.enqueuedAt}ms`);
-            await this.submit(next);
-          }
-
-          info(TAG, `worker exited: pid=${worker.pid} code=${code} signal=${signal} responded=${responded} thread=${threadTs}`);
-
-          const deliveredBeforeExitNotice = userVisibleDeliveryObserved
-            || Boolean(currentCcTurnId && orchestrator.hasUserVisibleDelivery(currentCcTurnId));
-          const abnormalExit = !responded && (signal !== null || (code !== 0 && code !== null));
-          if (abnormalExit) {
-            await finalizeStreamsOnAbnormalExit();
-          }
-
-          if (!responded && !deliveredBeforeExitNotice) {
-            logError(TAG, `worker exited without response: thread=${threadTs} code=${code} signal=${signal}`);
-            this._autoContinueCount.delete(threadTs);
-            await adapter.cleanupIndicator(channel, effectiveThreadTs, false, '处理过程中出错，请重试。');
-          } else if (!responded) {
-            warn(TAG, `worker exited without IPC signal but stream delivered: thread=${threadTs} (suppressed user-facing warning)`);
-            this._autoContinueCount.delete(threadTs);
-          }
-
-          await this.processNextQueued(threadTs);
-
-          if (pendingAutoContinue) {
-            const cont = pendingAutoContinue;
-            pendingAutoContinue = null;
-            info(TAG, `auto-continue dispatched after worker exit: thread=${cont.threadTs}`);
-            await this.submit(cont);
-            return;
-          }
-
-          if (workerFailure) {
-            settleCompletion('reject', workerFailure);
-          } else if (!responded) {
-            settleCompletion('reject', new Error(signal ? `worker killed: ${signal}` : `worker exited with code ${code}`));
-          } else {
-            settleCompletion('resolve', {
-              text: finalResultText,
-              threadTs: effectiveThreadTs,
-              stopReason: finalStopReason,
-              errorSummary: finalErrorSummary,
-            });
-          }
-        },
-      }));
-    } catch (err) {
-      logError(TAG, `fork failed: ${err.message}`);
-      await stopTyping();
-      await adapter.cleanupIndicator(channel, effectiveThreadTs, false, 'Worker 启动失败。');
-      await this.processNextQueued(threadTs);
-      settleCompletion('reject', err);
-      return;
-    }
-
-    this.activeWorkers.set(threadTs, {
-      worker,
-      platform,
-      channel,
-      userId,
-      deliveryThreadTs: effectiveThreadTs,
-      channelSemantics,
-      pendingInjects: new Map(),
-      task: sanitizeTaskForPersistence(task),
-      orchestrator,
-      ledger,
-    });
-    worker.on('error', (err) => {
-      logError(TAG, `worker error event: pid=${worker.pid} err=${err.message}`);
-    });
-    info(TAG, `task sent to worker pid=${worker.pid} thread=${threadTs} profile=${profile.name}`);
+    return runWorkerForTask(task, { scheduler: this });
   }
 
   // --- Skill auto-extraction ---
@@ -1888,8 +1033,69 @@ export class Scheduler {
     });
   }
 
+  _disconnectAdapters() {
+    for (const [name, adapter] of this.adapters) {
+      info(TAG, `disconnecting adapter: ${name}`);
+      adapter.disconnect();
+    }
+  }
+
+  _activeWorkerTurnId(threadTs, entry) {
+    const turnIds = entry?.orchestrator?._turns?.keys
+      ? [...entry.orchestrator._turns.keys()]
+      : [];
+    return turnIds.at(-1) || makeTurnId({
+      threadTs: entry?.deliveryThreadTs || threadTs,
+      attemptId: entry?.task?.attemptId,
+    });
+  }
+
+  async _publishDrainWorkerCrashResults(activeEntries) {
+    for (const [threadTs, entry] of activeEntries) {
+      if (this.activeWorkers.get(threadTs)?.worker !== entry.worker) continue;
+      const adapter = this._getAdapter(entry.platform);
+      if (!adapter) continue;
+      const turnId = this._activeWorkerTurnId(threadTs, entry);
+      const msg = {
+        ...makeCcEvent({
+          turnId,
+          attemptId: entry.task?.attemptId || '',
+          origin: entry.task?.origin || null,
+          eventType: 'result',
+          payload: {
+            stop_reason: 'worker_crash',
+            stopReason: 'worker_crash',
+            synthetic: true,
+            reason: 'scheduler_drain_timeout',
+          },
+        }),
+        stopReason: 'worker_crash',
+      };
+      try {
+        await this._publishWorkerCcEvent(msg, {
+          task: entry.task,
+          turn: entry.turn,
+          worker: entry.worker,
+          adapter,
+          channel: entry.channel,
+          threadTs,
+          effectiveThreadTs: entry.deliveryThreadTs || threadTs,
+          platform: entry.platform,
+          profile: entry.task?.profile || null,
+          deferDeliveryUntilResult: entry.task?.deferDeliveryUntilResult === true,
+          channelSemantics: entry.channelSemantics,
+          orchestrator: entry.orchestrator,
+        });
+        info(TAG, `synthetic worker_crash result published before drain kill: thread=${threadTs} turn=${turnId}`);
+      } catch (err) {
+        warn(TAG, `synthetic worker_crash result publish failed: thread=${threadTs} err=${err.message}`);
+      }
+    }
+  }
+
   async shutdown(signal) {
-    const allWorkers = [...this.activeWorkers.values()].map(({ worker }) => worker).concat([...this._backgroundWorkers]);
+    const activeEntries = [...this.activeWorkers.entries()];
+    const allWorkers = activeEntries.map(([, { worker }]) => worker).concat([...this._backgroundWorkers]);
     info(TAG, `${signal} received, draining ${this.activeWorkers.size} active + ${this._backgroundWorkers.size} background worker(s)...`);
     try {
       this._permissionServer?.close();
@@ -1900,7 +1106,6 @@ export class Scheduler {
 
     persistShutdownQueues({
       threadQueues: this.threadQueues,
-      activeWorkers: this.activeWorkers,
       getProfile: (userId) => this.getProfile(userId),
     });
 
@@ -1912,13 +1117,8 @@ export class Scheduler {
       }
     }
 
-    // Disconnect all adapters
-    for (const [name, adapter] of this.adapters) {
-      info(TAG, `disconnecting adapter: ${name}`);
-      adapter.disconnect();
-    }
-
     if (allWorkers.length === 0) {
+      this._disconnectAdapters();
       process.exit(0);
     }
 
@@ -1926,17 +1126,29 @@ export class Scheduler {
     const onExit = () => {
       remaining--;
       info(TAG, `worker drained, ${remaining} remaining`);
-      if (remaining <= 0) process.exit(0);
+      if (remaining <= 0) {
+        this._disconnectAdapters();
+        process.exit(0);
+      }
     };
     for (const worker of allWorkers) {
       worker.once('exit', onExit);
     }
 
-    setTimeout(() => {
+    setTimeout(async () => {
       warn(TAG, `drain timeout, force killing ${allWorkers.length} worker(s)`);
+      await this._publishDrainWorkerCrashResults(activeEntries);
+      for (const ledger of this._turnDeliveryLedgers.values()) {
+        try {
+          await ledger.flush?.();
+        } catch (err) {
+          warn(TAG, `turn delivery ledger flush failed: ${err.message}`);
+        }
+      }
       for (const worker of allWorkers) {
         try { worker.kill('SIGKILL'); } catch {}
       }
+      this._disconnectAdapters();
       process.exit(1);
     }, DRAIN_TIMEOUT);
   }

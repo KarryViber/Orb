@@ -7,10 +7,11 @@ import json
 import logging
 import re
 import sqlite3
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 try:
     import docx  # type: ignore
@@ -26,6 +27,8 @@ logging.getLogger("pdfminer").setLevel(logging.ERROR)
 logging.getLogger("pdfplumber").setLevel(logging.ERROR)
 
 import os as _os
+_os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+_os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 # Paths MUST be configured via env vars — no hardcoded fallbacks.
 _projects_root = _os.environ.get("DOC_PROJECTS_ROOT", "")
@@ -41,8 +44,14 @@ else:
 _doc_root = _os.environ.get("DOC_ROOT", "")
 DOC_ROOT = Path(_doc_root) if _doc_root else None
 
+_references_root = _os.environ.get("DOC_REFERENCES_ROOT", "")
+REFERENCES_ROOT = Path(_references_root) if _references_root else None
+
 _doc_index_db = _os.environ.get("DOC_INDEX_DB", "")
 DEFAULT_DB_PATH = Path(_doc_index_db) if _doc_index_db else None
+
+_docstore_wide_map_json = _os.environ.get("DOCSTORE_WIDE_MAP_JSON", "")
+DOCSTORE_WIDE_MAP_JSON = Path(_docstore_wide_map_json) if _docstore_wide_map_json else None
 MAX_CHUNK_CHARS = 1200
 MIN_CHUNK_CHARS = 300
 OVERLAP_CHARS = 180
@@ -118,6 +127,10 @@ DOC_TYPE_BOOST = {
     "02_draft": 0.6,      # 降权：编辑中草稿
 }
 
+EMBEDDING_DIM = 1024
+EMBEDDING_MODEL_NAME = "BAAI/bge-m3"
+EMBEDDING_BATCH_SIZE = 4
+
 SCHEMA_SQL = """
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
@@ -146,6 +159,8 @@ CREATE TABLE IF NOT EXISTS chunks (
     title TEXT NOT NULL,
     section TEXT NOT NULL,
     content TEXT NOT NULL,
+    embedding BLOB,
+    priority_layer TEXT NOT NULL DEFAULT 'L5',
     UNIQUE(doc_id, chunk_index)
 );
 
@@ -246,38 +261,98 @@ def should_index(path: Path, doc_type: str) -> bool:
     return suffix in allowed
 
 
+def load_docstore_wide_map_rules() -> list[dict[str, Any]]:
+    """Load wide-mode path mapping rules from DOCSTORE_WIDE_MAP_JSON.
+
+    Wide mode intentionally has no built-in organization-specific paths. Set
+    DOCSTORE_WIDE_MAP_JSON to a JSON file with a top-level `rules` array, or to
+    a JSON array directly. See docs/docstore-wide-map.example.json.
+    """
+    if not DOCSTORE_WIDE_MAP_JSON:
+        return []
+    if not DOCSTORE_WIDE_MAP_JSON.exists():
+        raise FileNotFoundError(f"DOCSTORE_WIDE_MAP_JSON not found: {DOCSTORE_WIDE_MAP_JSON}")
+    payload = json.loads(DOCSTORE_WIDE_MAP_JSON.read_text(encoding="utf-8"))
+    rules = payload.get("rules") if isinstance(payload, dict) else payload
+    if not isinstance(rules, list):
+        raise ValueError("DOCSTORE_WIDE_MAP_JSON must contain a rules array")
+    out: list[dict[str, Any]] = []
+    for index, rule in enumerate(rules):
+        if not isinstance(rule, dict):
+            raise ValueError(f"wide map rule {index} must be an object")
+        match = rule.get("match")
+        if not isinstance(match, list) or not all(isinstance(item, str) for item in match):
+            raise ValueError(f"wide map rule {index} must include a string match array")
+        out.append(rule)
+    return out
+
+
+def _match_wide_rule(pattern: list[str], rel_parts: tuple[str, ...]) -> list[str] | None:
+    captures: list[str] = []
+    part_index = 0
+    for token in pattern:
+        if token == "**":
+            captures.extend(rel_parts[part_index:])
+            part_index = len(rel_parts)
+            break
+        if part_index >= len(rel_parts):
+            return None
+        current = rel_parts[part_index]
+        if token == "*":
+            captures.append(current)
+        elif token != current:
+            return None
+        part_index += 1
+    if part_index != len(rel_parts):
+        return None
+    return captures
+
+
+def _render_wide_template(template: object, captures: list[str], dir_to_slug: dict[str, str]) -> str:
+    if not isinstance(template, str):
+        raise ValueError("wide map output templates must be strings")
+
+    def replace(match: re.Match[str]) -> str:
+        expression = match.group(1)
+        parts = expression.split("|")
+        try:
+            value = captures[int(parts[0])]
+        except (ValueError, IndexError) as err:
+            raise ValueError(f"invalid wide map capture reference: {expression}") from err
+        for op in parts[1:]:
+            if op == "registry":
+                value = dir_to_slug.get(value, value)
+            elif op.startswith("known_project_doc_type:"):
+                fallback = op.split(":", 1)[1]
+                value = value if value in KNOWN_PROJECT_DOC_TYPES else fallback
+            else:
+                raise ValueError(f"unsupported wide map template operator: {op}")
+        return value
+
+    return re.sub(r"\{([^{}]+)\}", replace, template)
+
+
 def derive_ids_wide(
     rel_parts: tuple[str, ...],
     dir_to_slug: dict[str, str],
+    mapping_rules: list[dict[str, Any]] | None = None,
 ) -> tuple[str, str, str] | None:
-    """Map a path (relative to DOC_ROOT) to (slug, project_dir, doc_type).
+    """Map a path relative to DOC_ROOT to (slug, project_dir, doc_type).
 
-    Returns None if the file should not be indexed (top-level or unknown area).
+    Returns None if no configured wide-map rule matches the path.
     """
-    if not rel_parts or len(rel_parts) < 2:
+    if not rel_parts:
         return None
-    top = rel_parts[0]
-    if top == "dyna" and len(rel_parts) >= 3:
-        domain = rel_parts[1]
-        if domain == "projects" and len(rel_parts) >= 4:
-            proj = rel_parts[2]
-            slug = dir_to_slug.get(proj, proj)
-            seg = rel_parts[3]
-            doc_type = seg if seg in KNOWN_PROJECT_DOC_TYPES else "reference"
-            return slug, proj, doc_type
-        if domain == "partners" and len(rel_parts) >= 4:
-            partner = rel_parts[2]
-            return f"partners-{partner}", f"partners/{partner}", "reference"
-        if domain == "psr":
-            return "psr", "psr", "reference"
-        # dyna top-level files (INDEX.md, lark-group-index.md)
-        return "dyna", "dyna", "reference"
-    if top == "articles" and len(rel_parts) >= 3:
-        section = rel_parts[1]
-        if section in {"04_published", "05_archive"}:
-            return "articles", "articles", "published"
-        # 01_briefs/02_drafts/03_publish_packets 已被 EXCLUDE_DIR_SEGMENTS 挡掉
-        return None
+    rules = load_docstore_wide_map_rules() if mapping_rules is None else mapping_rules
+    for rule in rules:
+        captures = _match_wide_rule(rule["match"], rel_parts)
+        if captures is None:
+            continue
+        slug = _render_wide_template(rule.get("slug"), captures, dir_to_slug)
+        project_dir = _render_wide_template(rule.get("project_dir"), captures, dir_to_slug)
+        doc_type_template = rule.get("doc_type", "reference")
+        doc_type = _render_wide_template(doc_type_template, captures, dir_to_slug)
+        return slug, project_dir, doc_type
     return None
 
 
@@ -317,24 +392,27 @@ def iter_candidate_files(slug_filter: str | None = None) -> Iterable[CandidateFi
             if slug_filter and slug != slug_filter:
                 continue
             yield CandidateFile(path=path, slug=slug, project_dir=project_dir, doc_type=doc_type)
-        return
+    else:
+        # Legacy mode: PROJECTS_ROOT/*/docType/**
+        if PROJECTS_ROOT and PROJECTS_ROOT.exists():
+            for project_dir in sorted(PROJECTS_ROOT.iterdir()):
+                if not project_dir.is_dir() or project_dir.name.startswith("."):
+                    continue
+                slug = dir_to_slug.get(project_dir.name, project_dir.name)
+                if slug_filter and slug != slug_filter:
+                    continue
+                for doc_type in INCLUDE_DIR_EXTS:
+                    base = project_dir / doc_type
+                    if not base.exists():
+                        continue
+                    for path in sorted(base.rglob("*")):
+                        if path.is_file() and should_index(path, doc_type):
+                            yield CandidateFile(path=path, slug=slug, project_dir=project_dir.name, doc_type=doc_type)
 
-    # Legacy mode: PROJECTS_ROOT/*/docType/**
-    if not PROJECTS_ROOT or not PROJECTS_ROOT.exists():
-        return
-    for project_dir in sorted(PROJECTS_ROOT.iterdir()):
-        if not project_dir.is_dir() or project_dir.name.startswith("."):
-            continue
-        slug = dir_to_slug.get(project_dir.name, project_dir.name)
-        if slug_filter and slug != slug_filter:
-            continue
-        for doc_type in INCLUDE_DIR_EXTS:
-            base = project_dir / doc_type
-            if not base.exists():
-                continue
-            for path in sorted(base.rglob("*")):
-                if path.is_file() and should_index(path, doc_type):
-                    yield CandidateFile(path=path, slug=slug, project_dir=project_dir.name, doc_type=doc_type)
+    if REFERENCES_ROOT and REFERENCES_ROOT.exists():
+        path = REFERENCES_ROOT / "bookmarks.md"
+        if path.is_file() and (not slug_filter or slug_filter == "references"):
+            yield CandidateFile(path=path, slug="references", project_dir="references", doc_type="bookmark")
 
 
 def extract_title(text: str, fallback: str) -> str:
@@ -467,11 +545,70 @@ def extract_document(file: CandidateFile) -> ExtractedDocument:
     raise RuntimeError(f"unsupported suffix: {suffix}")
 
 
+def derive_priority_layer(path: Path | str) -> str:
+    """Derive priority_layer from absolute or relative path string.
+
+    L1: /03_delivery/  L2: /knowledge/  L3: /02_draft/  L4: /00_source/  L5: 其他
+    """
+    posix = (path.as_posix() if isinstance(path, Path) else str(path))
+    if "/03_delivery/" in posix:
+        return "L1"
+    if "/knowledge/" in posix or "/dyna/knowledge/" in posix:
+        return "L2"
+    if "/02_draft/" in posix:
+        return "L3"
+    if "/00_source/" in posix:
+        return "L4"
+    return "L5"
+
+
+_EMBEDDER = None
+
+
+def get_embedder():
+    """Lazy-load BAAI/bge-m3 SentenceTransformer; module-level singleton."""
+    global _EMBEDDER
+    if _EMBEDDER is not None:
+        return _EMBEDDER
+    from sentence_transformers import SentenceTransformer  # type: ignore
+    _EMBEDDER = SentenceTransformer(EMBEDDING_MODEL_NAME)
+    return _EMBEDDER
+
+
+def encode_chunks(texts: list[str]) -> list[bytes]:
+    """Encode chunk texts -> list of float32 BLOBs (1024-dim, L2-normalized)."""
+    if not texts:
+        return []
+    import numpy as np  # type: ignore
+    model = get_embedder()
+    arr = np.asarray(
+        model.encode(
+            texts,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+            batch_size=EMBEDDING_BATCH_SIZE,
+        ),
+        dtype=np.float32,
+    )
+    return [row.tobytes() for row in arr]
+
+
+def migrate_schema(conn: sqlite3.Connection) -> None:
+    """Idempotent ALTER TABLE: add embedding + priority_layer columns if missing."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(chunks)").fetchall()}
+    if "embedding" not in cols:
+        conn.execute("ALTER TABLE chunks ADD COLUMN embedding BLOB")
+    if "priority_layer" not in cols:
+        conn.execute("ALTER TABLE chunks ADD COLUMN priority_layer TEXT NOT NULL DEFAULT 'L5'")
+    conn.commit()
+
+
 def connect(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA_SQL)
+    migrate_schema(conn)
     return conn
 
 
@@ -532,14 +669,21 @@ def upsert_document(conn: sqlite3.Connection, file: CandidateFile, text: str, ti
     delete_doc_chunks(conn, doc_id)
 
     chunks = chunk_text(text)
+    priority_layer = derive_priority_layer(file.path)
+    embeddings: list[bytes] = []
+    if chunks:
+        # fail-fast：encoder 不可用直接 raise，让上游 cron 报错 DM
+        # 历史问题：silent degrade 写 NULL embedding 导致 717 chunks 静默失明（2026-05-10 修复）
+        embeddings = encode_chunks([content for _section, content in chunks])
     fts_rows = []
     for chunk_index, (section, content) in enumerate(chunks):
+        emb = embeddings[chunk_index] if chunk_index < len(embeddings) and embeddings[chunk_index] else None
         cursor = conn.execute(
             """
-            INSERT INTO chunks(doc_id, chunk_index, path, slug, doc_type, title, section, content)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO chunks(doc_id, chunk_index, path, slug, doc_type, title, section, content, embedding, priority_layer)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (doc_id, chunk_index, str(file.path), file.slug, file.doc_type, title, section, content),
+            (doc_id, chunk_index, str(file.path), file.slug, file.doc_type, title, section, content, emb, priority_layer),
         )
         row_id = cursor.lastrowid
         fts_rows.append((row_id, str(file.path), file.slug, file.doc_type, title, section, content))
@@ -565,6 +709,102 @@ def delete_stale_documents(conn: sqlite3.Connection, live_paths: set[str], slug_
         conn.execute("DELETE FROM documents WHERE id = ?", (row["id"],))
         deleted += 1
     return deleted
+
+
+def semantic_rerank(
+    conn: sqlite3.Connection,
+    query: str,
+    slug: str | None,
+    doc_type: str | None,
+    limit: int,
+    pool: int = 50,
+    bm25_weight: float = 0.4,
+    cosine_weight: float = 0.6,
+) -> list[dict]:
+    """FTS5 top-`pool` 召回 + bge-m3 cosine rerank，返回 top-`limit`。
+
+    任何阶段失败（无 embedding 列 / 编码失败 / FTS5 异常）返回空列表，由调用方走纯 FTS 回退。
+    """
+    if len(query.strip()) < 3:
+        return []
+    try:
+        import numpy as np  # type: ignore
+    except Exception:
+        return []
+    filters: list[str] = []
+    params: list[object] = [query]
+    if slug:
+        filters.append("c.slug = ?")
+        params.append(slug)
+    if doc_type:
+        filters.append("c.doc_type = ?")
+        params.append(doc_type)
+    where = (" AND " + " AND ".join(filters)) if filters else ""
+    params.append(pool)
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT
+                c.id AS chunk_id,
+                c.path, c.slug, c.doc_type, d.ext, c.title, c.section,
+                c.embedding, c.priority_layer,
+                snippet(chunks_fts, 5, '[', ']', ' … ', 18) AS snippet,
+                bm25(chunks_fts, 3.5, 2.0, 1.8, 1.8, 1.5, 1.0) AS bm25
+            FROM chunks_fts
+            JOIN chunks c ON c.id = chunks_fts.rowid
+            JOIN documents d ON d.id = c.doc_id
+            WHERE chunks_fts MATCH ? {where}
+            ORDER BY bm25
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+    except Exception:
+        return []
+    if not rows:
+        return []
+    candidates = [dict(r) for r in rows]
+    # encode query
+    try:
+        q_vec = encode_chunks([query])
+        if not q_vec or not q_vec[0]:
+            return []
+        q_arr = np.frombuffer(q_vec[0], dtype=np.float32)
+    except Exception:
+        return []
+    # bm25 normalization (smaller = better in FTS5; flip sign)
+    bm25_vals = [float(c["bm25"]) for c in candidates]
+    bm25_neg = [-v for v in bm25_vals]
+    bmin, bmax = min(bm25_neg), max(bm25_neg)
+    span = (bmax - bmin) or 1.0
+    out: list[dict] = []
+    for c, bn in zip(candidates, bm25_neg, strict=True):
+        emb = c.get("embedding")
+        if emb:
+            try:
+                v = np.frombuffer(emb, dtype=np.float32)
+                cos = float(np.dot(q_arr, v))  # both L2-normalized
+            except Exception:
+                cos = 0.0
+        else:
+            cos = 0.0
+        bm_norm = (bn - bmin) / span
+        combined = bm25_weight * bm_norm + cosine_weight * cos
+        out.append({
+            "path": c["path"],
+            "slug": c["slug"],
+            "doc_type": c["doc_type"],
+            "ext": c["ext"],
+            "title": c["title"],
+            "section": c["section"],
+            "snippet": c["snippet"],
+            "priority_layer": c["priority_layer"],
+            "bm25": bm25_vals[candidates.index(c)] if False else float(c["bm25"]),
+            "cosine": cos,
+            "score": -combined,  # negative so smaller = better (matches FTS convention)
+        })
+    out.sort(key=lambda r: r["score"])
+    return out[:limit]
 
 
 def search_rows(conn: sqlite3.Connection, query: str, slug: str | None, doc_type: str | None, limit: int) -> list[dict]:
@@ -595,6 +835,7 @@ def search_rows(conn: sqlite3.Connection, query: str, slug: str | None, doc_type
                 c.title,
                 c.section,
                 snippet(chunks_fts, 5, '[', ']', ' … ', 18) AS snippet,
+                c.priority_layer AS priority_layer,
                 bm25(chunks_fts, 3.5, 2.0, 1.8, 1.8, 1.5, 1.0) * CASE c.doc_type
                     WHEN '03_delivery' THEN 1.5
                     WHEN 'published'   THEN 1.3
@@ -615,7 +856,19 @@ def search_rows(conn: sqlite3.Connection, query: str, slug: str | None, doc_type
         ).fetchall()
     except Exception:
         return []
-    return [dict(row) for row in rows]
+    results = [dict(row) for row in rows]
+    fallback = _search_rows_like_terms(conn, query, slug, doc_type, limit) if len(_query_like_terms(query)) >= 3 else []
+    if results and not fallback:
+        return results
+    if not results:
+        return fallback
+    merged: dict[tuple[object, object], dict] = {}
+    for row in results + fallback:
+        key = (row.get("path"), row.get("section"))
+        existing = merged.get(key)
+        if not existing or row.get("score", 0) < existing.get("score", 0):
+            merged[key] = row
+    return sorted(merged.values(), key=lambda row: row.get("score", 0))[:limit]
 
 
 def _search_rows_like(conn: sqlite3.Connection, query: str, slug: str | None, doc_type: str | None, limit: int) -> list[dict]:
@@ -641,6 +894,7 @@ def _search_rows_like(conn: sqlite3.Connection, query: str, slug: str | None, do
                 c.title,
                 c.section,
                 c.content AS snippet,
+                c.priority_layer AS priority_layer,
                 1.0 AS score
             FROM chunks c
             JOIN documents d ON d.id = c.doc_id
@@ -649,6 +903,83 @@ def _search_rows_like(conn: sqlite3.Connection, query: str, slug: str | None, do
             LIMIT ?
             """,
             params,
+        ).fetchall()
+    except Exception:
+        return []
+    return [dict(row) for row in rows]
+
+
+def _query_like_terms(query: str) -> list[str]:
+    terms: list[str] = []
+    seen: set[str] = set()
+
+    def add(term: str) -> None:
+        term = term.strip()
+        if len(term) < 2:
+            return
+        key = term.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        terms.append(term)
+
+    for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9+._-]*|[\u4e00-\u9fff]+|[ぁ-んァ-ヶー]+", query):
+        add(token)
+        if re.fullmatch(r"[\u4e00-\u9fff]+", token):
+            for width in (2, 3):
+                if len(token) <= width:
+                    continue
+                for idx in range(0, len(token) - width + 1):
+                    add(token[idx : idx + width])
+    return terms[:32]
+
+
+def _search_rows_like_terms(conn: sqlite3.Connection, query: str, slug: str | None, doc_type: str | None, limit: int) -> list[dict]:
+    terms = _query_like_terms(query)
+    if not terms:
+        return []
+
+    filters = []
+    params: list[object] = []
+    if slug:
+        filters.append("c.slug = ?")
+        params.append(slug)
+    if doc_type:
+        filters.append("c.doc_type = ?")
+        params.append(doc_type)
+    match_exprs = []
+    match_params: list[object] = []
+    score_exprs = []
+    score_params: list[object] = []
+    for term in terms:
+        like = f"%{term}%"
+        match_exprs.append("(c.title LIKE ? OR c.section LIKE ? OR c.content LIKE ?)")
+        match_params.extend([like, like, like])
+        score_exprs.append("(CASE WHEN c.title LIKE ? THEN 3 ELSE 0 END + CASE WHEN c.section LIKE ? THEN 2 ELSE 0 END + CASE WHEN c.content LIKE ? THEN 1 ELSE 0 END)")
+        score_params.extend([like, like, like])
+    where = " AND ".join(filters + ["(" + " OR ".join(match_exprs) + ")"])
+    score_sql = " + ".join(score_exprs)
+    sql_params = score_params + params + match_params + [limit]
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT
+                c.path,
+                c.slug,
+                c.doc_type,
+                d.ext,
+                c.title,
+                c.section,
+                c.content AS snippet,
+                c.priority_layer AS priority_layer,
+                -1.0 * ({score_sql}) AS score
+            FROM chunks c
+            JOIN documents d ON d.id = c.doc_id
+            WHERE {where}
+            ORDER BY score, c.doc_type DESC
+            LIMIT ?
+            """,
+            sql_params,
         ).fetchall()
     except Exception:
         return []
@@ -700,11 +1031,13 @@ def command_update(args: argparse.Namespace) -> int:
 
         docs = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
         chunks = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+        null_emb = conn.execute("SELECT COUNT(*) FROM chunks WHERE embedding IS NULL").fetchone()[0]
         payload = {
             "db_path": str(db_path),
             "slug": slug_filter,
             "documents": docs,
             "chunks": chunks,
+            "null_embedding_count": null_emb,
             "inserted": inserted,
             "updated": updated,
             "unchanged": unchanged,
@@ -717,7 +1050,7 @@ def command_update(args: argparse.Namespace) -> int:
             print(json.dumps(payload, ensure_ascii=False, indent=2))
         else:
             print(f"db={db_path}")
-            print(f"documents={docs} chunks={chunks}")
+            print(f"documents={docs} chunks={chunks} null_embedding_count={null_emb}")
             print(
                 "inserted={inserted} updated={updated} unchanged={unchanged} deleted={deleted} skipped_empty={skipped_empty} skipped_extract={skipped_extract}".format(
                     inserted=inserted,
@@ -728,6 +1061,10 @@ def command_update(args: argparse.Namespace) -> int:
                     skipped_extract=skipped_extract,
                 )
             )
+        # 后置断言：null_embedding_count > 0 视为部分失败，让上游 cron 报错 DM 提醒跑 rebuild
+        if null_emb > 0:
+            print(f"WARN: {null_emb} chunks have NULL embedding; run workspace-doc-rebuild-embeddings.sh", file=sys.stderr)
+            return 2
         return 0
     finally:
         conn.close()
@@ -737,7 +1074,11 @@ def command_search(args: argparse.Namespace) -> int:
     db_path = Path(args.db_path).expanduser()
     conn = connect(db_path)
     try:
-        results = search_rows(conn, args.query, args.slug, args.doc_type, args.limit)
+        results: list[dict] = []
+        if not getattr(args, "no_semantic", False):
+            results = semantic_rerank(conn, args.query, args.slug, args.doc_type, args.limit)
+        if not results:
+            results = search_rows(conn, args.query, args.slug, args.doc_type, args.limit)
         if args.json:
             print(json.dumps(results, ensure_ascii=False, indent=2))
         else:
@@ -812,6 +1153,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_search.add_argument("--doc-type", choices=sorted(INCLUDE_DIR_EXTS.keys()))
     p_search.add_argument("--limit", type=int, default=8)
     p_search.add_argument("--json", action="store_true")
+    p_search.add_argument("--no-semantic", action="store_true", help="Disable bge-m3 cosine rerank (FTS5 only)")
     p_search.set_defaults(func=command_search)
 
     p_stats = sub.add_parser("stats", help="Show index stats")

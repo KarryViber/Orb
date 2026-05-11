@@ -57,128 +57,106 @@ function protectStructuralHeadings(text, headingMarks) {
   return out.join('\n');
 }
 
-export function markdownToMrkdwn(text) {
-  if (!text) return '';
+// CJK boundary regex: Slack mrkdwn formatting chars (* _ ~) need word
+// boundaries to render. CJK and fullwidth punctuation aren't recognized
+// as boundaries, so we insert U+200B (zero-width space) where needed.
+const CJK_BOUNDARY = /[⺀-鿿豈-﫿︰-﹏＀-￯]/;
 
+function protectTokens(text, store) {
   let result = text;
-  result = result.replace(/\u200b/g, '');
-
-  // ── Phase 0: Protect non-convertible tokens ──
-
-  // Protect code blocks (may span paragraphs)
-  const codeBlocks = [];
   result = result.replace(/```[\s\S]*?```/g, (match) => {
-    codeBlocks.push(match);
-    return `\x00CB${codeBlocks.length - 1}\x00`;
+    store.codeBlocks.push(match);
+    return `\x00CB${store.codeBlocks.length - 1}\x00`;
   });
-
-  // Protect inline code
-  const inlineCodes = [];
   result = result.replace(/`[^`]+`/g, (match) => {
-    inlineCodes.push(match);
-    return `\x00IC${inlineCodes.length - 1}\x00`;
+    store.inlineCodes.push(match);
+    return `\x00IC${store.inlineCodes.length - 1}\x00`;
   });
-
-  // Protect Slack entities: <@U...>, <#C...>, <!here>, <https://...|label>
-  // These must not be touched by any escaping pass
-  const slackEntities = [];
   result = result.replace(/<(?:@[A-Z0-9]+|#[A-Z0-9]+(?:\|[^>]*)?|![a-z]+(?:\|[^>]*)?)>/g, (match) => {
-    slackEntities.push(match);
-    return `\x00SE${slackEntities.length - 1}\x00`;
+    store.slackEntities.push(match);
+    return `\x00SE${store.slackEntities.length - 1}\x00`;
   });
+  return result;
+}
 
-  // ── Phase 1: Structural conversion ──
-
-  // Headers map to distinct Slack visual tiers. Protect generated mrkdwn
-  // markers so the later inline italic pass does not reinterpret them.
-  const headingMarks = [];
-  result = protectStructuralHeadings(result, headingMarks);
-
-  // Blockquotes: > text → (indented, Slack supports > natively in mrkdwn)
-  // Just ensure single > at line start is preserved (Slack mrkdwn blockquote)
+function convertStructural(text, store) {
+  let result = protectStructuralHeadings(text, store.headingMarks);
   result = result.replace(/^>\s?/gm, '> ');
+  return result;
+}
 
-  // ── Phase 2: Inline formatting ──
+function convertInline(text, store) {
+  let result = text;
 
-  // CJK boundary regex: Slack mrkdwn formatting chars (* _ ~) need word
-  // boundaries to render. CJK and fullwidth punctuation aren't recognized
-  // as boundaries, so we insert U+200B (zero-width space) where needed.
-  const CJK_BOUNDARY = /[\u2E80-\u9FFF\uF900-\uFAFF\uFE30-\uFE4F\uFF00-\uFFEF]/;
-
-  // ***bold italic*** → *_text_* (Slack bold+italic)
   result = result.replace(/\*\*\*(.+?)\*\*\*/g, '*_$1_*');
 
-  // Bold: **text** or __text__ → *text* (Slack bold)
-  // Protect converted bold from italic pass by using placeholder
-  const boldMarks = [];
   result = result.replace(/\*\*(.+?)\*\*/g, (_, inner) => {
-    boldMarks.push(inner);
-    return `\x00BD${boldMarks.length - 1}\x00`;
+    store.boldMarks.push(inner);
+    return `\x00BD${store.boldMarks.length - 1}\x00`;
   });
   result = result.replace(/__(.+?)__/g, (_, inner) => {
-    boldMarks.push(inner);
-    return `\x00BD${boldMarks.length - 1}\x00`;
+    store.boldMarks.push(inner);
+    return `\x00BD${store.boldMarks.length - 1}\x00`;
   });
 
-  // Italic: single *text* → _text_ (only matches genuine italic, not converted bold).
-  // If inner contains CJK, preserve *text* — Slack mrkdwn uses * for bold, so
-  // agents that already write Slack-style bold stay idempotent instead of
-  // silently flipping to italic. ZWSP is inserted OUTSIDE the stars only.
   result = result.replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g, (match, inner, offset, str) => {
     const before = str[offset - 1] || '';
     const after = str[offset + match.length] || '';
     const innerHasCjk = CJK_BOUNDARY.test(inner);
     let out = innerHasCjk ? `*${inner}*` : `_${inner}_`;
-    if (CJK_BOUNDARY.test(before)) out = '\u200b' + out;
-    if (CJK_BOUNDARY.test(after)) out = out + '\u200b';
+    if (CJK_BOUNDARY.test(before)) out = '​' + out;
+    if (CJK_BOUNDARY.test(after)) out = out + '​';
     return out;
   });
 
-  // Restore bold with CJK boundary awareness.
-  // Invariant: ZWSP is only inserted OUTSIDE the stars (`\u200b*X*\u200b`),
-  // never between them, so adjacent output never produces `**X*\u200b*`.
   result = result.replace(/\x00BD(\d+)\x00/g, (match, i, offset, str) => {
     const before = str[offset - 1] || '';
     const after = str[offset + match.length] || '';
-    let out = `*${boldMarks[i]}*`;
-    if (CJK_BOUNDARY.test(before)) out = '\u200b' + out;
-    if (CJK_BOUNDARY.test(after)) out = out + '\u200b';
+    let out = `*${store.boldMarks[i]}*`;
+    if (CJK_BOUNDARY.test(before)) out = '​' + out;
+    if (CJK_BOUNDARY.test(after)) out = out + '​';
     return out;
   });
 
-  // Strikethrough: ~~text~~ → ~text~
   result = result.replace(/~~(.+?)~~/g, '~$1~');
 
-  // Restore structural headings before protected code/entities are restored.
-  result = result.replace(/\x00HD(\d+)\x00/g, (_, i) => headingMarks[i]);
+  result = result.replace(/\x00HD(\d+)\x00/g, (_, i) => store.headingMarks[i]);
 
-  // ── Phase 3: Links ──
-
-  // Images before links (! prefix)
   result = result.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '<$2|$1>');
 
-  // Links: [text](url) → <url|text> (handle balanced parens in URLs)
   result = result.replace(/\[([^\]]+)\]\(((?:[^()]+|\([^()]*\))+)\)/g, '<$2|$1>');
 
-  // Horizontal rules → ———
   result = result.replace(/^(-{3,}|\*{3,}|_{3,})$/gm, '———');
 
-  // ── Phase 4: HTML entity cleanup ──
-
-  // Prevent double-escaping: &amp; → & (only if not already part of an entity)
   result = result.replace(/&amp;(#?\w+;)/g, '&$1');
 
-  // ── Phase 5: Restore protected tokens (reverse order) ──
+  return result;
+}
 
-  // Restore Slack entities
-  result = result.replace(/\x00SE(\d+)\x00/g, (_, i) => slackEntities[i]);
+function restoreTokens(text, store) {
+  let result = text;
+  result = result.replace(/\x00SE(\d+)\x00/g, (_, i) => store.slackEntities[i]);
+  result = result.replace(/\x00IC(\d+)\x00/g, (_, i) => store.inlineCodes[i]);
+  result = result.replace(/\x00CB(\d+)\x00/g, (_, i) => store.codeBlocks[i]);
+  return result;
+}
 
-  // Restore inline code
-  result = result.replace(/\x00IC(\d+)\x00/g, (_, i) => inlineCodes[i]);
+export function markdownToMrkdwn(text) {
+  if (!text) return '';
 
-  // Restore code blocks
-  result = result.replace(/\x00CB(\d+)\x00/g, (_, i) => codeBlocks[i]);
+  const store = {
+    codeBlocks: [],
+    inlineCodes: [],
+    slackEntities: [],
+    headingMarks: [],
+    boldMarks: [],
+  };
 
+  let result = text.replace(/\u200b/g, '');
+  result = protectTokens(result, store);
+  result = convertStructural(result, store);
+  result = convertInline(result, store);
+  result = restoreTokens(result, store);
   return result;
 }
 
@@ -582,6 +560,30 @@ function buildGitDiffContextBlock(summary) {
   };
 }
 
+export function buildDailyNotesContextBlock(summary) {
+  if (!summary || !summary.count) return null;
+  const n = Number(summary.count) || 0;
+  if (n <= 0) return null;
+  const entries = Array.isArray(summary.entries) ? summary.entries : [];
+  const lines = entries
+    .map((entry) => {
+      const mode = String(entry?.mode || 'line');
+      const icon = mode === 'karry' ? '🪞' : '📓';
+      const time = String(entry?.time || '--:--');
+      const label = entry?.layer ? `[${entry.layer}]` : mode;
+      const snippet = String(entry?.snippet || entry?.title || '').trim();
+      return `${icon} ${time}｜${label}｜${snippet || '日记已追加'}`;
+    })
+    .filter(Boolean);
+  const text = lines.length > 0
+    ? lines.join('\n')
+    : (n === 1 ? '📓 _日记已追加_' : `📓 _日记已追加 ×${n}_`);
+  return {
+    type: 'context',
+    elements: [{ type: 'mrkdwn', text }],
+  };
+}
+
 // --- Public API ---
 
 /**
@@ -593,19 +595,22 @@ function buildGitDiffContextBlock(summary) {
  */
 export function buildSendPayloads(text, options = {}) {
   const gitDiffSummary = options?.gitDiffSummary;
+  const dailyNotesSummary = options?.dailyNotesSummary;
   const diffOnly = !text && gitDiffSummary?.hasChanges;
-  if (!text && !diffOnly) return [{ text: '(无回复)' }];
   const diffContextBlock = buildGitDiffContextBlock(gitDiffSummary);
-  if (diffOnly) {
-    const blocks = [diffContextBlock];
-    return [{ blocks, text: '改动摘要' }];
+  const dailyNotesContextBlock = buildDailyNotesContextBlock(dailyNotesSummary);
+  const contextBlocks = [diffContextBlock, dailyNotesContextBlock].filter(Boolean);
+  const contextOnly = !text && contextBlocks.length > 0;
+  if (!text && !contextOnly) return [{ text: '(无回复)' }];
+  if (contextOnly) {
+    return [{ blocks: contextBlocks, text: diffOnly ? '改动摘要' : '📓' }];
   }
 
   // Agent explicitly output Block Kit JSON
   const explicit = parseBlockKit(text);
   if (explicit) {
     normalizeBlocksMrkdwn(explicit.blocks);
-    if (diffContextBlock) explicit.blocks.push(diffContextBlock);
+    explicit.blocks.push(...contextBlocks);
     return [{ blocks: explicit.blocks, text: explicit.text }];
   }
 
@@ -624,7 +629,7 @@ export function buildSendPayloads(text, options = {}) {
   const converted = markdownToMrkdwn(withPlaceholders);
 
   // Force blocks mode if we have tables
-  const useBlocks = Boolean(diffContextBlock) || shouldUseBlocks(converted) || tableBlocks.length > 0;
+  const useBlocks = contextBlocks.length > 0 || shouldUseBlocks(converted) || tableBlocks.length > 0;
 
   if (!useBlocks) {
     return [{ text: converted }];
@@ -632,10 +637,12 @@ export function buildSendPayloads(text, options = {}) {
 
   const blocks = buildBlocks(converted, tableBlocks);
   if (blocks.length === 0) {
-    if (diffContextBlock) return [{ blocks: [diffContextBlock], text: buildFallbackText(text) || '改动摘要' }];
+    if (contextBlocks.length > 0) {
+      return [{ blocks: contextBlocks, text: buildFallbackText(text) || (diffOnly ? '改动摘要' : '📓') }];
+    }
     return [{ text: converted }];
   }
-  if (diffContextBlock) blocks.push(diffContextBlock);
+  blocks.push(...contextBlocks);
 
   const fallback = buildFallbackText(text);
   const groups = buildBlockGroups(blocks);
@@ -732,48 +739,6 @@ function normalizeTaskStatus(status, fallback = 'in_progress') {
   return fallback;
 }
 
-function truncateText(text, maxChars) {
-  const normalized = String(text || '').replace(/\s+\n/g, '\n').trim();
-  if (normalized.length <= maxChars) return normalized;
-  return `${normalized.slice(0, maxChars - 3)}...`;
-}
-
-function truncateTaskField(text) {
-  const normalized = String(text || '').replace(/\s+\n/g, '\n').trim();
-  if (normalized.length <= 256) return normalized;
-  return `${normalized.slice(0, 255)}…`;
-}
-
-function mapTodoStatus(status) {
-  if (status === 'completed') return 'complete';
-  if (status === 'in_progress') return 'in_progress';
-  return 'pending';
-}
-
-export function buildPlanSnapshotRows(todos) {
-  if (!Array.isArray(todos)) return [];
-  return todos.map((todo, index) => ({
-    task_id: `todowrite-todo-${index}`,
-    title: truncateTaskField(todo?.content || `Todo ${index + 1}`),
-    status: mapTodoStatus(todo?.status),
-  }));
-}
-
-export function buildPlanSnapshotTitle(todos) {
-  const list = Array.isArray(todos) ? todos : [];
-  const total = list.length;
-  const completed = list.filter((todo) => todo?.status === 'completed').length;
-  const activeTodo = list.find((todo) => todo?.status === 'in_progress');
-
-  if (activeTodo) {
-    return `进度 ${completed}/${total}｜${truncateText(activeTodo.content || '进行中', 40)}`;
-  }
-  if (total > 0 && completed === total) {
-    return `进度 ${total}/${total}｜完成`;
-  }
-  return `进度 ${completed}/${total}`;
-}
-
 export function buildTaskUpdateChunks(taskCardsMap, { updateOnly = false } = {}) {
   return [...(taskCardsMap?.entries?.() || [])].map(([task_id, card]) => {
     const chunk = {
@@ -795,13 +760,11 @@ export function buildTaskUpdateChunks(taskCardsMap, { updateOnly = false } = {})
   }).filter((chunk) => chunk.id);
 }
 
-export function categorizeTool(toolName) {
-  if (/^(Bash|Read|Edit|Write|Grep|Glob|NotebookEdit|WebFetch|WebSearch)$/.test(toolName)) return 'Probe';
-  if (/^(Task|Agent|Skill|mcp__)/.test(toolName)) return 'Delegate';
-  if (toolName === 'summary') return 'Distill';
-  return null;
-}
-
-
+export { buildPlanSnapshotRows, buildPlanSnapshotTitle, categorizeTool };
 
 export { sanitizeErrorText } from '../format-utils.js';
+import {
+  buildPlanSnapshotRows,
+  buildPlanSnapshotTitle,
+  categorizeTool,
+} from '../turn-delivery/task-card-format.js';

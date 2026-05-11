@@ -70,7 +70,7 @@ function aliasRegex(alias) {
   return new RegExp(esc, 'i');
 }
 
-export function inferSlugFromThread(threadHistory) {
+function inferSlugFromThread(threadHistory) {
   if (!threadHistory) return null;
   const firstLine = threadHistory.split('\n')[0] || '';
   const colonIdx = firstLine.indexOf(': ');
@@ -87,7 +87,7 @@ export function inferSlugFromThread(threadHistory) {
   return matched.size === 1 ? [...matched][0] : null;
 }
 
-export function docsToFragments(docs, retrievedAt) {
+function docsToFragments(docs, retrievedAt) {
   return (Array.isArray(docs) ? docs : []).map((d) => {
     const itemId = [d.slug, d.doc_type, d.path || d.title, d.section].filter(Boolean).join('#');
     const content = d.snippet || d.content || '';

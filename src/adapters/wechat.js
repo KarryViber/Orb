@@ -16,41 +16,56 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { createCipheriv, createHash, randomUUID, randomBytes } from 'node:crypto';
 import { info, error as logError, warn } from '../log.js';
-import { buildSendPayloads } from './wechat-format.js';
+import { buildSendPayloads, markdownToWechat } from './wechat-format.js';
 import { PlatformAdapter } from './interface.js';
 import { ORB_PERMISSION_APPROVAL_MODE } from '../runtime-env.js';
+import { splitText } from '../format-utils.js';
 
 const TAG = 'wechat';
 
 // --- iLink API constants ---
 
+// @internal: test-only — exported for unit tests; not part of adapter public API.
 export const ILINK_BASE_URL = 'https://ilinkai.weixin.qq.com';
+// @internal: test-only
 export const WECHAT_CDN_BASE_URL = 'https://novac2c.cdn.weixin.qq.com/c2c';
 const ILINK_APP_ID = 'bot';
 const CHANNEL_VERSION = '2.2.0';
 const ILINK_APP_CLIENT_VERSION = String((2 << 16) | (2 << 8) | 0);
 
 const EP_GET_UPDATES = 'ilink/bot/getupdates';
+// @internal: test-only
 export const EP_SEND_MESSAGE = 'ilink/bot/sendmessage';
 const EP_SEND_TYPING = 'ilink/bot/sendtyping';
 const EP_GET_CONFIG = 'ilink/bot/getconfig';
+// @internal: test-only
 export const EP_GET_UPLOAD_URL = 'ilink/bot/getuploadurl';
 
 const LONG_POLL_TIMEOUT_MS = 35_000;
+// @internal: test-only
 export const API_TIMEOUT_MS = 15_000;
 const CONFIG_TIMEOUT_MS = 10_000;
-export const CDN_UPLOAD_TIMEOUT_MS = 120_000;
+// @internal: test-only
+const CDN_UPLOAD_TIMEOUT_MS = 120_000;
+// @internal: test-only
 export const MAX_UPLOAD_FILE_BYTES = 10 * 1024 * 1024;
 
 const MAX_CONSECUTIVE_FAILURES = 3;
 const RETRY_DELAY_MS = 2_000;
 const BACKOFF_DELAY_MS = 30_000;
+// @internal: test-only
 export const SESSION_EXPIRED_ERRCODE = -14;
 
 const ITEM_TEXT = 1;
-export const ITEM_IMAGE = 2;
-export const MEDIA_IMAGE = 1;
+const CRON_MESSAGE_MAX_CHARS = 1900;
+const CRON_CHUNK_DELAY_MS = 1200;
+// @internal: test-only
+const ITEM_IMAGE = 2;
+// @internal: test-only
+const MEDIA_IMAGE = 1;
+// @internal: test-only
 export const MSG_TYPE_BOT = 2;
+// @internal: test-only
 export const MSG_STATE_FINISH = 2;
 
 function formatApprovalPrompt(prompt) {
@@ -79,6 +94,49 @@ function formatApprovalPrompt(prompt) {
   return String(prompt || '');
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function plainTextFromSlackTextObject(textObject) {
+  if (!textObject || typeof textObject !== 'object') return '';
+  return typeof textObject.text === 'string' ? textObject.text : '';
+}
+
+function cronBlockToMarkdown(block) {
+  if (!block || typeof block !== 'object' || Array.isArray(block)) return '';
+  if ('header' in block || 'body' in block) {
+    return [block.header, block.body].filter((value) => typeof value === 'string' && value.trim()).join('\n');
+  }
+  if (block.type === 'divider') return '---';
+  if (block.type === 'header') return plainTextFromSlackTextObject(block.text);
+  if (block.type === 'section') {
+    const parts = [plainTextFromSlackTextObject(block.text)];
+    if (Array.isArray(block.fields)) parts.push(...block.fields.map(plainTextFromSlackTextObject));
+    return parts.filter(Boolean).join('\n');
+  }
+  if (block.type === 'context' && Array.isArray(block.elements)) {
+    return block.elements.map(plainTextFromSlackTextObject).filter(Boolean).join(' ');
+  }
+  try {
+    return JSON.stringify(block);
+  } catch {
+    return '';
+  }
+}
+
+function renderCronOutputForWechat(output) {
+  const parts = [];
+  if (output?.main) parts.push(output.main);
+  if (output?.thread_md) parts.push(output.thread_md);
+  if (Array.isArray(output?.blocks) && output.blocks.length > 0) {
+    const blockText = output.blocks.map(cronBlockToMarkdown).filter(Boolean).join('\n\n');
+    if (blockText) parts.push(blockText);
+    else warn(TAG, 'cron blocks dropped during WeChat delivery: no text fallback');
+  }
+  return markdownToWechat(parts.filter(Boolean).join('\n\n---\n\n') || '[cron delivery]');
+}
+
 // --- Credential storage ---
 
 function credentialDir() {
@@ -87,7 +145,8 @@ function credentialDir() {
   return dir;
 }
 
-export function loadCredentials(accountId) {
+// @internal: test-only
+function loadCredentials(accountId) {
   const path = join(credentialDir(), `${accountId}.json`);
   if (!existsSync(path)) return null;
   try {
@@ -211,6 +270,7 @@ function buildHeaders(token, bodyStr) {
   return headers;
 }
 
+// @internal: test-only
 export async function apiPost(baseUrl, endpoint, payload, token, timeoutMs) {
   const body = JSON.stringify({ ...payload, base_info: { channel_version: CHANNEL_VERSION } });
   const url = `${baseUrl.replace(/\/$/, '')}/${endpoint}`;
@@ -232,6 +292,7 @@ export async function apiPost(baseUrl, endpoint, payload, token, timeoutMs) {
   }
 }
 
+// @internal: test-only
 export async function cdnUpload(uploadUrl, ciphertext) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), CDN_UPLOAD_TIMEOUT_MS);
@@ -253,23 +314,27 @@ export async function cdnUpload(uploadUrl, ciphertext) {
   }
 }
 
-export function aesPaddedSize(size) {
+// @internal: test-only
+function aesPaddedSize(size) {
   return Math.ceil((size + 1) / 16) * 16;
 }
 
-export function encryptAes128Ecb(plaintext, key) {
+// @internal: test-only
+function encryptAes128Ecb(plaintext, key) {
   const cipher = createCipheriv('aes-128-ecb', key, null);
   cipher.setAutoPadding(true);
   return Buffer.concat([cipher.update(plaintext), cipher.final()]);
 }
 
-export function cdnUploadUrl(cdnBaseUrl, uploadParam, filekey) {
+// @internal: test-only
+function cdnUploadUrl(cdnBaseUrl, uploadParam, filekey) {
   const encodedParam = encodeURIComponent(uploadParam);
   const encodedFilekey = encodeURIComponent(filekey);
   return `${cdnBaseUrl.replace(/\/$/, '')}/upload?encrypted_query_param=${encodedParam}&filekey=${encodedFilekey}`;
 }
 
-export function detectImageMime(buffer) {
+// @internal: test-only
+function detectImageMime(buffer) {
   if (buffer.length >= 8
     && buffer[0] === 0x89
     && buffer[1] === 0x50
@@ -290,6 +355,7 @@ export function detectImageMime(buffer) {
   return '';
 }
 
+// @internal: test-only
 export function assertOkIlinkResponse(resp, operation) {
   const ret = resp?.ret ?? 0;
   const errcode = resp?.errcode ?? 0;
@@ -483,6 +549,22 @@ export class WeChatAdapter extends PlatformAdapter {
     if (finalRet !== 0 || finalErr !== 0) {
       throw new Error(`iLink sendmessage ret=${finalRet} errcode=${finalErr} errmsg=${resp?.errmsg || ''}`);
     }
+    return { ts: clientId };
+  }
+
+  async deliverCronOutput({ channel, threadTs, output }) {
+    const text = renderCronOutputForWechat(output);
+    const chunks = splitText(text, CRON_MESSAGE_MAX_CHARS);
+    let deliveredCount = 0;
+    let firstTs = null;
+    for (let i = 0; i < chunks.length; i += 1) {
+      if (i > 0) await sleep(CRON_CHUNK_DELAY_MS);
+      const chunkText = chunks.length > 1 ? `${chunks[i]}\n（${i + 1}/${chunks.length}）` : chunks[i];
+      const resp = await this.sendReply(channel, threadTs || channel, chunkText);
+      firstTs ||= resp?.ts || null;
+      deliveredCount += 1;
+    }
+    return { ts: firstTs, deliveredCount };
   }
 
   async editMessage() {

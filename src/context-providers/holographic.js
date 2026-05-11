@@ -2,7 +2,7 @@ import { join } from 'node:path';
 import { recallMemory } from '../memory.js';
 import { memoryManifestItem, sha16 } from './interface.js';
 
-export function memoriesToFragments(memories, retrievedAt) {
+function memoriesToFragments(memories, retrievedAt) {
   return (Array.isArray(memories) ? memories : []).map((m) => {
     const itemKind = m.category === 'lesson' ? 'lesson' : 'fact';
     const itemId = m.path || m.file || m.fact_id || m.id || sha16(m.content);

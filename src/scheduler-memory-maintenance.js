@@ -4,8 +4,8 @@ import { info } from './log.js';
 import { purgeTransient, lintMemory } from './memory.js';
 
 const TAG = 'scheduler';
-export const MEMORY_SYNC_THRESHOLD = 20;
-export const MEMORY_SYNC_INTERVAL = 6 * 60 * 60 * 1000;
+const MEMORY_SYNC_THRESHOLD = 20;
+const MEMORY_SYNC_INTERVAL = 6 * 60 * 60 * 1000;
 
 export function checkMemorySync({
   profileName,

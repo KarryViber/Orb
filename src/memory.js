@@ -219,6 +219,7 @@ export async function storeConversation({ userText, responseText, threadTs, user
           category: fact.category || 'conversation',
           tags,
           confidence: fact.confidence || 'default',
+          source: threadTs ? `thread:${threadTs}` : 'unknown',
           source_kind: fact.source_kind || 'extracted',
           source_confidence: fact.source_confidence ?? 0.5,
         },
@@ -236,6 +237,7 @@ export async function storeConversation({ userText, responseText, threadTs, user
         content: condensed,
         category: 'conversation',
         tags,
+        source: threadTs ? `thread:${threadTs}` : 'unknown',
         source_kind: 'inferred',
         source_confidence: 0.6,
       });

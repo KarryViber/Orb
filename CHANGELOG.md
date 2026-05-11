@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.5.0 — Turn Delivery + Context Providers + Cron Delivery Contract (2026-05-11)
+
+This release carries the private 0.5 work into the OSS tree with private paths removed. The big shape change is that per-turn delivery, cron delivery semantics, and context assembly now have clearer module boundaries and documented contracts.
+
+### Highlights
+
+- **Turn delivery refactor.** Worker per-turn delivery orchestration now lives in `src/turn-delivery/`, including orchestrator, intents, ledger, status, text stream, task-card streams, cc-event formatting/subscription, and adapter strategy. Task-card interruption recovery is separated from plan and Qi streams.
+- **Cron delivery contract v2.** Adapter-owned channel rendering replaces the old shell delivery path. `deliver.mode` now supports `silent`, `direct`, `evolution_state`, and `dm_only`, with `cron-protocol` context taking precedence for delivery rules.
+- **Context providers v2.** Added `cron-history`, `cron-protocol`, `channel-meta`, `legacy-attachment`, and `scratchpad` providers alongside the existing context-provider architecture.
+- **Scheduler and worker decomposition.** Scheduler behavior is split across `scheduler/{task-normalizer,turn-lifecycle,worker-runner}` and worker stream parsing/tool-event state moved under `worker/`. Slack adapter behavior is similarly split into thread context, stream client, message router, and approval controller helpers.
+- **AskUserQuestion MVP.** Slack Block Kit cards can carry multi-choice clarification questions, with permission relay support for the interactive path.
+- **DocStore semantic upgrade.** Doc indexing is semantic-first, embedding failures are fail-loud, and wide-mode path mapping is now environment-configured instead of hardcoded.
+
+### New
+
+- `src/context-providers/{cron-history,cron-protocol,channel-meta,legacy-attachment,scratchpad}.js`.
+- `src/turn-delivery/` as the home for per-turn delivery orchestration.
+- `docs/docstore-wide-map.example.json` as a starting point for wide-mode DocStore path mappings.
+- Nine clean system-scope skills under `.claude/skills/`: `adopt-from-external-repo`, `change-blast-radius-check`, `claim-vs-reality-margin`, `debug-audit-on-second-miss`, `fix-claim-acceptance-gate`, `internal-comms`, `opencli`, `theme-factory`, and `vendor-api-param-validation`.
+
+### Changed
+
+- Cron supports `runMode=script` for non-LLM shell execution.
+- Slack stream rotation is proactive at four minutes instead of relying on passive timeout fallback.
+- Slack reactions can map into quick-reply text injection.
+- Worker daily-notes receipts are delivered as small Slack context blocks at the end of each turn.
+- `storeConversation` fact writes moved to per-turn handling and preserve thread source metadata.
+- External Codex launcher completion events can flow back into the worker through Unix socket IPC.
+- SIGTERM drain now synthesizes interruption cc_events for turn delivery.
+- Worker prompt-cache usage telemetry is recorded.
+- Lesson-candidate handling is single-sourced.
+
+### Removed
+
+- `cron-deliver.sh` as the cron delivery owner; adapters now own rendering.
+- Interrupted-runs auto-notify mechanism.
+- Several one-off cc_event subscribers left over from the previous delivery architecture.
+
+### Migration notes
+
+- DocStore wide-mode users should copy `docs/docstore-wide-map.example.json`, adapt the top-level path rules, and point `DOCSTORE_WIDE_MAP_JSON` at the result. `derive_ids_wide` no longer includes organization-specific path mappings.
+- Cron jobs that still call the old shell delivery path should move delivery configuration into `deliver.mode` and adapter-owned fields.
+- Skills now have two layers: profile-scope `profiles/{name}/workspace/.claude/skills/` and system-scope `.claude/skills/` at the repository root, loaded into every worker via `--add-dir`.
+
+---
+
 ## 0.4.0 — Reliability + System-Scope Skills (2026-05-02)
 
 This release is the first hardening pass after 0.3.0's IPC refactor. It lands six batches of reliability fixes against the worker/scheduler boundary, introduces a system-scope skill layer shared across profiles, splits `src/context.js` into pluggable providers, and reshapes the on-disk layout so scripts, tests, and skills are easier to navigate.

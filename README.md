@@ -40,6 +40,14 @@ Claude Code CLI (one worker per thread, cwd = profiles/{name}/workspace/)
 - MCP permission relay that can surface Claude Code approval requests in Slack.
 - Short-lived per-thread workers that reuse the same Claude session for follow-up messages via `inject` IPC.
 
+
+## v0.5 Highlights
+
+- Per-turn delivery is organized under `src/turn-delivery/`, with separate ledgers, stream handling, adapter strategy, and cc_event subscription.
+- Context assembly uses providers for cron history, cron protocol, channel metadata, legacy attachments, scratchpad notes, document recall, memory recall, and thread history.
+- Cron delivery is adapter-owned through `deliver.mode` (`silent`, `direct`, `evolution_state`, `dm_only`) instead of the old shell delivery flow.
+- DocStore wide-mode path inference is configured with `DOCSTORE_WIDE_MAP_JSON`; start from `docs/docstore-wide-map.example.json` for custom repository layouts.
+
 ## Quickstart
 
 Prerequisites:

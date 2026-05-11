@@ -5,7 +5,13 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DB="/tmp/test-evolution-$$.db"
-REAL_DB="$HOME/Orb/profiles/karry/data/memory.db"
+
+if [ -z "${ORB_ROOT:-}" ]; then
+  echo "ORB_ROOT is required and must point to the Orb repository root" >&2
+  exit 1
+fi
+
+REAL_DB="$ORB_ROOT/profiles/${ORB_PROFILE:-example}/data/memory.db"
 
 cleanup() { rm -f "$DB"; }
 trap cleanup EXIT

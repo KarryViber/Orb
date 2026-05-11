@@ -6,8 +6,15 @@ import { createStatusProcessor } from './status.js';
 const TAG = 'turn-delivery-cc-event';
 
 function isSupportedContext(ctx) {
-  const platform = ctx?.platform || ctx?.adapter?.platform || 'slack';
-  return platform === 'slack';
+  const adapter = ctx?.adapter;
+  if (!adapter) return false;
+  return Boolean(
+    adapter.createQiSubscriber
+    || adapter.createPlanSubscriber
+    || adapter.createTextSubscriber
+    || adapter.createStatusSubscriber
+    || adapter.installCcEventSubscriber
+  );
 }
 
 async function safeHandle(name, processor, msg, ctx) {
@@ -42,7 +49,7 @@ export function createTurnDeliveryCcEventSubscriber({
         }
         return;
       }
-      if (!['tool_use', 'text', 'result'].includes(msg.eventType)) return;
+      if (!['tool_use', 'text', 'result', 'summary_snapshot'].includes(msg.eventType)) return;
       if (msg.eventType === 'result') {
         for (const [name, processor] of [['text', text], ['qi', qi], ['plan', plan], ['status', status]]) {
           await safeHandle(name, processor, msg, ctx);

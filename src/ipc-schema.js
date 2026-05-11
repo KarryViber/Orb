@@ -8,6 +8,7 @@ export const IPC_TYPES = {
   INJECT_FAILED: 'inject_failed',
   ERROR: 'error',
   RESULT: 'result',
+  EXTERNAL_SESSION_RESULT: 'external_session_result',
 };
 
 const REQUIRED_FIELDS_BY_TYPE = {
@@ -16,6 +17,7 @@ const REQUIRED_FIELDS_BY_TYPE = {
   [IPC_TYPES.RESULT]: ['channelSemantics'],
   [IPC_TYPES.INJECT_FAILED]: ['userText'],
   [IPC_TYPES.ERROR]: ['error'],
+  [IPC_TYPES.EXTERNAL_SESSION_RESULT]: ['channel', 'thread_ts', 'label', 'rc', 'text'],
 };
 
 function requireFields(payload, fields, factoryName) {
@@ -117,6 +119,7 @@ export function makeTurnComplete(payload = {}) {
     stopReason: normalizeOptional(payload.stopReason),
     channelSemantics: payload.channelSemantics,
     gitDiffSummary: normalizeOptional(payload.gitDiffSummary),
+    dailyNotesSummary: normalizeOptional(payload.dailyNotesSummary),
   };
 }
 
@@ -169,4 +172,34 @@ export function makeResult(payload = {}) {
     exitCode: normalizeOptional(payload.exitCode),
     stderrSummary: normalizeOptional(payload.stderrSummary),
   };
+}
+
+export function makeExternalSessionResult(payload = {}) {
+  requireFields(payload, ['channel', 'thread_ts', 'label', 'rc', 'text'], 'makeExternalSessionResult');
+  return {
+    type: IPC_TYPES.EXTERNAL_SESSION_RESULT,
+    channel: payload.channel,
+    thread_ts: payload.thread_ts,
+    label: payload.label,
+    rc: payload.rc,
+    took_seconds: normalizeOptional(payload.took_seconds),
+    log_path: normalizeOptional(payload.log_path),
+    spec_archived: normalizeOptional(payload.spec_archived),
+    next_spec: normalizeOptional(payload.next_spec),
+    text: payload.text,
+  };
+}
+
+export function validateExternalSessionResult(msg) {
+  const validationError = validateIncomingIpc(msg);
+  if (validationError) return validationError;
+  if (msg.type !== IPC_TYPES.EXTERNAL_SESSION_RESULT) {
+    return `expected ${IPC_TYPES.EXTERNAL_SESSION_RESULT}, got ${msg.type}`;
+  }
+  if (typeof msg.channel !== 'string' || !msg.channel.trim()) return 'external_session_result channel must be non-empty string';
+  if (typeof msg.thread_ts !== 'string' || !msg.thread_ts.trim()) return 'external_session_result thread_ts must be non-empty string';
+  if (typeof msg.label !== 'string' || !msg.label.trim()) return 'external_session_result label must be non-empty string';
+  if (!Number.isInteger(msg.rc)) return 'external_session_result rc must be integer';
+  if (typeof msg.text !== 'string' || !msg.text.trim()) return 'external_session_result text must be non-empty string';
+  return null;
 }

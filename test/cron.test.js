@@ -1,10 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { appendFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { CronScheduler } from '../src/cron.js';
+
+// 防止 postFailDM 在测试中真发 Slack DM（test fixture 'Failing Cron' 会泄漏到 D0ANGB3M1CZ）
+// lineage: thread D0ANGB3M1CZ/1777979683 — Karry 指挥方案 1 止血
+process.env.SLACK_BOT_TOKEN = '';
 
 function createTempDataDir() {
   const root = mkdtempSync(join(tmpdir(), 'orb-cron-'));
@@ -245,6 +249,118 @@ test('cron failed result text is treated as failure without direct delivery', as
   const [job] = readJobs(dataDir);
   assert.equal(job.lastStatus, 'failed');
   assert.equal(job.lastError, 'boom');
+  assert.equal(job.lastDeliveryError, null);
+});
+
+test('cron direct delivery routes through scheduler platform adapter', async () => {
+  const dataDir = createTempDataDir();
+  const calls = [];
+  const adapter = {
+    async sendReply(channel, threadTs, text, extra = {}) {
+      calls.push({ channel, threadTs, text, extra });
+      return { ok: true, ts: '111.222' };
+    },
+  };
+  const scheduler = new CronScheduler({
+    getProfilePaths: () => ({ dataDir, workspaceDir: dataDir, scriptsDir: dataDir }),
+    getProfileNotifyDm: () => 'D0ANGB3M1CZ',
+    scheduler: {
+      adapters: new Map([['slack', adapter]]),
+      executeTask: async () => ({
+        text: '{"status":"ok","main":"direct text","blocks":[{"type":"section","text":{"type":"mrkdwn","text":"block text"}}]}',
+        stopReason: 'success',
+      }),
+    },
+  });
+  scheduler.setProfileNames(['karry']);
+
+  writeJobs(dataDir, [createJob('job-direct', {
+    deliver: { platform: 'slack', channel: 'C123', mode: 'direct', onFailDM: 'D0ANGB3M1CZ' },
+  })]);
+
+  await scheduler.tick();
+  await delay(20);
+  await scheduler._awaitJobWrites(dataDir);
+
+  assert.deepEqual(calls, [
+    { channel: 'C123', threadTs: undefined, text: 'direct text', extra: {} },
+    {
+      channel: 'C123',
+      threadTs: '111.222',
+      text: ' ',
+      extra: { blocks: [{ type: 'section', text: { type: 'mrkdwn', text: 'block text' } }] },
+    },
+  ]);
+  const [job] = readJobs(dataDir);
+  assert.equal(job.lastStatus, 'ok');
+  assert.equal(job.lastDeliveryError, null);
+});
+
+test('cron direct delivery failure persists failed status receipt and delivery lesson kind', async () => {
+  const dataDir = createTempDataDir();
+  const adapter = {
+    async deliverCronOutput() {
+      throw new Error('iLink sendmessage ret=-2 errcode=0 errmsg=rate limited');
+    },
+    async sendReply() {
+      return { ts: 'fail-dm' };
+    },
+  };
+  const scheduler = new CronScheduler({
+    getProfilePaths: () => ({ dataDir, workspaceDir: dataDir, scriptsDir: dataDir }),
+    getProfileNotifyDm: () => 'D0ANGB3M1CZ',
+    scheduler: {
+      adapters: new Map([['wechat', adapter]]),
+      executeTask: async () => ({
+        text: '{"status":"ok","main":"direct text"}',
+        stopReason: 'success',
+      }),
+    },
+  });
+  scheduler.setProfileNames(['karry']);
+
+  writeJobs(dataDir, [createJob('job-delivery-fail', {
+    deliver: { platform: 'wechat', channel: 'wx-invalid', mode: 'direct', onFailDM: 'D0ANGB3M1CZ' },
+  })]);
+
+  await scheduler.tick();
+  await delay(20);
+  await scheduler._awaitJobWrites(dataDir);
+
+  const [job] = readJobs(dataDir);
+  assert.equal(job.lastStatus, 'failed');
+  assert.equal(job.lastError, 'iLink sendmessage ret=-2 errcode=0 errmsg=rate limited');
+  assert.equal(job.lastDeliveryError, 'iLink sendmessage ret=-2 errcode=0 errmsg=rate limited');
+
+  const receiptRoot = join(dataDir, 'cron-receipts');
+  const [receiptDay] = readdirSync(receiptRoot).sort();
+  const receipt = JSON.parse(readFileSync(join(receiptRoot, receiptDay, 'job-delivery-fail.json'), 'utf-8'));
+  assert.equal(receipt.status, 'failed');
+  assert.equal(receipt.error, 'iLink sendmessage ret=-2 errcode=0 errmsg=rate limited');
+
+  const lessonDir = join(dataDir, 'lesson-candidates');
+  const [lessonFile] = readdirSync(lessonDir);
+  const lessonText = readFileSync(join(lessonDir, lessonFile), 'utf-8');
+  assert.match(lessonText, /source: "cron-failure"/);
+  assert.match(lessonText, /failure_kind: "delivery"/);
+});
+
+test('cron output fail protocol is treated as failed status', async () => {
+  const dataDir = createTempDataDir();
+  const scheduler = createScheduler(
+    dataDir,
+    async () => ({ text: '{"status":"fail","error":"test"}', stopReason: 'success' }),
+  );
+
+  writeJobs(dataDir, [createJob('job-output-fail')]);
+
+  await scheduler.tick();
+  await delay(20);
+  await scheduler._awaitJobWrites(dataDir);
+
+  const [job] = readJobs(dataDir);
+  assert.equal(job.lastStatus, 'failed');
+  assert.equal(job.lastError, 'cron-output: test');
   assert.equal(job.lastDeliveryError, null);
 });
 

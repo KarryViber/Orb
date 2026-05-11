@@ -26,10 +26,13 @@ export class PlatformAdapter {
   async startStream(channel, threadTs, options) { return null; }
   async appendStream(streamId, chunks) {}
   async stopStream(streamId, payload) {}
+  async sendAskUserQuestion(payload) { throw new Error("unsupported"); }
+  async updateAskUserQuestionCard(requestId, answers, options) { throw new Error("unsupported"); }
   createQiSubscriber() { return null; }
   createPlanSubscriber() { return null; }
   createTextSubscriber() { return null; }
   createStatusSubscriber() { return null; }
+  clearStatusByContext(context) {}
 
   get botUserId() { throw new Error("not implemented"); }
   get platform() { return "unknown"; }
@@ -44,6 +47,7 @@ Required contract:
 
 - `start` / `disconnect`
 - `sendReply`
+- `deliver(intent, ctx)` — single egress entry point used by `turn-delivery/orchestrator.js`; missing it breaks the whole turn delivery chain
 - `buildPayloads`
 - `cleanupIndicator`
 - `sendApproval`
@@ -58,7 +62,9 @@ Optional capabilities, implemented only by adapters that support the behavior:
 - `uploadFile`: upload generated files
 - `setSuggestedPrompts`: Slack suggested prompts
 - `startStream` / `appendStream` / `stopStream`: task-card streaming
+- `sendAskUserQuestion` / `updateAskUserQuestionCard`: AskUserQuestion approval-card flow (Slack Block Kit)
 - `createQiSubscriber` / `createPlanSubscriber` / `createTextSubscriber` / `createStatusSubscriber`: `cc_event` rendering subscriber factories
+- `clearStatusByContext`: clear adapter-owned status bookkeeping for a thread
 
 ## Method Responsibilities
 

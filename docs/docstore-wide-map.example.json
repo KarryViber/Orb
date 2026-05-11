@@ -1,0 +1,34 @@
+{
+  "rules": [
+    {
+      "match": ["knowledge-base", "projects", "*", "*", "**"],
+      "slug": "{0|registry}",
+      "project_dir": "{0}",
+      "doc_type": "{1|known_project_doc_type:reference}"
+    },
+    {
+      "match": ["knowledge-base", "partners", "*", "**"],
+      "slug": "partners-{0}",
+      "project_dir": "partners/{0}",
+      "doc_type": "reference"
+    },
+    {
+      "match": ["knowledge-base", "reference", "*", "**"],
+      "slug": "{0}",
+      "project_dir": "reference/{0}",
+      "doc_type": "reference"
+    },
+    {
+      "match": ["articles", "04_published", "**"],
+      "slug": "articles",
+      "project_dir": "articles",
+      "doc_type": "published"
+    },
+    {
+      "match": ["articles", "05_archive", "**"],
+      "slug": "articles",
+      "project_dir": "articles",
+      "doc_type": "published"
+    }
+  ]
+}

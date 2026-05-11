@@ -102,7 +102,7 @@ Keep this directory out of git.
 
 Orb has two script layers with different ownership.
 
-Use `~/Orb/scripts/` for runtime utilities that are shared across profiles. Examples include helpers such as `slack-blockkit.py` and delivery/runtime glue such as `cron-deliver.sh`. A script belongs here when it is platform infrastructure, profile-agnostic, or expected to be reused by more than one profile.
+Use `~/Orb/scripts/` for runtime utilities that are shared across profiles. Examples include helpers such as `slack-blockkit.py`, delivery helpers, and workflow automation. Cron delivery itself is configured through `deliver.mode` in each profile's `cron-jobs.json`. A script belongs here when it is platform infrastructure, profile-agnostic, or expected to be reused by more than one profile.
 
 Use `~/Orb/profiles/{name}/scripts/` for profile-private workflows and persona-specific tools. A script belongs here when it encodes one profile's preferences, private automation, local data paths, or one user's workflow shortcuts.
 

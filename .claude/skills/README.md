@@ -1,7 +1,3 @@
-# Orb System-Level Skills
+# System-Scope Skills
 
-Loaded into every Orb worker via `--add-dir ~/Orb` (CLI auto-discovers `.claude/skills/` from add-dir per CC docs).
-
-Cross-profile (karry, eting, future) shared skill pool. Frame-level discipline / debugging / verification / protocol tooling.
-
-See `.claude/skills/_GOVERNANCE.md` section "Skill 分层 scope" for placement rules.
+System-scope skills shared across all profiles. Loaded into every worker via `--add-dir <repo-root>`.

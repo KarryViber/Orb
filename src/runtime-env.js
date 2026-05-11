@@ -1,4 +1,4 @@
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 export function parseIntEnv(value, defaultValue = null) {
@@ -7,13 +7,15 @@ export function parseIntEnv(value, defaultValue = null) {
   return Number.isFinite(parsed) ? parsed : defaultValue;
 }
 
-export function parseFloatEnv(value, defaultValue = null) {
+// @internal: test-only
+function parseFloatEnv(value, defaultValue = null) {
   if (value == null || value === '') return defaultValue;
   const parsed = parseFloat(value);
   return Number.isFinite(parsed) ? parsed : defaultValue;
 }
 
-export function parseBoolEnv(value, defaultValue = false) {
+// @internal: test-only
+function parseBoolEnv(value, defaultValue = false) {
   if (value == null || value === '') return defaultValue;
   const normalized = String(value).trim().toLowerCase();
   if (normalized === '0' || normalized === 'false' || normalized === 'no' || normalized === 'off') return false;
@@ -30,14 +32,17 @@ export const ORB_PERMISSION_TIMEOUT_MS = parseIntEnv(process.env.ORB_PERMISSION_
 export const ORB_WORKER_TIMEOUT_MS = parseIntEnv(process.env.ORB_WORKER_TIMEOUT_MS, 1_800_000);
 export const ORB_PERMISSION_APPROVAL_MODE = parseStringEnv(process.env.ORB_PERMISSION_APPROVAL_MODE, 'auto-allow');
 export const ORB_EVENTBUS_SMOKE_LOG = parseBoolEnv(process.env.ORB_EVENTBUS_SMOKE_LOG, false);
+// @internal: test-only — flag still readable for compatibility but not consumed by current src.
 export const ORB_PROMPT_SOURCE_LABELING = parseBoolEnv(process.env.ORB_PROMPT_SOURCE_LABELING, true);
 export const ORB_PROMPT_TOKEN_BUDGET = parseIntEnv(process.env.ORB_PROMPT_TOKEN_BUDGET, null);
 export const ORB_LEDGER_HYDRATE = parseBoolEnv(process.env.ORB_LEDGER_HYDRATE, true);
 export const ORB_STREAM_TRACE = parseBoolEnv(process.env.ORB_STREAM_TRACE, false);
+export const ORB_STREAM_AUTO_ROTATE = parseBoolEnv(process.env.ORB_STREAM_AUTO_ROTATE, false);
 export const ORB_MEMORY_RECALL_LIMIT = parseIntEnv(process.env.ORB_MEMORY_RECALL_LIMIT, 10);
 export const ORB_MEMORY_MIN_TRUST = parseFloatEnv(process.env.ORB_MEMORY_MIN_TRUST, 0.3);
 export const ORB_DOC_RECALL_LIMIT = parseIntEnv(process.env.ORB_DOC_RECALL_LIMIT, 8);
 export const ORB_MCP_PERMISSION_LOG = parseStringEnv(process.env.ORB_MCP_PERMISSION_LOG, null);
+export const ORB_RUNTIME = parseStringEnv(process.env.ORB_RUNTIME, join(tmpdir(), 'orb-runtime'));
 
 export const MEMORY_ENABLED = parseBoolEnv(process.env.MEMORY_ENABLED, true);
 export const DOC_INDEX_ENABLED = parseBoolEnv(process.env.DOC_INDEX_ENABLED, true);

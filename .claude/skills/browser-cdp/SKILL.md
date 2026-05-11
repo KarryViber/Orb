@@ -60,7 +60,7 @@ with sync_playwright() as p:
 
 | 站点 | URL | 提取方式 | 脚本 |
 |------|-----|---------|------|
-| Lark Messenger | `dyna.sg.larksuite.com/next/messenger` | JS evaluate `__CHAT_MESSAGE_LIST` + DOM `.a11y_feed_card_item` | `lark-playwright-extract.py` |
+| Lark Messenger | `<your-tenant>.larksuite.com/next/messenger` | JS evaluate `__CHAT_MESSAGE_LIST` + DOM `.a11y_feed_card_item` | `lark-playwright-extract.py` |
 | Plaud | `web.plaud.ai` | DOM 解析录音列表 | `plaud-playwright-extract.py` |
 
 ## 操作规范

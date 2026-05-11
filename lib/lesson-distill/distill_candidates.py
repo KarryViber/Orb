@@ -7,7 +7,12 @@ import urllib.request
 from pathlib import Path
 
 import sys as _sys  # noqa: E402
-_sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "cron"))
+ORB_ROOT = os.environ.get("ORB_ROOT")
+if not ORB_ROOT:
+  raise SystemExit("ORB_ROOT is required and must point to the Orb repository root")
+
+_sys.path.insert(0, str(Path(ORB_ROOT) / "scripts" / "cron"))
+import _import_root  # noqa: F401,E402  side effect: register canonical cron paths
 from cron_run_log import RunLog  # noqa: E402
 
 
@@ -36,6 +41,27 @@ def parse_frontmatter(text):
     key, value = line.split(":", 1)
     out[key.strip()] = value.strip().strip('"')
   return out
+
+
+NOISE_INJECT_KEYS = {"userText", "injectId", "origin", "parentAttemptId", "name", "kind"}
+
+
+def is_noise_candidate(meta):
+  """inject-failed candidates carrying only user follow-up text + ids are 系统级噪音：
+  根因（worker session 在用户回复前已 exit）已被 lessons/inject-failed-null.md 覆盖，
+  逐条 errorContext 没有诊断价值。Slack 审批卡只是噪音，直接归档。"""
+  if meta.get("source") != "inject-failed":
+    return False
+  raw = meta.get("errorContext") or ""
+  if not raw:
+    return True
+  try:
+    obj = json.loads(raw.replace("\\\"", "\""))
+  except (json.JSONDecodeError, ValueError):
+    return False
+  if not isinstance(obj, dict):
+    return False
+  return set(obj.keys()).issubset(NOISE_INJECT_KEYS)
 
 
 def build_lesson_text(meta):
@@ -114,10 +140,13 @@ def validate_payload(candidate_path, blocks, text):
   validate_text("candidate path value", value, MAX_BUTTON_VALUE)
 
 
-def slack_post(token, channel, blocks, text):
+def slack_post(token, channel, blocks, text, thread_ts=None):
+  body = {"channel": channel, "text": text, "blocks": blocks}
+  if thread_ts:
+    body["thread_ts"] = thread_ts
   req = urllib.request.Request(
     "https://slack.com/api/chat.postMessage",
-    data=json.dumps({"channel": channel, "text": text, "blocks": blocks}, ensure_ascii=False).encode("utf-8"),
+    data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
     headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"},
     method="POST",
   )
@@ -131,17 +160,12 @@ def slack_post(token, channel, blocks, text):
 
 
 def card(candidate_path, meta, lesson, apply):
-  value = str(candidate_path)
   source = meta.get("source", "unknown")
   cron_name = meta.get("cron_name")
   label = f"`{source}` · {cron_name}" if cron_name else f"`{source}`"
   return [
-    {"type": "section", "text": {"type": "mrkdwn", "text": f"*Lesson candidate* {label}\n{lesson}\n\n*How to apply*\n{apply}"}},
+    {"type": "section", "text": {"type": "mrkdwn", "text": f"*Lesson candidate* {label} · _auto-archived_\n{lesson}\n\n*Context*\n{apply}"}},
     {"type": "context", "elements": [{"type": "mrkdwn", "text": f"`{candidate_path}`"}]},
-    {"type": "actions", "elements": [
-      {"type": "button", "text": {"type": "plain_text", "text": "收录"}, "style": "primary", "action_id": "lesson_candidate_approve", "value": value},
-      {"type": "button", "text": {"type": "plain_text", "text": "丢弃"}, "style": "danger", "action_id": "lesson_candidate_reject", "value": value},
-    ]},
   ]
 
 
@@ -150,30 +174,30 @@ def main():
   parser = argparse.ArgumentParser()
   parser.add_argument("--data-dir", required=True)
   parser.add_argument("--channel", default=os.environ.get("LESSON_DISTILL_CHANNEL"))
-  parser.add_argument("--channel-name", dest="channel_name", help="Slack 频道名（从 config.json profiles.<profile>.channels 反查）")
+  parser.add_argument("--channel-name", dest="channel_name", help="(deprecated) 4 层架构下统一走 evolution_state，无需 channel")
   parser.add_argument("--dry-run", action="store_true")
   args = parser.parse_args()
-  if args.channel_name and args.channel:
-    parser.error("--channel 和 --channel-name 不能同时使用")
-  if args.channel_name:
-    import subprocess
-    args.channel = subprocess.check_output(
-        ["python3", "/Users/karry/Orb/scripts/cron/channels-resolve.py", args.channel_name]
-    ).decode().strip()
-  if not args.channel:
-    args.channel = "CXXXXXXXXXX"  # 兼容旧默认值
 
   candidates = sorted(Path(args.data_dir, "lesson-candidates").glob("*.md"))
-  token = os.environ.get("SLACK_BOT_TOKEN") or os.environ.get("SLACK_TOKEN")
+  archive_dir = Path(args.data_dir, "lesson-candidates", ".archive")
+  archive_dir.mkdir(exist_ok=True)
   processed = 0
-  posted = 0
   failed = 0
+  noise_archived = 0
   first_error = None
+  all_blocks: list[dict] = []
+  approved_paths: list[tuple[Path, str, str, str]] = []  # (path, lesson, apply, original_text)
+
   for path in candidates:
     try:
       text = path.read_text(encoding="utf-8")
       meta = parse_frontmatter(text)
       if meta.get("status") != "pending_review":
+        continue
+      if is_noise_candidate(meta):
+        path.rename(archive_dir / path.name)
+        noise_archived += 1
+        log.add_change("archived_noise", path, "inject-failed-no-diagnostic-info")
         continue
       processed += 1
       lesson, apply = build_lesson_text(meta)
@@ -187,16 +211,10 @@ def main():
         print(json.dumps({"candidate": str(path), "lesson": lesson, "how_to_apply": apply, "blocks": blocks}, ensure_ascii=False))
         continue
 
-      if not token:
-        raise RuntimeError("SLACK_BOT_TOKEN required")
-      result = slack_post(token, args.channel, blocks, fallback)
-      updated = text.replace("status: pending_review", "status: approval_sent", 1)
-      if "## Distilled Lesson" not in updated:
-        updated = updated.rstrip() + f"\n\n## Distilled Lesson\n{lesson}\n\n## How to apply\n{apply}\n"
-      updated += f"\n\n<!-- lesson_distill_slack_ts: {result['ts']} -->\n"
-      path.write_text(updated, encoding="utf-8")
-      log.add_change("updated", path, "status=approval_sent")
-      posted += 1
+      # 收集到批量 blocks（aggregator 会作为 thread reply 单条投递）
+      all_blocks.extend(blocks)
+      all_blocks.append({"type": "divider"})
+      approved_paths.append((path, lesson, apply, text))
     except Exception as err:
       failed += 1
       message = f"{path}: {err}"
@@ -206,8 +224,9 @@ def main():
       print(f"candidate_failed={json.dumps({'candidate': str(path), 'error': str(err)}, ensure_ascii=False)}")
 
   log.add_metric("processed", processed)
-  log.add_metric("posted", posted)
   log.add_metric("failed", failed)
+  log.add_metric("noise_archived", noise_archived)
+
   if args.dry_run:
     print(f"dry_run processed={processed} failed={failed}")
     log.finish("partial" if failed else "ok")
@@ -215,9 +234,47 @@ def main():
       raise SystemExit(1)
     return
 
+  # 写 evolution_state（即使 0 candidate 也写 silent，让 aggregator 知道这个 cron 跑过了）
+  # path 已由模块顶部 _import_root 注入 profile scripts
+  from evolution_state import write_cron_output
+
+  date_md = __import__("datetime").datetime.now().strftime("%m/%d")
+  if approved_paths:
+    # 自进化频道统一标题协议：emoji + 中文名 MM/DD｜2-4 metric · 分隔
+    title = f"🔁 失败蒸馏 {date_md}｜{processed} 候选 · 已归档"
+    if all_blocks and all_blocks[-1].get("type") == "divider":
+      all_blocks.pop()
+    write_cron_output(
+      cron_id="failure-lesson-distill",
+      cron_name="failure-lesson-distill",
+      title=title,
+      blocks=all_blocks,
+      status="failed" if failed else "ok",
+      error=first_error if failed else None,
+      schedule_label="每天 02:30 JST",
+    )
+    # 全权放权 (Karry 2026-05-03): 候选不再发审批卡，处置摘要写进 evolution thread 后直接归档。
+    # 异常模式靠 Orb 在 thread 里回看 + 既有 lesson-monitor / quarterly-review 兜底。
+    for path, lesson, apply, original in approved_paths:
+      updated = original.replace("status: pending_review", "status: auto_archived", 1)
+      if "## Distilled Lesson" not in updated:
+        updated = updated.rstrip() + f"\n\n## Distilled Lesson\n{lesson}\n\n## How to apply\n{apply}\n"
+      updated += f"\n\n<!-- lesson_distill_auto_archived: {date_md} -->\n"
+      path.write_text(updated, encoding="utf-8")
+      path.rename(archive_dir / path.name)
+      log.add_change("auto_archived", path, "status=auto_archived")
+  else:
+    write_cron_output(
+      cron_id="failure-lesson-distill",
+      cron_name="failure-lesson-distill",
+      title=f"🔁 失败蒸馏 {date_md}｜0 候选",
+      status="silent",
+      schedule_label="每天 02:30 JST",
+    )
+
   if failed:
-    print(f"failed: lesson-distill processed={processed} posted={posted} failed={failed}; first_error={first_error}")
-    log.finish("partial" if posted else "failed")
+    print(f"failed: lesson-distill processed={processed} failed={failed}; first_error={first_error}")
+    log.finish("partial" if approved_paths else "failed")
     raise SystemExit(1)
 
   log.finish("ok")

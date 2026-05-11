@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS facts (
     trust_score     REAL DEFAULT 0.5,
     retrieval_count INTEGER DEFAULT 0,
     helpful_count   INTEGER DEFAULT 0,
+    importance      REAL DEFAULT 0.5,
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     hrr_vector      BLOB
@@ -209,6 +210,8 @@ class MemoryStore:
             self._conn.execute("ALTER TABLE facts ADD COLUMN hrr_vector BLOB")
         if "source" not in columns:
             self._conn.execute("ALTER TABLE facts ADD COLUMN source TEXT DEFAULT 'unknown'")
+        if "importance" not in columns:
+            self._conn.execute("ALTER TABLE facts ADD COLUMN importance REAL DEFAULT 0.5")
         # Graphiti-style tombstone columns (additive, rollback-safe)
         if "invalid_at" not in columns:
             self._conn.execute("ALTER TABLE facts ADD COLUMN invalid_at TIMESTAMP")
@@ -256,6 +259,7 @@ class MemoryStore:
         confidence: str = "default",
         source_kind: str = "extracted",
         confidence_score: float | None = None,
+        importance: float = 0.5,
     ) -> int:
         """Insert a fact and return its fact_id.
 
@@ -281,6 +285,7 @@ class MemoryStore:
                     "speculative": 0.2,
                 }.get(confidence, 0.5)
             confidence_score = max(0.0, min(1.0, float(confidence_score)))
+            importance = max(0.0, min(1.0, float(importance)))
 
             duplicate = self._conn.execute(
                 "SELECT fact_id FROM facts WHERE content = ?", (content,)
@@ -327,11 +332,11 @@ class MemoryStore:
                     """
                     INSERT INTO facts (
                         content, category, tags, source_kind, confidence,
-                        trust_score, source, trust_frozen
+                        trust_score, source, trust_frozen, importance
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
                     """,
-                    (content, category, tags, source_kind, confidence_score, trust_score, source),
+                    (content, category, tags, source_kind, confidence_score, trust_score, source, importance),
                 )
                 self._conn.commit()
                 fact_id: int = cur.lastrowid  # type: ignore[assignment]

@@ -22,7 +22,7 @@ export const TURN_DELIVERY_INTENTS = new Set([
   RECEIPT_SILENT_SUPPRESSED,
 ]);
 
-export const TURN_DELIVERY_CHANNELS = new Set(['stream', 'postMessage', 'edit', 'metadata', 'silent']);
+const TURN_DELIVERY_CHANNELS = new Set(['stream', 'postMessage', 'edit', 'metadata', 'silent']);
 
 /**
  * @typedef {Object} TurnDeliveryRecord

@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { resolve, relative, isAbsolute, normalize } from 'node:path';
+import { parseToolInput } from './worker/tool-event-state.js';
 
 const GIT_DIFF_TIMEOUT_MS = 2_000;
 const GIT_DIFF_MAX_FILES = 20;
@@ -8,6 +9,16 @@ const FILE_MODIFYING_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdi
 
 export function isFileModifyingTool(toolName) {
   return FILE_MODIFYING_TOOLS.has(toolName);
+}
+
+export function recordModifiedPathFromToolUse(toolUse, modifiedPaths = new Set()) {
+  const toolName = toolUse?.name;
+  if (!isFileModifyingTool(toolName)) return false;
+  const input = parseToolInput(toolUse?.input);
+  const filePath = toolName === 'NotebookEdit' ? input?.notebook_path : input?.file_path;
+  if (!filePath || typeof filePath !== 'string') return false;
+  modifiedPaths.add(filePath);
+  return true;
 }
 
 function runGit(args, cwd) {

@@ -1,3 +1,10 @@
+import {
+  buildPlanSnapshotRows,
+  buildPlanSnapshotTitle,
+  categorizeTool,
+  truncateText,
+} from './task-card-format.js';
+
 const QI_INITIAL_CHUNKS = [
   { type: 'plan_update', title: 'Orbiting...' },
   { type: 'task_update', id: 'qi-exec', title: 'Probe', status: 'in_progress', details: '' },
@@ -11,28 +18,9 @@ const QI_TASK_IDS = {
   Distill: 'qi-summary',
 };
 
-function truncateText(text, max = 256) {
-  const normalized = String(text || '').replace(/\s+/g, ' ').trim();
-  return normalized.length <= max ? normalized : `${normalized.slice(0, max - 1)}...`;
-}
-
-function truncateTaskField(text) {
-  const normalized = String(text || '').replace(/\s+\n/g, '\n').trim();
-  if (normalized.length <= 256) return normalized;
-  return `${normalized.slice(0, 255)}...`;
-}
-
-function mapTodoStatus(status) {
-  if (status === 'completed') return 'complete';
-  if (status === 'in_progress') return 'in_progress';
-  return 'pending';
-}
-
-export function categorizeTool(toolName) {
-  if (/^(Bash|Read|Edit|Write|Grep|Glob|NotebookEdit|WebFetch|WebSearch)$/.test(toolName)) return 'Probe';
-  if (/^(Task|Agent|Skill|mcp__)/.test(toolName)) return 'Delegate';
-  if (toolName === 'summary') return 'Distill';
-  return null;
+export function buildInterruptedTitle(stopReason) {
+  const reason = String(stopReason || 'unknown').trim() || 'unknown';
+  return `⚠️ 已中断（${reason}）· 发「继续」续接`;
 }
 
 export function summarizeQiInput(input) {
@@ -50,7 +38,8 @@ export function summarizeQiInput(input) {
 export function buildQiToolLine(payload) {
   const name = payload?.name || 'Tool';
   const summary = summarizeQiInput(payload?.input);
-  return truncateText(summary ? `${name}: ${summary}` : name);
+  // 254 = 256 - 2 (\n wrapper in buildQiToolChunks).
+  return truncateText(summary ? `${name}: ${summary}` : name, 254);
 }
 
 export function buildStatusText(payload) {
@@ -102,28 +91,17 @@ export function buildQiSettledChunks(toolCount = 0, reason = '') {
   ];
 }
 
-export function buildPlanSnapshotRows(todos) {
-  if (!Array.isArray(todos)) return [];
-  return todos.map((todo, index) => ({
-    task_id: `todowrite-todo-${index}`,
-    title: truncateTaskField(todo?.content || `Todo ${index + 1}`),
-    status: mapTodoStatus(todo?.status),
-  }));
+export function buildQiInterruptedChunks(toolCount = 0, stopReason = '') {
+  const count = Number.isFinite(Number(toolCount)) ? Number(toolCount) : 0;
+  const reason = String(stopReason || 'unknown').trim() || 'unknown';
+  return [
+    { type: 'plan_update', title: buildInterruptedTitle(reason) },
+    { type: 'task_update', id: 'qi-summary', title: 'Distill', status: 'error', details: `Interrupted after ${count} probes: ${reason}` },
+  ];
 }
 
-export function buildPlanSnapshotTitle(todos) {
-  const list = Array.isArray(todos) ? todos : [];
-  const total = list.length;
-  const completed = list.filter((todo) => todo?.status === 'completed').length;
-  const activeTodo = list.find((todo) => todo?.status === 'in_progress');
-
-  if (activeTodo) {
-    return `进度 ${completed}/${total}｜${truncateText(activeTodo.content || '进行中', 40)}`;
-  }
-  if (total > 0 && completed === total) {
-    return `进度 ${total}/${total}｜完成`;
-  }
-  return `进度 ${completed}/${total}`;
+export function buildPlanInterruptedChunks(stopReason = '') {
+  return [{ type: 'plan_update', title: buildInterruptedTitle(stopReason) }];
 }
 
 export function buildPlanSnapshotChunks(todos) {
@@ -139,3 +117,5 @@ export function buildPlanSnapshotChunks(todos) {
     })),
   ];
 }
+
+export { buildPlanSnapshotRows, buildPlanSnapshotTitle, categorizeTool };
