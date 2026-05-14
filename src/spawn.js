@@ -40,7 +40,13 @@ export function createSerializedMessageHandler({ label, onMessage, onToolCall })
 export function spawnWorker({ task, timeout = 600_000, label, onMessage, onExit }) {
   const worker = fork(WORKER_PATH, [], {
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
-    env: { ...process.env, ORB_WORKER: '1', ENABLE_PROMPT_CACHING_1H: '1' },
+    env: {
+      ...process.env,
+      ORB_WORKER: '1',
+      ENABLE_PROMPT_CACHING_1H: '1',
+      ...(task?.threadTs  ? { ORB_THREAD_TS:  String(task.threadTs)  } : {}),
+      ...(task?.attemptId ? { ORB_ATTEMPT_ID: String(task.attemptId) } : {}),
+    },
   });
 
   // stdout/stderr → log (sanitize to avoid leaking tokens)
@@ -70,7 +76,11 @@ export function spawnWorker({ task, timeout = 600_000, label, onMessage, onExit 
 
   worker.on('exit', (code, signal) => {
     clearTimeout(timer);
-    onExit(code, signal);
+    Promise.resolve()
+      .then(() => onExit(code, signal))
+      .catch((err) => {
+        logError(TAG, `[${label}] onExit error code=${code} signal=${signal}: ${err?.stack || err}`);
+      });
   });
 
   // Send task — kill worker if IPC send fails (#16)

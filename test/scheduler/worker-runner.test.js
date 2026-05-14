@@ -55,7 +55,7 @@ function createScheduler(script) {
       return { worker };
     },
   });
-  scheduler.addAdapter('slack', adapter);
+  scheduler.setAdapter(adapter);
   return { scheduler, adapter, calls };
 }
 
@@ -130,7 +130,7 @@ test('inject_failed smoke respawns through queued replay path', async () => {
   assert.equal(calls[1].opts.task.userText, 'replay me');
 });
 
-test('turn_complete sends context-only receipt when final text is empty', async () => {
+test('turn_complete does not deliver summary-only receipt when final text is empty', async () => {
   const { scheduler, adapter } = createScheduler(async (opts) => {
     await opts.onMessage({ type: 'turn_start', turnId: 'turn-receipt', attemptId: 'attempt-receipt' });
     await opts.onMessage({
@@ -154,9 +154,5 @@ test('turn_complete sends context-only receipt when final text is empty', async 
     platform: 'slack',
   });
 
-  assert.equal(adapter.deliveries.length, 1);
-  assert.equal(adapter.deliveries[0].intent, 'assistant_text.final');
-  assert.equal(adapter.deliveries[0].text, '');
-  assert.equal(adapter.deliveries[0].meta.contextOnly, true);
-  assert.deepEqual(adapter.deliveries[0].meta.dailyNotesSummary, { count: 1 });
+  assert.equal(adapter.deliveries.length, 0);
 });

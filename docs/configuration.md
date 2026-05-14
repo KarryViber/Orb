@@ -33,13 +33,6 @@ Environment variable interpolation is exact-match only:
       "replyBroadcast": false,
       "freeResponseChannels": ["C0123456789"],
       "freeResponseUsers": ["U0123456789"]
-    },
-    "wechat": {
-      "enabled": false,
-      "accountId": "${WECHAT_ACCOUNT_ID}",
-      "token": "${WECHAT_TOKEN}",
-      "dmPolicy": "allowlist",
-      "allowedUsers": []
     }
   },
   "profiles": {
@@ -83,7 +76,6 @@ Environment variable interpolation is exact-match only:
 - `adapters.slack.freeResponseChannels`
 - `adapters.slack.freeResponseUsers`
 - `adapters.slack.dmRouting`
-- `adapters.wechat.*`
 - `scheduler.maxWorkers`
 - `scheduler.timeoutMs`
 
@@ -96,7 +88,6 @@ Object keyed by adapter name.
 Currently read by `src/main.js`:
 
 - `slack`
-- `wechat`
 
 An adapter only starts when `enabled` is truthy.
 

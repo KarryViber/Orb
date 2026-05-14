@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createMessageRouter } from '../../../src/adapters/slack/message-router.js';
 
-function makeRouter({ dmRouting = null, onMessage = () => {}, onReaction = () => {}, replies } = {}) {
+function makeRouter({ dmRouting = null, onMessage = () => {}, onReaction = () => {}, replies, ignoredChannels = new Set() } = {}) {
   const posts = [];
   const threadContext = {
     _isDuplicate: () => false,
@@ -29,6 +29,7 @@ function makeRouter({ dmRouting = null, onMessage = () => {}, onReaction = () =>
       },
     },
     allowBots: 'none',
+    ignoredChannels,
     freeResponseChannels: new Set(),
     freeResponseUsers: new Set(),
     dmRouting,
@@ -44,9 +45,9 @@ function makeRouter({ dmRouting = null, onMessage = () => {}, onReaction = () =>
   return { router, posts };
 }
 
-test('message router ignores unmentioned channel messages', async () => {
+test('message router ignores configured ignored channel messages', async () => {
   let called = false;
-  const { router } = makeRouter({ onMessage: () => { called = true; } });
+  const { router } = makeRouter({ ignoredChannels: new Set(['C1']), onMessage: () => { called = true; } });
   await router._handleMessage({ event: { channel: 'C1', user: 'U1', text: 'hello', ts: '1' }, ack: async () => {} });
   assert.equal(called, false);
 });

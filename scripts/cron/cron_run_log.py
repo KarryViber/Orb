@@ -14,7 +14,7 @@ JST = timezone.utc
 
 
 def _default_run_dir() -> Path:
-    return Path(os.path.expanduser("~/Orb/profiles/karry/data/cron-runs"))
+    return Path(os.path.expanduser("~/Orb/profiles/<your-profile>/data/cron/runs"))
 
 
 class RunLog:

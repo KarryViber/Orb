@@ -41,17 +41,6 @@ function getTaskCardStreamErrorCode(err) {
   const match = String(err.message || '').match(/chat\.(?:start|append|stop)Stream failed: ([a-z_]+)/);
   return match?.[1] || null;
 }
-function hasReceiptSummary(msg) {
-  return Boolean(msg?.dailyNotesSummary?.count > 0 || msg?.gitDiffSummary?.hasChanges);
-}
-function hasReceiptSummaryInStream(orchestrator, turnId) {
-  const records = orchestrator?.ledger?.getRecordsForTurn?.(turnId) || [];
-  return records.some((record) => (
-    record?.deliveryChannel === 'stream'
-    && record?.intent === 'task_progress.stop'
-    && (record?.meta?.dailyNotesSummary?.count > 0 || record?.meta?.gitDiffSummary?.hasChanges)
-  ));
-}
 async function emitEphemeralControlPlane({ adapter, channel, threadTs, platform, text, source = 'scheduler.control_plane' }) {
   const orchestrator = new TurnDeliveryOrchestrator({ adapter, logger: (line) => warn(TAG, line) });
   const turnId = makeTurnId({ threadTs, attemptId: `control-${Date.now()}` });
@@ -314,33 +303,6 @@ export async function runWorkerForTask(task, { scheduler }) {
         text,
         source,
         meta,
-      });
-      if (result.delivered) userVisibleDeliveryObserved = true;
-      return result;
-    };
-
-    const emitReceiptContextFallback = async ({ msg, source, meta = {} }) => {
-      if (!hasReceiptSummary(msg)) return { delivered: false, reason: 'no-receipt-summary' };
-      const turnId = makeTurnId({ turnId: msg?.turnId || currentCcTurnId, threadTs, attemptId: msg?.attemptId || task.attemptId });
-      if (hasReceiptSummaryInStream(orchestrator, turnId)) {
-        return { delivered: false, reason: 'receipt-summary-already-streamed' };
-      }
-      const result = await orchestrator.emit({
-        turnId,
-        attemptId: msg?.attemptId || task.attemptId || '',
-        channel,
-        threadTs: effectiveThreadTs,
-        platform,
-        channelSemantics: normalizeChannelSemantics(msg?.channelSemantics ?? channelSemantics),
-        intent: ASSISTANT_TEXT_FINAL,
-        text: '',
-        source,
-        meta: {
-          ...meta,
-          gitDiffSummary: msg.gitDiffSummary || null,
-          dailyNotesSummary: msg.dailyNotesSummary || null,
-          contextOnly: true,
-        },
       });
       if (result.delivered) userVisibleDeliveryObserved = true;
       return result;
@@ -751,16 +713,11 @@ export async function runWorkerForTask(task, { scheduler }) {
                   msg,
                   source: 'scheduler.turn_complete',
                   meta: {
+                    // Routing metadata only; not rendered to Slack since 2026-05-14.
                     gitDiffSummary: msg.gitDiffSummary || null,
                     dailyNotesSummary: msg.dailyNotesSummary || null,
                     deferred: deferDeliveryUntilResult,
                   },
-                });
-              } else if (hasReceiptSummary(msg)) {
-                await emitReceiptContextFallback({
-                  msg,
-                  source: 'scheduler.turn_complete.context_only',
-                  meta: { stopReason: msg.stopReason || null, deferred: deferDeliveryUntilResult },
                 });
               } else if (metadataText?.trim()) {
                 userVisibleDeliveryObserved = true;
@@ -788,16 +745,11 @@ export async function runWorkerForTask(task, { scheduler }) {
                   msg,
                   source: 'scheduler.fallback',
                   meta: {
+                    // Routing metadata only; not rendered to Slack since 2026-05-14.
                     gitDiffSummary: msg.gitDiffSummary || null,
                     dailyNotesSummary: msg.dailyNotesSummary || null,
                     deferred: deferDeliveryUntilResult,
                   },
-                });
-              } else if (hasReceiptSummary(msg)) {
-                await emitReceiptContextFallback({
-                  msg,
-                  source: 'scheduler.fallback.context_only',
-                  meta: { stopReason: msg.stopReason || null, deferred: deferDeliveryUntilResult },
                 });
               } else if (metadataText?.trim()) {
                 userVisibleDeliveryObserved = true;

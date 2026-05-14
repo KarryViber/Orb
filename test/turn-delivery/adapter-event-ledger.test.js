@@ -81,7 +81,7 @@ test('SlackAdapter sendApproval ignores adapter event ledger failures', async ()
 
 test('scheduler rejects adapters without deliver implementation', () => {
   const scheduler = new Scheduler({ getProfile: () => ({ name: 'test' }), startPermissionServer: false });
-  assert.throws(() => scheduler.addAdapter('slack', {}), /adapter must implement deliver\(\)/);
+  assert.throws(() => scheduler.setAdapter({}), /adapter must implement deliver\(\)/);
 });
 
 test('scheduler no longer contains delivery adapter wrapper', () => {

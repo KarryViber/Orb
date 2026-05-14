@@ -3,7 +3,6 @@ import { closeSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { SlackAdapter } from './adapters/slack.js';
-import { WeChatAdapter } from './adapters/wechat.js';
 import { Scheduler } from './scheduler.js';
 import { CronScheduler } from './cron.js';
 import { loadConfig, resolveProfile, resolveProfilePaths } from './config.js';
@@ -67,50 +66,24 @@ function acquireDaemonLock() {
   }
 }
 
-async function buildAdapters(enabledAdapters, scheduler, getProfile) {
-  for (const [name, adapterConfig] of enabledAdapters) {
-    if (name === 'slack') {
-      if (!adapterConfig.botToken || !adapterConfig.appToken) {
-        logError(TAG, 'slack adapter: missing botToken or appToken');
-        process.exit(1);
-      }
-
-      const adapter = new SlackAdapter({
-        botToken: adapterConfig.botToken,
-        appToken: adapterConfig.appToken,
-        allowBots: adapterConfig.allowBots || 'none',
-        replyBroadcast: adapterConfig.replyBroadcast || false,
-        freeResponseChannels: new Set(adapterConfig.freeResponseChannels || []),
-        freeResponseUsers: new Set(adapterConfig.freeResponseUsers || []),
-        dmRouting: adapterConfig.dmRouting || null,
-        getProfilePaths: getProfile,
-      });
-
-      scheduler.addAdapter(name, adapter);
-      adapter.onReaction = (task) => scheduler.submit(task);
-      await adapter.start((task) => scheduler.submit(task), null);
-      info(TAG, `adapter started: ${name}`);
-    }
-    else if (name === 'wechat') {
-      if (!adapterConfig.accountId) {
-        logError(TAG, 'wechat adapter: missing accountId — run `node scripts/wechat-setup.js` first');
-        continue;
-      }
-
-      const adapter = new WeChatAdapter({
-        accountId: adapterConfig.accountId,
-        token: adapterConfig.token || '',
-        baseUrl: adapterConfig.baseUrl || undefined,
-        dmPolicy: adapterConfig.dmPolicy || 'allowlist',
-        allowedUsers: adapterConfig.allowedUsers || [],
-        sendChunkDelayMs: adapterConfig.sendChunkDelayMs ?? 350,
-      });
-
-      scheduler.addAdapter(name, adapter);
-      await adapter.start((task) => scheduler.submit(task));
-      info(TAG, `adapter started: ${name}`);
-    }
+async function startSlackAdapter(slackCfg, scheduler, getProfile) {
+  if (!slackCfg.botToken || !slackCfg.appToken) {
+    logError(TAG, 'slack adapter: missing botToken or appToken');
+    process.exit(1);
   }
+  const adapter = new SlackAdapter({
+    botToken: slackCfg.botToken,
+    appToken: slackCfg.appToken,
+    allowBots: slackCfg.allowBots || 'none',
+    replyBroadcast: slackCfg.replyBroadcast || false,
+    ignoredChannels: new Set(slackCfg.ignoredChannels || []),
+    dmRouting: slackCfg.dmRouting || null,
+    getProfilePaths: getProfile,
+  });
+  scheduler.setAdapter(adapter);
+  adapter.onReaction = (task) => scheduler.submit(task);
+  await adapter.start((task) => scheduler.submit(task), null);
+  info(TAG, 'adapter started: slack');
 }
 
 function installSignalHandlers({ scheduler, cronScheduler, reload }) {
@@ -141,9 +114,9 @@ async function start() {
   }
   info(TAG, `profiles: ${Object.keys(config.profiles).join(', ')}`);
 
-  const enabledAdapters = Object.entries(config.adapters || {}).filter(([, v]) => v.enabled);
-  if (enabledAdapters.length === 0) {
-    logError(TAG, 'no adapters enabled in config.json');
+  const slackCfg = config.adapters?.slack;
+  if (!slackCfg?.enabled) {
+    logError(TAG, 'slack adapter not enabled in config.json');
     process.exit(1);
   }
 
@@ -156,7 +129,7 @@ async function start() {
     getProfile,
   });
 
-  await buildAdapters(enabledAdapters, scheduler, getProfile);
+  await startSlackAdapter(slackCfg, scheduler, getProfile);
 
   const cronScheduler = new CronScheduler({
     getProfilePaths: (profileName) => {
@@ -172,7 +145,7 @@ async function start() {
 
   installSignalHandlers({ scheduler, cronScheduler, reload: () => loadConfig(true) });
 
-  info(TAG, `Orb started with ${enabledAdapters.length} adapter(s), ${Object.keys(config.profiles).length} profile(s)`);
+  info(TAG, `Orb started with slack adapter, ${Object.keys(config.profiles).length} profile(s)`);
 
   const HEARTBEAT_INTERVAL = 30 * 60 * 1000;
   setInterval(async () => {

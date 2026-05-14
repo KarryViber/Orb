@@ -1,5 +1,60 @@
 # Changelog
 
+## 0.6.0 — Self-Curation + Single-Adapter Consolidation (2026-05-14)
+
+This release narrows the platform surface and turns the self-evolution loop from a single monolithic cron into a three-stage pipeline. The big shape changes are that the multi-platform adapter abstraction collapses to a single Slack instance, the `CLAUDE.md` prompt layering grows from three layers to four with framework-wide rules moving to `profiles/CLAUDE.md`, and self-curation jobs (lesson lifecycle, skill evolution, narration audit, memory freshness, permission-blocker scan) reorganize around a shared mechanical/LLM/render split.
+
+External agent behavior is unchanged for Slack DM and thread flows. Operators of WeChat deployments must migrate off — see Migration notes.
+
+### Highlights
+
+- **Single-adapter consolidation.** The `PlatformAdapter` registry collapses to a single Slack instance. WeChat adapter, the iLink CDN bridge, and capability-driven `supportsInteractiveApproval` branches are removed. The platform abstraction stays — it now describes one adapter cleanly rather than two adapters at different completeness tiers.
+- **Self-evolution cron split into A/B/C.** The `Orb 自进化` cron is refactored into three stages: **A — mechanical** (deterministic data gathering, no LLM), **B — single-pass LLM** (one reasoning pass over the A bundle), **C — render** (deterministic card formatting). Each stage owns one failure mode and one model budget. Step 2.5 (daily-notes semantic compression), Step 2.7 (`关于 Karry` signal coverage audit), and Step 4b (architecture-review section) are explicit stages instead of free-form prompt sections.
+- **Lesson lifecycle automation.** Lesson distill, narration-audit, candidate auto-classify (new vs. merge), and weekly seed-landing approval all share one canonical cron-narration-audit pass at 02:20 JST. Lesson similarity comparison swaps Jaccard for a Haiku-judged LLM call — short text where token cost is acceptable and Jaccard mis-clusters frequently.
+- **Four-layer CLAUDE.md prompt architecture.** Prompt layering grows from three layers to four: `~/.claude/CLAUDE.md` (user-private global) / `~/Orb/CLAUDE.md` (project root) / `~/Orb/profiles/CLAUDE.md` (system-level framework rules, auto-loaded by cwd walk-up) / `profiles/{name}/workspace/CLAUDE.md` (profile-specific). Framework-level engineering practice and runtime constraints moved up from `~/.claude/CLAUDE.md` into `profiles/CLAUDE.md` so all profiles inherit them without duplication. `AGENTS.md` renamed back to `CLAUDE.md` at the project root.
+- **Slack signal-to-noise rebalance.** Auto-context injection (per-turn `git diff` summary + daily-notes receipt) is now opt-in via `ORB_SLACK_AUTO_CONTEXT=1` rather than always-on. Proactive stream rotation at 4 minutes is the default (`ORB_STREAM_AUTO_ROTATE=1`). Daily-notes receipts render as small Slack context blocks; thread-history extraction whitelists the receipt block so it does not pollute future turn context. Reaction map collapsed to six canonical reactions aligned with the `reaction-action-protocol` skill.
+- **Memory freshness + permission-blocker scan.** Two `holaOS` ideas land: holographic facts carry a `freshness_state` (fresh / stale / archived) updated by usage instrumentation, and a permission-blocker scan surfaces repeated approval friction as a self-evolution signal instead of dropping it on the floor.
+
+### New
+
+- `src/cron/orb-evolution/{stage-a,stage-b,stage-c}.js` — three-stage self-evolution pipeline.
+- `src/cron/cron-narration-audit.js` — single canonical narration audit feeding lesson-lifecycle distill.
+- `scripts/prompts/orb-evolution.md` — the LLM prompt for stage B, extracted from inline `cron-jobs.json`.
+- `seed-landing-weekly` cron — weekly approval card sweep for accepted seeds awaiting landing.
+- `silent-cron-audit` cron — flags cron jobs whose recent runs were silent without `channelSemantics: silent` declared.
+- `permission-blocker-scan` cron — surfaces repeated approval friction as evolution signal.
+- `worker-env: ORB_THREAD_TS / ORB_ATTEMPT_ID` — worker subprocess inherits these env vars for in-script Slack ops.
+- `src/cron/cron-runtime/run-mode-script.js` (carried from 0.5) is now the foundation for cron-narration-audit and other shell-only cron jobs.
+
+### Changed
+
+- `task-normalizer`: when worker effort escalates (e.g. `--effort xhigh`), the model also auto-upgrades to `opus`. Previously effort and model were independent dials.
+- `context.js`: goal-hint injection for multi-step user requests moved out of regex-in-context into the `execution-discipline` skill.
+- `slack-stream`: fallback text changed to `"Orbiting..."` so the stream placeholder reads as the bot identity rather than a generic working indicator.
+- `slack-stream`: proactive 4-minute rotate is now the default. Passive 5-minute fallback remains as a safety net.
+- `auto-memory-audit`: new `--auto-archive` flag physically archives cite=0 stale candidates instead of just flagging them.
+- `summary` event fields on Slack messages are routing-only metadata. Rendering paths that consumed them are removed; downstream consumers should read the explicit Block Kit blocks.
+- `skill-evolution`: similarity comparison upgraded from Jaccard to LLM judge (Haiku). The Jaccard implementation is removed.
+- `codex-launcher`: external Codex sessions now route IPC inject results back into the worker on completion (Unix socket), so the worker can observe `external_session_result` and decide next action instead of polling.
+
+### Removed
+
+- `src/adapters/wechat.js` and the WeChat iLink CDN bridge (`wechat-upload-helpers.js`, `wechat-cli-bridge.py`, related tests).
+- `PlatformAdapter.supportsInteractiveApproval` capability flag and the non-interactive WeChat permission JSON renderer.
+- Multi-platform registry indirection in `src/scheduler.js`; adapter list is a single Slack instance.
+- Jaccard-based lesson similarity comparison.
+- Inline `Orb 自进化` prompt body inside `cron-jobs.json` (moved to `scripts/prompts/orb-evolution.md`).
+- `coding-agent-workflow` L1 (single-agent) guidance — folded into L2 selection rules.
+
+### Migration notes
+
+- **WeChat operators** must move to Slack or fork the 0.5 line. The WeChat adapter and its iLink CDN upload helpers are removed; there is no in-tree replacement.
+- **Prompt layering**: if you maintained framework-level engineering rules in `~/.claude/CLAUDE.md`, the recommended home is now `~/Orb/profiles/CLAUDE.md` so every profile picks them up via cwd walk-up. `~/.claude/CLAUDE.md` remains private per user-account.
+- **Slack auto-context**: per-turn `git diff` blocks and daily-notes receipts are off by default. Set `ORB_SLACK_AUTO_CONTEXT=1` in the environment to restore the 0.5 behavior.
+- **`cron-jobs.json` `Orb 自进化` entry**: the inline prompt has moved to `scripts/prompts/orb-evolution.md`. Existing jobs continue to work because cron reads the prompt-file pointer through the same field; only edit the file path if you maintain a fork.
+
+---
+
 ## 0.5.0 — Turn Delivery + Context Providers + Cron Delivery Contract (2026-05-11)
 
 This release carries the private 0.5 work into the OSS tree with private paths removed. The big shape change is that per-turn delivery, cron delivery semantics, and context assembly now have clearer module boundaries and documented contracts.

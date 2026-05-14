@@ -99,6 +99,9 @@ class FactRetriever:
             # Trust weighting
             score = fact["trust_score"] * self._source_kind_weight(fact.get("source_kind"))
 
+            # Freshness weighting
+            score *= self._freshness_multiplier(fact)
+
             # Optional temporal decay
             if self.half_life > 0:
                 score *= self._temporal_decay(fact.get("updated_at") or fact.get("created_at"))
@@ -121,6 +124,23 @@ class FactRetriever:
         # Strip raw HRR bytes — callers expect JSON-serializable dicts
         for fact in results:
             fact.pop("hrr_vector", None)
+
+        # Access feedback: bump retrieval_count + small trust boost for returned facts.
+        # Closes the loop that store.fts_search() updates but _fts_candidates() bypasses.
+        if results:
+            fact_ids = [f["fact_id"] for f in results]
+            placeholders = ",".join("?" * len(fact_ids))
+            conn = self.store._conn
+            with conn:
+                conn.execute(
+                    f"UPDATE facts SET retrieval_count = retrieval_count + 1,"
+                    f" trust_score = MIN(trust_score + 0.01, 0.9),"
+                    f" freshness_state = 'fresh',"
+                    f" updated_at = datetime('now')"
+                    f" WHERE fact_id IN ({placeholders})",
+                    fact_ids,
+                )
+
         return results
 
     def session_search(
@@ -660,6 +680,32 @@ class FactRetriever:
             return 0.7
         if source_kind == "ambiguous":
             return 0.4
+        return 1.0
+
+    @staticmethod
+    def _freshness_multiplier(fact: dict) -> float:
+        """Score multiplier based on freshness_state + time since last access.
+
+        fresh + updated within 30 days → 1.15 (boost recently active memories)
+        fresh + older than 30 days     → 1.0  (decayed back to neutral)
+        stale                          → 0.70 (suppress old unused memories)
+        unknown / missing              → 1.0  (neutral, new DB or unset)
+        """
+        state = fact.get("freshness_state") or "unknown"
+        if state == "stale":
+            return 0.70
+        if state == "fresh":
+            updated = fact.get("updated_at") or fact.get("created_at")
+            if updated:
+                try:
+                    ts = datetime.fromisoformat(str(updated).replace("Z", "+00:00"))
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                    age_days = (datetime.now(timezone.utc) - ts).total_seconds() / 86400
+                    if age_days <= 30:
+                        return 1.15
+                except (ValueError, TypeError):
+                    pass
         return 1.0
 
     @staticmethod

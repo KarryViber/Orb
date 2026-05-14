@@ -93,7 +93,7 @@ Send a reply into the right conversation. `extra` can carry platform-native payl
 
 ### `setThreadStatus(channel, threadTs, status, loadingMessages)`
 
-Optionally set or clear a conversation status indicator. Slack uses this for richer "thinking" text; WeChat maps it to typing when a non-empty status is provided.
+Optionally set or clear a conversation status indicator. Slack uses this for richer "thinking" text.
 
 ### `editMessage(channel, ts, text, extra)`
 
@@ -134,7 +134,7 @@ Place the implementation in `src/adapters/{platform}.js`.
 
 ### 2. Register It In main.js
 
-`src/main.js` is where enabled adapters are instantiated and started. Follow the existing Slack and WeChat branches:
+`src/main.js` is where enabled adapters are instantiated and started. Follow the existing Slack adapter branch:
 
 ```javascript
 if (name === "myplatform") {

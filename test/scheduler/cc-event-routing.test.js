@@ -24,11 +24,11 @@ function createAdapter() {
   };
 }
 
-test('Scheduler addAdapter installs cc_event subscriber via adapter capability', () => {
+test('Scheduler setAdapter installs cc_event subscriber via adapter capability', () => {
   const scheduler = new Scheduler({ getProfile: () => ({ name: 'test' }), startPermissionServer: false });
   const adapter = createAdapter();
 
-  scheduler.addAdapter('slack', adapter);
+  scheduler.setAdapter(adapter);
 
   assert.deepEqual(adapter.calls, []);
   assert.equal(typeof adapter.__orbTurnDeliveryCcEventUnsubscribe, 'function');

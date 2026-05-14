@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createStreamClient } from '../../../src/adapters/slack/stream-client.js';
 import { SlackAdapter } from '../../../src/adapters/slack.js';
+import { TurnDeliveryOrchestrator } from '../../../src/turn-delivery/orchestrator.js';
+import { createQiStreamProcessor } from '../../../src/turn-delivery/task-card-streams.js';
 
 function streamClient(calls = [], options = {}) {
   let tsSeq = 0;
@@ -26,6 +28,10 @@ function streamClient(calls = [], options = {}) {
     postReply: async () => ({ ts: '1777.2' }),
     ...options,
   });
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 test('normalizeStreamChunks converts text and task aliases into Slack stream chunks', () => {
@@ -91,11 +97,370 @@ test('auto rotate stops the old stream, starts a continued stream, and appends t
     'chat.appendStream',
   ]);
   assert.equal(calls[2][1].ts, '1777.1');
+  assert.equal(calls[2][1].chunks, undefined);
   assert.equal(calls[3][1].ts, undefined);
   assert.equal(calls[3][1].chunks[0].type, 'blocks');
   assert.equal(calls[3][1].chunks[0].blocks[0].elements[0].text, '↩️ 续');
+  assert.deepEqual(calls[3][1].chunks[1], { type: 'plan_update', title: 'Orbiting...' });
+  assert.deepEqual(calls[3][1].chunks[2], {
+    type: 'task_update',
+    id: 'qi-exec',
+    title: 'Probe',
+    status: 'in_progress',
+    details: '\nBash: npm test\n',
+  });
   assert.equal(calls[4][1].ts, '1777.2');
   assert.deepEqual(rotations.map((rotation) => rotation.reason), ['auto-rotate']);
+});
+
+test('auto rotate does not resend accumulated snapshot chunks while stopping previous stream', async () => {
+  const calls = [];
+  const client = streamClient(calls, { autoRotateEnabled: () => true });
+  const result = await client.startStream('C1', '111.222', {
+    task_display_mode: 'plan',
+    initial_chunks: [{ type: 'task_update', id: 'qi-exec', title: 'Probe', status: 'in_progress', details: '' }],
+  });
+  await client.appendStream(result.stream_id, [
+    { type: 'task_update', id: 'qi-exec', title: 'Probe', status: 'in_progress', details: 'A1\n' },
+  ]);
+  await client.appendStream(result.stream_id, [
+    { type: 'task_update', id: 'qi-exec', title: 'Probe', status: 'in_progress', details: 'A2\n' },
+  ]);
+
+  const rotated = await client.stopAndRotate(result.stream_id);
+  await client.appendStream(rotated.stream_id, [
+    { type: 'task_update', id: 'qi-exec', title: 'Probe', status: 'complete', details: 'A3\n' },
+  ]);
+
+  const stopCall = calls.find(([method]) => method === 'chat.stopStream');
+  const rotatedStartCall = calls.filter(([method]) => method === 'chat.startStream')[1];
+  const postRotateAppendCall = calls.at(-1);
+  assert.equal(stopCall[1].chunks, undefined);
+  assert.equal(rotatedStartCall[1].chunks[1].details, 'A1\nA2\n');
+  assert.equal(postRotateAppendCall[1].chunks[0].details, 'A3\n');
+});
+
+test('auto rotate startStream failure marks turn streamFailed immediately', async () => {
+  const calls = [];
+  let tsSeq = 0;
+  const adapter = new SlackAdapter({ botToken: 'xoxb-test', appToken: 'xapp-test' });
+  adapter._teamId = 'T1';
+  adapter._slack = {
+    conversations: {
+      async replies() {
+        return { messages: [{ user: 'U1' }] };
+      },
+    },
+    async apiCall(method, payload) {
+      calls.push([method, payload]);
+      if (method === 'chat.startStream') {
+        tsSeq += 1;
+        if (tsSeq === 2) throw Object.assign(new Error('start failed'), { data: { error: 'ratelimited' } });
+        return { ok: true, ts: `1777.${tsSeq}` };
+      }
+      return { ok: true };
+    },
+  };
+  const orchestrator = new TurnDeliveryOrchestrator({ adapter });
+  const taskCardStates = {
+    qi: { enabled: true, deferred: false, streamId: null, streamMessageTs: null, failed: false },
+  };
+  const turnState = orchestrator.beginTurn({
+    turnId: 'rotate-start-fail',
+    attemptId: 'attempt-1',
+    channel: 'C1',
+    threadTs: '111.222',
+    platform: 'slack',
+    taskCardStates,
+  });
+  const processor = createQiStreamProcessor();
+
+  await processor.handle({
+    type: 'cc_event',
+    turnId: 'rotate-start-fail',
+    eventType: 'tool_use',
+    payload: { type: 'tool_use', id: 'tool-1', name: 'Bash', input: { description: 'Run tests' } },
+  }, {
+    channel: 'C1',
+    threadTs: '111.222',
+    effectiveThreadTs: '111.222',
+    platform: 'slack',
+    adapter,
+    turn: { taskCardStates },
+    task: { attemptId: 'attempt-1', teamId: 'T1' },
+    orchestrator,
+  });
+
+  await assert.rejects(() => adapter._streamClient.stopAndRotate(turnState.streamIds.qi), /ratelimited/);
+  assert.equal(turnState.streamFailed, true);
+  assert.equal(turnState.taskCardStates.qi.failed, true);
+  assert.deepEqual(calls.map(([method]) => method), ['chat.startStream', 'chat.appendStream', 'chat.stopStream', 'chat.startStream']);
+});
+
+test('auto rotate stopStream failure leaves old stream appendable', async () => {
+  const calls = [];
+  let tsSeq = 0;
+  const client = createStreamClient({
+    webClient: {
+      conversations: {
+        async replies() {
+          return { messages: [{ user: 'U1' }] };
+        },
+      },
+      async apiCall(method, payload) {
+        calls.push([method, payload]);
+        if (method === 'chat.startStream') {
+          tsSeq += 1;
+          return { ok: true, ts: `1777.${tsSeq}` };
+        }
+        if (method === 'chat.stopStream') {
+          throw Object.assign(new Error('stop failed'), { data: { error: 'internal_error' } });
+        }
+        return { ok: true };
+      },
+    },
+    getTeamId: () => 'T1',
+    postReply: async () => ({ ts: '1777.reply' }),
+    autoRotateEnabled: () => true,
+  });
+  const result = await client.startStream('C1', '111.222', {
+    initial_chunks: [{ type: 'plan_update', title: 'Working' }],
+  });
+
+  await assert.rejects(() => client.stopAndRotate(result.stream_id), /internal_error/);
+  await client.appendStream(result.stream_id, [{ type: 'markdown_text', text: 'still live' }]);
+
+  assert.deepEqual(calls.map(([method]) => method), [
+    'chat.startStream',
+    'chat.stopStream',
+    'chat.appendStream',
+  ]);
+  assert.equal(calls.at(-1)[1].ts, '1777.1');
+});
+
+test('stopStream old id waiting on rotate deletes the current rotated stream entry', async () => {
+  const calls = [];
+  let tsSeq = 0;
+  let releaseSecondStart;
+  const secondStartStarted = new Promise((resolve) => {
+    releaseSecondStart = resolve;
+  });
+  const releaseSecondStartWait = {};
+  releaseSecondStartWait.promise = new Promise((resolve) => {
+    releaseSecondStartWait.resolve = resolve;
+  });
+  const client = createStreamClient({
+    webClient: {
+      conversations: {
+        async replies() {
+          return { messages: [{ user: 'U1' }] };
+        },
+      },
+      async apiCall(method, payload) {
+        calls.push([method, payload]);
+        if (method === 'chat.startStream') {
+          tsSeq += 1;
+          if (tsSeq === 2) {
+            releaseSecondStart();
+            await releaseSecondStartWait.promise;
+          }
+          return { ok: true, ts: `1777.${tsSeq}` };
+        }
+        return { ok: true };
+      },
+    },
+    getTeamId: () => 'T1',
+    postReply: async () => ({ ts: '1777.reply' }),
+    autoRotateEnabled: () => true,
+  });
+  const result = await client.startStream('C1', '111.222', {
+    initial_chunks: [{ type: 'plan_update', title: 'Working' }],
+  });
+
+  const rotatePromise = client.stopAndRotate(result.stream_id);
+  await secondStartStarted;
+  const stopPromise = client.stopStream(result.stream_id, { chunks: [{ type: 'markdown_text', text: 'done' }] });
+  releaseSecondStartWait.resolve();
+  const rotated = await rotatePromise;
+  await stopPromise;
+  await assert.rejects(
+    () => client.appendStream(rotated.stream_id, [{ type: 'markdown_text', text: 'late' }]),
+    /unknown stream id: C1:1777\.2/,
+  );
+
+  assert.deepEqual(calls.map(([method]) => method), [
+    'chat.startStream',
+    'chat.stopStream',
+    'chat.startStream',
+    'chat.stopStream',
+  ]);
+  assert.equal(calls[3][1].ts, '1777.2');
+});
+
+test('appendStream rejects a stopped stream after rotate start failure without Slack append', async () => {
+  const calls = [];
+  let tsSeq = 0;
+  const rotations = [];
+  const client = createStreamClient({
+    webClient: {
+      conversations: {
+        async replies() {
+          return { messages: [{ user: 'U1' }] };
+        },
+      },
+      async apiCall(method, payload) {
+        calls.push([method, payload]);
+        if (method === 'chat.startStream') {
+          tsSeq += 1;
+          if (tsSeq === 2) return { ok: false, error: 'unavailable' };
+          return { ok: true, ts: `1777.${tsSeq}` };
+        }
+        return { ok: true };
+      },
+    },
+    getTeamId: () => 'T1',
+    postReply: async () => ({ ts: '1777.reply' }),
+    autoRotateEnabled: () => true,
+  });
+  const result = await client.startStream('C1', '111.222', {
+    initial_chunks: [{ type: 'plan_update', title: 'Working' }],
+    on_rotate: (rotation) => rotations.push(rotation),
+  });
+
+  await assert.rejects(() => client.stopAndRotate(result.stream_id), /unavailable/);
+  await assert.rejects(
+    () => client.appendStream(result.stream_id, [{ type: 'markdown_text', text: 'late' }]),
+    /stream_stopped/,
+  );
+
+  assert.equal(rotations.length, 1);
+  assert.equal(rotations[0].ok, false);
+  assert.equal(rotations[0].stopped, true);
+  assert.deepEqual(calls.map(([method]) => method), ['chat.startStream', 'chat.stopStream', 'chat.startStream']);
+});
+
+test('rebuildInitialChunks empty falls back to snapshot during rotate', async () => {
+  const calls = [];
+  const client = streamClient(calls, { autoRotateEnabled: () => true });
+  const result = await client.startStream('C1', '111.222', {
+    task_display_mode: 'plan',
+    initial_chunks: [{ type: 'task_update', id: 'qi-exec', title: 'Probe', status: 'in_progress', details: '' }],
+    rebuild_initial_chunks: () => [],
+  });
+  await client.appendStream(result.stream_id, [
+    { type: 'task_update', id: 'qi-exec', title: 'Probe', status: 'in_progress', details: 'A1\n' },
+  ]);
+
+  await client.stopAndRotate(result.stream_id);
+
+  const rotatedStartCall = calls.filter(([method]) => method === 'chat.startStream')[1];
+  assert.equal(rotatedStartCall[1].chunks[0].type, 'blocks');
+  assert.deepEqual(rotatedStartCall[1].chunks[1], {
+    type: 'task_update',
+    id: 'qi-exec',
+    title: 'Probe',
+    status: 'in_progress',
+    details: 'A1\n',
+  });
+});
+
+test('rebuildInitialChunks throw safely fails rotate and notifies callback', async () => {
+  const calls = [];
+  const rotations = [];
+  const client = streamClient(calls, { autoRotateEnabled: () => true });
+  const result = await client.startStream('C1', '111.222', {
+    initial_chunks: [{ type: 'plan_update', title: 'Working' }],
+    rebuild_initial_chunks: () => {
+      throw new Error('rebuild failed');
+    },
+    on_rotate: (rotation) => rotations.push(rotation),
+  });
+
+  await assert.rejects(() => client.stopAndRotate(result.stream_id), /rebuild failed/);
+  await assert.rejects(
+    () => client.appendStream(result.stream_id, [{ type: 'markdown_text', text: 'late' }]),
+    /stream_stopped/,
+  );
+
+  assert.equal(rotations.length, 1);
+  assert.equal(rotations[0].ok, false);
+  assert.match(rotations[0].error.message, /rebuild failed/);
+  assert.deepEqual(calls.map(([method]) => method), ['chat.startStream', 'chat.stopStream']);
+});
+
+test('stopStream clears pending auto rotate timer', async () => {
+  const calls = [];
+  const client = streamClient(calls, { autoRotateEnabled: () => true });
+  const result = await client.startStream('C1', '111.222', {
+    initial_chunks: [{ type: 'plan_update', title: 'Working' }],
+    rotate_after_ms: 15,
+  });
+
+  await client.stopStream(result.stream_id, { chunks: [{ type: 'markdown_text', text: 'done' }] });
+  await delay(40);
+
+  assert.deepEqual(calls.map(([method]) => method), ['chat.startStream', 'chat.stopStream']);
+});
+
+test('stopAndRotate is a no-op after stream has already stopped', async () => {
+  const calls = [];
+  const client = streamClient(calls, { autoRotateEnabled: () => true });
+  const result = await client.startStream('C1', '111.222', {
+    initial_chunks: [{ type: 'plan_update', title: 'Working' }],
+  });
+
+  await client.stopStream(result.stream_id, { chunks: [{ type: 'markdown_text', text: 'done' }] });
+  assert.equal(await client.stopAndRotate(result.stream_id), undefined);
+
+  assert.deepEqual(calls.map(([method]) => method), ['chat.startStream', 'chat.stopStream']);
+});
+
+test('short completed turn does not leave an orphan auto rotate', async () => {
+  const calls = [];
+  const rotations = [];
+  const client = streamClient(calls, { autoRotateEnabled: () => true });
+  const result = await client.startStream('C1', '111.222', {
+    task_display_mode: 'plan',
+    initial_chunks: [{ type: 'plan_update', title: 'Working' }],
+    on_rotate: (rotation) => rotations.push(rotation),
+    rotate_after_ms: 20,
+  });
+
+  await client.appendStream(result.stream_id, [{ type: 'markdown_text', text: 'progress' }]);
+  await delay(5);
+  await client.stopStream(result.stream_id, { chunks: [{ type: 'markdown_text', text: 'done' }] });
+  await delay(45);
+
+  assert.deepEqual(rotations, []);
+  assert.deepEqual(calls.map(([method]) => method), [
+    'chat.startStream',
+    'chat.appendStream',
+    'chat.stopStream',
+  ]);
+});
+
+test('auto rotate timer still rotates a live long turn', async () => {
+  const calls = [];
+  const rotations = [];
+  const client = streamClient(calls, { autoRotateEnabled: () => true });
+  const result = await client.startStream('C1', '111.222', {
+    task_display_mode: 'plan',
+    initial_chunks: [{ type: 'plan_update', title: 'Working' }],
+    on_rotate: (rotation) => rotations.push(rotation),
+    rotate_after_ms: 30,
+  });
+
+  await delay(40);
+
+  assert.equal(rotations.length, 1);
+  assert.equal(rotations[0].prev_stream_id, result.stream_id);
+  assert.equal(rotations[0].stream_id, 'C1:1777.2');
+  assert.deepEqual(calls.map(([method]) => method), [
+    'chat.startStream',
+    'chat.stopStream',
+    'chat.startStream',
+  ]);
+  await client.stopStream(rotations[0].stream_id, { chunks: [{ type: 'markdown_text', text: 'done' }] });
 });
 
 test('SlackAdapter auto rotate callback updates turn stream state', async () => {
@@ -151,6 +516,85 @@ test('SlackAdapter auto rotate callback updates turn stream state', async () => 
   assert.deepEqual(calls.map(([method]) => method), ['chat.startStream', 'chat.stopStream', 'chat.startStream']);
 });
 
+test('SlackAdapter auto rotate keeps plan and qi streams independent', async () => {
+  const calls = [];
+  let tsSeq = 0;
+  const adapter = new SlackAdapter({ botToken: 'xoxb-test', appToken: 'xapp-test' });
+  adapter._teamId = 'T1';
+  adapter._slack = {
+    conversations: {
+      async replies() {
+        return { messages: [{ user: 'U1' }] };
+      },
+    },
+    async apiCall(method, payload) {
+      calls.push([method, payload]);
+      if (method === 'chat.startStream') {
+        tsSeq += 1;
+        return { ok: true, ts: `1777.${tsSeq}` };
+      }
+      return { ok: true };
+    },
+  };
+  const turnState = {
+    streamId: null,
+    streamIds: {},
+    streamMessageTs: null,
+    streamMessageTsByChannel: {},
+    taskCardStates: {
+      qi: { enabled: true, deferred: false, streamId: null, streamMessageTs: null, failed: false },
+      plan: { enabled: true, deferred: false, streamId: null, streamMessageTs: null, failed: false },
+    },
+  };
+
+  const planStarted = await adapter.deliver({
+    intent: 'task_progress.start',
+    channel: 'C1',
+    threadTs: '111.222',
+    text: 'Plan',
+    meta: {
+      streamChannel: 'plan',
+      task_display_mode: 'plan',
+      chunks: [{ type: 'plan_update', title: 'Plan' }],
+      teamId: 'T1',
+      autoRotate: true,
+    },
+  }, { channel: 'stream', turnState });
+  const qiStarted = await adapter.deliver({
+    intent: 'task_progress.start',
+    channel: 'C1',
+    threadTs: '111.222',
+    text: 'Qi',
+    meta: {
+      streamChannel: 'qi',
+      task_display_mode: 'plan',
+      chunks: [{ type: 'task_update', id: 'qi-exec', title: 'Probe', status: 'in_progress' }],
+      teamId: 'T1',
+      autoRotate: true,
+    },
+  }, { channel: 'stream', turnState });
+
+  const planRotated = await adapter._streamClient.stopAndRotate(planStarted.stream_id);
+  const qiRotated = await adapter._streamClient.stopAndRotate(qiStarted.stream_id);
+
+  assert.equal(turnState.streamIds.plan, planRotated.stream_id);
+  assert.equal(turnState.streamIds.qi, qiRotated.stream_id);
+  assert.equal(turnState.streamMessageTsByChannel.plan, planRotated.ts);
+  assert.equal(turnState.streamMessageTsByChannel.qi, qiRotated.ts);
+  assert.equal(turnState.taskCardStates.plan.streamId, planRotated.stream_id);
+  assert.equal(turnState.taskCardStates.qi.streamId, qiRotated.stream_id);
+  assert.equal(turnState.streamId, qiRotated.stream_id);
+  assert.notEqual(turnState.streamIds.plan, turnState.streamIds.qi);
+  assert.deepEqual(calls.map(([method]) => method), [
+    'chat.startStream',
+    'chat.startStream',
+    'chat.stopStream',
+    'chat.startStream',
+    'chat.stopStream',
+    'chat.startStream',
+  ]);
+});
+
 test('setTyping and setThreadStatus call assistant status API', async () => {
   const calls = [];
   const client = streamClient(calls);
@@ -178,7 +622,7 @@ test('SlackAdapter exposes PlatformAdapter methods and delegates typing status',
   assert.deepEqual(calls.map(([method]) => method), ['assistant.threads.setStatus', 'assistant.threads.setStatus']);
 });
 
-test('SlackAdapter falls back to context-only postMessage when final stopStream lost ownership', async () => {
+test('SlackAdapter silently exits lost-ownership fallback when final blocks are empty', async () => {
   const adapter = new SlackAdapter({ botToken: 'xoxb-test', appToken: 'xapp-test' });
   const replies = [];
   adapter.stopStream = async () => {
@@ -191,6 +635,8 @@ test('SlackAdapter falls back to context-only postMessage when final stopStream 
     return { ts: `reply-${replies.length}` };
   };
 
+  assert.deepEqual(adapter.buildPayloads('', { dailyNotesSummary: { count: 1 } }), [{ text: '(无回复)' }]);
+
   const result = await adapter.deliver({
     intent: 'assistant_text.final',
     channel: 'C1',
@@ -202,10 +648,8 @@ test('SlackAdapter falls back to context-only postMessage when final stopStream 
     turnState: { streamId: 'stream-1', streamMessageTs: '111.333', assistantStreamTextLen: 4 },
   });
 
-  assert.equal(result.ts, 'reply-1');
-  assert.equal(replies.length, 1);
-  assert.equal(replies[0].text, '📓');
-  assert.equal(replies[0].extra.blocks[0].elements[0].text, '📓 _日记已追加_');
+  assert.deepEqual(result, { streamId: 'stream-1', ts: '111.333' });
+  assert.equal(replies.length, 0);
 });
 
 test('SlackAdapter builds AskUserQuestion single and multi question blocks', async () => {

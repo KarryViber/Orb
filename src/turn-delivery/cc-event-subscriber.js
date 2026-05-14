@@ -43,13 +43,16 @@ export function createTurnDeliveryCcEventSubscriber({
   return {
     match: (msg, ctx) => msg?.type === 'cc_event' && isSupportedContext(ctx),
     async handle(msg, ctx = {}) {
+      if (msg.eventType === 'text' && ctx?.channelSemantics === 'silent') {
+        return;
+      }
       if (msg.eventType === 'turn_abort') {
         for (const [name, processor] of processors) {
           await safeHandle(name, processor, msg, ctx);
         }
         return;
       }
-      if (!['tool_use', 'text', 'result', 'summary_snapshot'].includes(msg.eventType)) return;
+      if (!['tool_use', 'text', 'result'].includes(msg.eventType)) return;
       if (msg.eventType === 'result') {
         for (const [name, processor] of [['text', text], ['qi', qi], ['plan', plan], ['status', status]]) {
           await safeHandle(name, processor, msg, ctx);

@@ -9,9 +9,7 @@ import {
   resolveDeliveryMode,
 } from '../../src/cron-delivery.js';
 import { CronScheduler } from '../../src/cron.js';
-import { PlatformAdapter } from '../../src/adapters/interface.js';
 import { SlackAdapter } from '../../src/adapters/slack.js';
-import { WeChatAdapter } from '../../src/adapters/wechat.js';
 
 function job(mode, overrides = {}) {
   return {
@@ -41,9 +39,8 @@ function createMockAdapter() {
   };
 }
 
-class FallbackAdapter extends PlatformAdapter {
+class FallbackAdapter {
   constructor() {
-    super();
     this.calls = [];
   }
 
@@ -305,38 +302,6 @@ test('SlackAdapter deliverCronOutput preserves three-part direct delivery shape'
       extra: { blocks: [{ type: 'section', text: { type: 'mrkdwn', text: 'block text' } }] },
     },
   ]);
-});
-
-test('WeChatAdapter deliverCronOutput merges main thread and block text into one bubble', async () => {
-  const adapter = new WeChatAdapter({ accountId: 'test', token: 'token' });
-  const calls = [];
-  adapter.sendReply = async (channel, threadTs, text, extra = {}) => {
-    calls.push({ channel, threadTs, text, extra });
-    return { ts: 'wx-1' };
-  };
-
-  const result = await adapter.deliverCronOutput({
-    channel: 'wx-user',
-    threadTs: null,
-    output: {
-      status: 'ok',
-      main: '# 主标题',
-      thread_md: 'thread **detail**',
-      blocks: [{ header: '块标题', body: '[链接](https://example.com)' }],
-    },
-    deliveryConfig: { mode: 'direct', platform: 'wechat', channel: 'wx-user' },
-  });
-
-  assert.equal(result.ts, 'wx-1');
-  assert.equal(result.deliveredCount, 1);
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0].channel, 'wx-user');
-  assert.equal(calls[0].threadTs, 'wx-user');
-  assert.match(calls[0].text, /【主标题】/);
-  assert.match(calls[0].text, /thread \*\*detail\*\*/);
-  assert.match(calls[0].text, /———/);
-  assert.match(calls[0].text, /块标题/);
-  assert.match(calls[0].text, /链接 \(https:\/\/example\.com\)/);
 });
 
 test('cron delivery dry-run smoke covers evolution_state mode', async () => {

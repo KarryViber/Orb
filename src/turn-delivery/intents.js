@@ -30,7 +30,7 @@ const TURN_DELIVERY_CHANNELS = new Set(['stream', 'postMessage', 'edit', 'metada
  * @property {string} attemptId Attempt id with the same semantics as 8e6aaad.
  * @property {string} channel Slack channel id.
  * @property {string} threadTs Slack thread ts.
- * @property {string} platform 'slack' | 'wechat' | ...
+ * @property {string} platform 'slack'
  * @property {string} intent One of the constants exported from this module.
  * @property {string} deliveryChannel 'stream' | 'postMessage' | 'edit' | 'silent'.
  * @property {number} textLen Emitted character count when the intent carries text.

@@ -48,8 +48,20 @@ test('markdown buildBlocks path keeps heading conversion behavior', () => {
   assert.equal(payloads[0].blocks[1].text.text, 'body');
 });
 
-test('daily notes summary appends after git diff context block', () => {
-  const payloads = buildSendPayloads('done', {
+test('daily notes and git diff summaries do not render context blocks', () => {
+  const payloads = buildSendPayloads('done', contextOptions());
+
+  assert.deepEqual(payloads, [{ text: 'done' }]);
+});
+
+test('daily notes summary does not render context-only fallback', () => {
+  const payloads = buildSendPayloads('', { dailyNotesSummary: { count: 1 } });
+
+  assert.deepEqual(payloads, [{ text: '(无回复)' }]);
+});
+
+function contextOptions() {
+  return {
     gitDiffSummary: {
       hasChanges: true,
       totals: { filesChanged: 1, insertions: 2, deletions: 0 },
@@ -62,37 +74,5 @@ test('daily notes summary appends after git diff context block', () => {
         { mode: 'narrative', time: '13:10', snippet: 'daily-notes 回执时序修复 A+B 上线' },
       ],
     },
-  });
-
-  const blocks = payloads[0].blocks;
-  assert.equal(blocks.at(-2).type, 'context');
-  assert.match(blocks.at(-2).elements[0].text, /改动/);
-  assert.equal(blocks.at(-1).type, 'context');
-  assert.equal(
-    blocks.at(-1).elements[0].text,
-    '📓 12:46｜[配置层]｜daemon 重启 + 验真 落地\n📓 13:10｜narrative｜daily-notes 回执时序修复 A+B 上线',
-  );
-});
-
-test('daily notes summary can render as context-only fallback', () => {
-  const payloads = buildSendPayloads('', { dailyNotesSummary: { count: 1 } });
-
-  assert.deepEqual(payloads, [{
-    blocks: [{
-      type: 'context',
-      elements: [{ type: 'mrkdwn', text: '📓 _日记已追加_' }],
-    }],
-    text: '📓',
-  }]);
-});
-
-test('daily notes summary renders karry entries with mirror prefix', () => {
-  const payloads = buildSendPayloads('', {
-    dailyNotesSummary: {
-      count: 1,
-      entries: [{ mode: 'karry', time: '09:30', title: '自我校准' }],
-    },
-  });
-
-  assert.equal(payloads[0].blocks[0].elements[0].text, '🪞 09:30｜karry｜自我校准');
-});
+  };
+}

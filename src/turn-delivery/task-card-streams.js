@@ -35,7 +35,6 @@ function makeQiTurnState() {
     appendSeq: 0,
     lastPlanChunk: null,
     taskChunks: new Map(),
-    summarySnapshot: null,
   };
 }
 
@@ -50,7 +49,6 @@ function makePlanTurnState() {
     appendSeq: 0,
     lastPlanChunk: null,
     taskChunks: new Map(),
-    summarySnapshot: null,
   };
 }
 
@@ -61,18 +59,6 @@ function extractStopReason(msg) {
 function extractExitCode(msg) {
   const value = msg?.exitCode ?? msg?.payload?.exitCode ?? msg?.payload?.exit_code ?? null;
   return Number.isInteger(value) ? value : null;
-}
-
-function extractSummarySnapshot(msg) {
-  const payload = msg?.payload && typeof msg.payload === 'object' ? msg.payload : {};
-  return {
-    gitDiffSummary: payload.gitDiffSummary || null,
-    dailyNotesSummary: payload.dailyNotesSummary || null,
-  };
-}
-
-function hasSummaryBlocks(snapshot) {
-  return Boolean(snapshot?.gitDiffSummary?.hasChanges || snapshot?.dailyNotesSummary?.count);
 }
 
 function isInterruptedResult(msg) {
@@ -175,17 +161,19 @@ export function createTaskCardStreamProcessor({
     return turns.get(key);
   };
 
-  const ensureStarted = async (state, ctx, initialChunks, turnId = null) => {
-    if (state.streamId || state.failed) return Boolean(state.streamId);
-    if (state.startPromise) {
-      await state.startPromise;
-      return Boolean(state.streamId);
-    }
+  const ensureStarted = (state, ctx, initialChunks, turnId = null) => {
+    if (state.streamId) return Promise.resolve(true);
+    if (state.failed) return Promise.resolve(false);
+    if (state.startPromise) return state.startPromise.then(() => Boolean(state.streamId));
     const taskCardState = ctx?.turn?.taskCardStates?.[streamChannel];
-    if (taskCardState?.streamId) return false;
+    if (taskCardState?.streamId) {
+      state.streamId = taskCardState.streamId;
+      state.streamTs = taskCardState.streamMessageTs || null;
+      return Promise.resolve(true);
+    }
     const channel = ctx?.channel || ctx?.task?.channel;
     const threadTs = ctx?.effectiveThreadTs || ctx?.threadTs || ctx?.task?.threadTs;
-    if (!channel || !threadTs) return false;
+    if (!channel || !threadTs) return Promise.resolve(false);
     state.startPromise = (async () => {
       try {
         const result = await ctx.orchestrator?.emit({
@@ -204,7 +192,17 @@ export function createTaskCardStreamProcessor({
             chunks: initialChunks,
             teamId: ctx?.task?.teamId || ctx?.teamId || null,
             rebuildInitialChunks: () => rebuildRememberedChunks(state, initialChunks),
-            onRotate: ({ stream_id: newStreamId, ts }) => {
+            onRotate: ({ ok = true, error = null, stream_id: newStreamId, ts }) => {
+              if (ok === false) {
+                state.failed = true;
+                const turnState = ctx?.orchestrator?.getTurnState?.(turnId) || null;
+                ctx?.orchestrator?.markStreamFailed?.(turnState, { streamChannel, error });
+                if (ctx?.turn?.taskCardStates?.[streamChannel]) {
+                  ctx.turn.taskCardStates[streamChannel].failed = true;
+                }
+                warn(TAG, `[task_card] rotate failed: ${error?.message || 'unknown rotate failure'}`);
+                return;
+              }
               state.streamId = newStreamId;
               state.streamTs = ts || null;
               if (ctx?.turn?.taskCardStates?.[streamChannel]) {
@@ -230,13 +228,15 @@ export function createTaskCardStreamProcessor({
         state.startPromise = null;
       }
     })();
-    await state.startPromise;
-    return Boolean(state.streamId);
+    return state.startPromise.then(() => Boolean(state.streamId));
   };
 
-  const chainAppend = (state, operation) => {
+  const chainAppend = (state, startPromise, operation) => {
     const previous = state.appendPromise || Promise.resolve();
-    const next = previous.catch(() => {}).then(operation);
+    const next = previous.catch(() => {}).then(() => startPromise).then((started) => {
+      if (!started) return;
+      return operation();
+    });
     state.appendPromise = next.finally(() => {
       if (state.appendPromise === next) state.appendPromise = null;
     });
@@ -255,11 +255,6 @@ export function createTaskCardStreamProcessor({
         return;
       }
       const state = getState(msg.turnId);
-      if (msg.eventType === 'summary_snapshot') {
-        const snapshot = extractSummarySnapshot(msg);
-        state.summarySnapshot = hasSummaryBlocks(snapshot) ? snapshot : null;
-        return;
-      }
       if (msg.eventType === 'tool_use') {
         if (!matchTool(msg, ctx, state)) return;
         const chunks = buildToolChunks(msg, ctx, state);
@@ -268,10 +263,9 @@ export function createTaskCardStreamProcessor({
         const initialChunks = getInitialChunks(msg, ctx, state, chunks);
         rememberChunks(state, initialChunks);
         rememberChunks(state, chunks);
-        if (!await ensureStarted(state, ctx, initialChunks, msg.turnId)) return;
-        if (state.failed || !state.streamId) return;
         const appendSequence = state.appendSeq = (state.appendSeq || 0) + 1;
-        await chainAppend(state, async () => {
+        const startPromise = ensureStarted(state, ctx, initialChunks, msg.turnId);
+        chainAppend(state, startPromise, async () => {
           if (!state.streamId) return;
           await ctx.orchestrator?.emit({
             turnId: msg.turnId,
@@ -325,7 +319,6 @@ export function createTaskCardStreamProcessor({
             streamId,
             chunks,
             chunkCount: Array.isArray(chunks) ? chunks.length : 0,
-            ...(streamChannel === 'qi' && hasSummaryBlocks(state.summarySnapshot) ? state.summarySnapshot : {}),
           },
         });
         if (interrupted && streamChannel === 'plan') {

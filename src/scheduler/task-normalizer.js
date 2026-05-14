@@ -127,8 +127,9 @@ export function normalizeTaskForSpawn(task, { getProfile, defaults = getDefaults
       effectiveText = effectiveText.slice(effortMatch[0].length);
     }
   }
-  if (!effectiveEffort && shouldEscalateEffort(effectiveText)) {
-    effectiveEffort = 'xhigh';
+  if (shouldEscalateEffort(effectiveText)) {
+    if (!effectiveEffort) effectiveEffort = 'xhigh';
+    if (!effectiveModel) effectiveModel = 'opus';
   }
   if (!effectiveModel) effectiveModel = defaults.model;
   if (!effectiveEffort) effectiveEffort = defaults.effort;

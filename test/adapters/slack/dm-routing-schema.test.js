@@ -14,7 +14,7 @@ function validRule(overrides = {}) {
     name: 'github-research',
     match: { urlPattern: 'https?://github\\.com/[^\\s]+' },
     target: {
-      channel: 'C0AN5M6EJRY',
+      channel: 'C0123456789',
       mainTemplate: 'GitHub {repo_slug}',
       workerPrompt: 'worker {url_matched}',
     },
@@ -77,7 +77,7 @@ test('dmRouting schema rejects unknown fields that would expand prompt surface',
     extraRuleField: true,
     match: { urlPattern: 'https://example\\.com', promptFragment: '{raw}' },
     target: {
-      channel: 'C0AN5M6EJRY',
+      channel: 'C0123456789',
       mainTemplate: 'main',
       workerPrompt: 'worker',
       extraPrompt: '{raw}',

@@ -75,6 +75,53 @@ def build_lesson_text(meta):
   return lesson, apply
 
 
+def _clean_meta_value(value):
+  if value is None:
+    return ""
+  text = str(value).strip()
+  if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+    text = text[1:-1]
+  return text.replace('\\"', '"').strip()
+
+
+def _relative_candidate_path(candidate_path):
+  path = Path(candidate_path)
+  data_dir = os.environ.get("LESSON_DISTILL_DATA_DIR")
+  roots = [Path(data_dir)] if data_dir else []
+  roots.append(Path(ORB_ROOT) / "profiles" / "karry" / "data")
+  for root in roots:
+    try:
+      return str(path.relative_to(root))
+    except ValueError:
+      continue
+  return path.name
+
+
+def _extract_context_metric(meta):
+  context = _clean_meta_value(meta.get("errorContext"))
+  if not context:
+    return _clean_meta_value(meta.get("stopReason")) or "unknown"
+  leaks = re.search(r"(\d+)\s+(?:narration\s+)?leaks?\b", context, re.I)
+  if leaks:
+    return f"{int(leaks.group(1))} 块 leaks"
+  count = re.search(r"\b(\d+)\b", context)
+  if count:
+    return f"{int(count.group(1))} 次"
+  return context[:80]
+
+
+def candidate_line(candidate_path, meta, archived=False):
+  source = _clean_meta_value(meta.get("source")) or "failure"
+  cron_name = _clean_meta_value(meta.get("cron_name")) or _clean_meta_value(meta.get("thread_id")) or "unknown"
+  if cron_name.startswith("cron:"):
+    cron_name = cron_name.rsplit(":", 1)[-1]
+  icon = "🗑️" if archived else "📎"
+  return (
+    f"{icon} `{source}` × `{cron_name}` · {_extract_context_metric(meta)} "
+    f"→ `{_relative_candidate_path(candidate_path)}`"
+  )
+
+
 def validate_text(name, value, limit, allow_empty=False):
   if not isinstance(value, str):
     raise PayloadValidationError(f"{name} must be a string")
@@ -160,12 +207,8 @@ def slack_post(token, channel, blocks, text, thread_ts=None):
 
 
 def card(candidate_path, meta, lesson, apply):
-  source = meta.get("source", "unknown")
-  cron_name = meta.get("cron_name")
-  label = f"`{source}` · {cron_name}" if cron_name else f"`{source}`"
   return [
-    {"type": "section", "text": {"type": "mrkdwn", "text": f"*Lesson candidate* {label} · _auto-archived_\n{lesson}\n\n*Context*\n{apply}"}},
-    {"type": "context", "elements": [{"type": "mrkdwn", "text": f"`{candidate_path}`"}]},
+    {"type": "section", "text": {"type": "mrkdwn", "text": candidate_line(candidate_path, meta, archived=True)}},
   ]
 
 
@@ -177,6 +220,7 @@ def main():
   parser.add_argument("--channel-name", dest="channel_name", help="(deprecated) 4 层架构下统一走 evolution_state，无需 channel")
   parser.add_argument("--dry-run", action="store_true")
   args = parser.parse_args()
+  os.environ["LESSON_DISTILL_DATA_DIR"] = str(Path(args.data_dir))
 
   candidates = sorted(Path(args.data_dir, "lesson-candidates").glob("*.md"))
   archive_dir = Path(args.data_dir, "lesson-candidates", ".archive")
@@ -208,7 +252,7 @@ def main():
       validate_payload(path, blocks, fallback)
 
       if args.dry_run:
-        print(json.dumps({"candidate": str(path), "lesson": lesson, "how_to_apply": apply, "blocks": blocks}, ensure_ascii=False))
+        print(candidate_line(path, meta, archived=True))
         continue
 
       # 收集到批量 blocks（aggregator 会作为 thread reply 单条投递）

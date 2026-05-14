@@ -307,50 +307,100 @@ function splitBlockText(text) {
 // --- Table block construction ---
 
 const MD_FORMAT_RE = /(\*\*(.+?)\*\*|\*(.+?)\*|__(.+?)__|_(.+?)_|~~(.+?)~~|`([^`]+)`)/;
+const EMOJI_RE = /:([a-z0-9_+-]+):/;
+const EMOJI_TOKEN_RE = /:([a-z0-9_+-]+):/g;
+
+function collectMarkdownCellTokens(t) {
+  const tokens = [];
+  const TOKEN_RE = /(\*\*(.+?)\*\*|(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)|__(.+?)__|(?<!_)_(?!_)(.+?)(?<!_)_(?!_)|~~(.+?)~~|`([^`]+)`)/g;
+  let m;
+  while ((m = TOKEN_RE.exec(t)) !== null) {
+    let el = null;
+    if (m[2]) el = { type: 'text', text: m[2], style: { bold: true } };
+    else if (m[3]) el = { type: 'text', text: m[3], style: { italic: true } };
+    else if (m[4]) el = { type: 'text', text: m[4], style: { bold: true } };
+    else if (m[5]) el = { type: 'text', text: m[5], style: { italic: true } };
+    else if (m[6]) el = { type: 'text', text: m[6], style: { strike: true } };
+    else if (m[7]) el = { type: 'text', text: m[7], style: { code: true } };
+    if (el) {
+      tokens.push({ start: m.index, end: m.index + m[1].length, element: el });
+    }
+  }
+  return tokens;
+}
+
+function collectEmojiCellTokens(t) {
+  const tokens = [];
+  const re = new RegExp(EMOJI_TOKEN_RE.source, 'g');
+  let m;
+  while ((m = re.exec(t)) !== null) {
+    tokens.push({
+      start: m.index,
+      end: m.index + m[0].length,
+      element: { type: 'emoji', name: m[1] },
+    });
+  }
+  return tokens;
+}
+
+function emitCellElements(t, tokens) {
+  tokens.sort((a, b) => a.start - b.start || b.end - a.end);
+  const merged = [];
+  let lastEnd = 0;
+  for (const tok of tokens) {
+    if (tok.start < lastEnd) continue;
+    merged.push(tok);
+    lastEnd = tok.end;
+  }
+  const elements = [];
+  let cursor = 0;
+  for (const tok of merged) {
+    if (tok.start > cursor) {
+      elements.push({ type: 'text', text: t.slice(cursor, tok.start) });
+    }
+    elements.push(tok.element);
+    cursor = tok.end;
+  }
+  if (cursor < t.length) {
+    elements.push({ type: 'text', text: t.slice(cursor) });
+  }
+  return elements;
+}
 
 /**
  * Convert a markdown-formatted cell string to a Slack table cell.
- * Uses rich_text for cells with formatting, raw_text for plain cells.
+ * Table cells don't run mrkdwn parsing, so emoji shortcodes must be emitted
+ * as `{type:'emoji'}` elements inside rich_text — otherwise they render
+ * literally as `:tada:`.
  */
 function cellToBlock(text) {
   const t = (text || '').trim() || ' ';
-  if (!MD_FORMAT_RE.test(t)) {
+  if (!MD_FORMAT_RE.test(t) && !EMOJI_RE.test(t)) {
     return { type: 'raw_text', text: t };
   }
 
-  const elements = [];
-  const TOKEN_RE = /(\*\*(.+?)\*\*|(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)|__(.+?)__|(?<!_)_(?!_)(.+?)(?<!_)_(?!_)|~~(.+?)~~|`([^`]+)`)/g;
-  let lastIndex = 0;
-  let match;
-
-  while ((match = TOKEN_RE.exec(t)) !== null) {
-    if (match.index > lastIndex) {
-      elements.push({ type: 'text', text: t.slice(lastIndex, match.index) });
-    }
-    if (match[2]) {
-      elements.push({ type: 'text', text: match[2], style: { bold: true } });
-    } else if (match[3]) {
-      elements.push({ type: 'text', text: match[3], style: { italic: true } });
-    } else if (match[4]) {
-      elements.push({ type: 'text', text: match[4], style: { bold: true } });
-    } else if (match[5]) {
-      elements.push({ type: 'text', text: match[5], style: { italic: true } });
-    } else if (match[6]) {
-      elements.push({ type: 'text', text: match[6], style: { strike: true } });
-    } else if (match[7]) {
-      elements.push({ type: 'text', text: match[7], style: { code: true } });
-    }
-    lastIndex = match.index + match[1].length;
-  }
-
-  if (lastIndex < t.length) {
-    elements.push({ type: 'text', text: t.slice(lastIndex) });
-  }
+  const tokens = [...collectMarkdownCellTokens(t), ...collectEmojiCellTokens(t)];
+  const elements = emitCellElements(t, tokens);
 
   if (elements.length === 0) {
     return { type: 'raw_text', text: t };
   }
 
+  return {
+    type: 'rich_text',
+    elements: [{ type: 'rich_text_section', elements }],
+  };
+}
+
+function cellHeaderToBlock(text) {
+  const stripped = (stripMarkdown(text) || '').trim() || ' ';
+  if (!EMOJI_RE.test(stripped)) {
+    return { type: 'raw_text', text: stripped };
+  }
+  const elements = emitCellElements(stripped, collectEmojiCellTokens(stripped));
+  if (elements.length === 0) {
+    return { type: 'raw_text', text: stripped };
+  }
   return {
     type: 'rich_text',
     elements: [{ type: 'rich_text_section', elements }],
@@ -392,8 +442,8 @@ function markdownTableToBlock(tableStr) {
     return { align, is_wrapped: true };
   });
 
-  // Header row: strip formatting (headers are already visually distinct)
-  const rows = [headerCells.map((c) => ({ type: 'raw_text', text: stripMarkdown(c) || ' ' }))];
+  // Header row: strip markdown emphasis but keep emoji shortcodes rendered.
+  const rows = [headerCells.map((c) => cellHeaderToBlock(c))];
 
   // Data rows: use rich_text for cells with formatting
   for (let i = 2; i < lines.length; i++) {
@@ -511,79 +561,6 @@ function buildBlockGroups(blocks) {
   return groups;
 }
 
-function formatDiffCount(value, prefix) {
-  const n = Number(value) || 0;
-  return `${prefix}${n}`;
-}
-
-function formatGitDiffFileLine(file) {
-  const status = String(file?.status || '').trim() || '?';
-  const path = String(file?.path || '').trim();
-  if (!path) return null;
-  const added = Number(file?.linesAdded) || 0;
-  const deleted = Number(file?.linesDeleted) || 0;
-  const lineStats = added || deleted ? ` (${formatDiffCount(added, '+')} ${formatDiffCount(deleted, '-')})` : '';
-  return `> • \`${status}\` ${path}${lineStats}`;
-}
-
-export function formatGitDiffSummary(summary) {
-  if (!summary?.hasChanges) return '';
-  const totals = summary.totals || {};
-  const filesChanged = Number(totals.filesChanged) || (Array.isArray(summary.files) ? summary.files.length : 0);
-  const insertions = Number(totals.insertions) || 0;
-  const deletions = Number(totals.deletions) || 0;
-  const lines = [
-    `> _📝 改动 · ${filesChanged} files (${formatDiffCount(insertions, '+')} ${formatDiffCount(deletions, '-')})_`,
-  ];
-  for (const file of Array.isArray(summary.files) ? summary.files : []) {
-    const line = formatGitDiffFileLine(file);
-    if (line) lines.push(line);
-  }
-  if (summary.truncated) {
-    const remaining = Math.max(0, filesChanged - (Array.isArray(summary.files) ? summary.files.length : 0));
-    lines.push(remaining > 0
-      ? `> _…还有 ${remaining} 个文件，详见 VS Code Source Control_`
-      : `> _…还有更多文件，详见 VS Code Source Control_`);
-  }
-  return lines.join('\n');
-}
-
-function buildGitDiffContextBlock(summary) {
-  const diffText = formatGitDiffSummary(summary);
-  if (!diffText) return null;
-  return {
-    type: 'context',
-    elements: [{
-      type: 'mrkdwn',
-      text: markdownToMrkdwn(diffText),
-    }],
-  };
-}
-
-export function buildDailyNotesContextBlock(summary) {
-  if (!summary || !summary.count) return null;
-  const n = Number(summary.count) || 0;
-  if (n <= 0) return null;
-  const entries = Array.isArray(summary.entries) ? summary.entries : [];
-  const lines = entries
-    .map((entry) => {
-      const mode = String(entry?.mode || 'line');
-      const icon = mode === 'karry' ? '🪞' : '📓';
-      const time = String(entry?.time || '--:--');
-      const label = entry?.layer ? `[${entry.layer}]` : mode;
-      const snippet = String(entry?.snippet || entry?.title || '').trim();
-      return `${icon} ${time}｜${label}｜${snippet || '日记已追加'}`;
-    })
-    .filter(Boolean);
-  const text = lines.length > 0
-    ? lines.join('\n')
-    : (n === 1 ? '📓 _日记已追加_' : `📓 _日记已追加 ×${n}_`);
-  return {
-    type: 'context',
-    elements: [{ type: 'mrkdwn', text }],
-  };
-}
-
 // --- Public API ---
 
 /**
@@ -594,23 +571,13 @@ export function buildDailyNotesContextBlock(summary) {
  * If blocks present: send as Block Kit. Otherwise: plain text.
  */
 export function buildSendPayloads(text, options = {}) {
-  const gitDiffSummary = options?.gitDiffSummary;
-  const dailyNotesSummary = options?.dailyNotesSummary;
-  const diffOnly = !text && gitDiffSummary?.hasChanges;
-  const diffContextBlock = buildGitDiffContextBlock(gitDiffSummary);
-  const dailyNotesContextBlock = buildDailyNotesContextBlock(dailyNotesSummary);
-  const contextBlocks = [diffContextBlock, dailyNotesContextBlock].filter(Boolean);
-  const contextOnly = !text && contextBlocks.length > 0;
-  if (!text && !contextOnly) return [{ text: '(无回复)' }];
-  if (contextOnly) {
-    return [{ blocks: contextBlocks, text: diffOnly ? '改动摘要' : '📓' }];
-  }
+  void options;
+  if (!text) return [{ text: '(无回复)' }];
 
   // Agent explicitly output Block Kit JSON
   const explicit = parseBlockKit(text);
   if (explicit) {
     normalizeBlocksMrkdwn(explicit.blocks);
-    explicit.blocks.push(...contextBlocks);
     return [{ blocks: explicit.blocks, text: explicit.text }];
   }
 
@@ -629,7 +596,7 @@ export function buildSendPayloads(text, options = {}) {
   const converted = markdownToMrkdwn(withPlaceholders);
 
   // Force blocks mode if we have tables
-  const useBlocks = contextBlocks.length > 0 || shouldUseBlocks(converted) || tableBlocks.length > 0;
+  const useBlocks = shouldUseBlocks(converted) || tableBlocks.length > 0;
 
   if (!useBlocks) {
     return [{ text: converted }];
@@ -637,12 +604,8 @@ export function buildSendPayloads(text, options = {}) {
 
   const blocks = buildBlocks(converted, tableBlocks);
   if (blocks.length === 0) {
-    if (contextBlocks.length > 0) {
-      return [{ blocks: contextBlocks, text: buildFallbackText(text) || (diffOnly ? '改动摘要' : '📓') }];
-    }
     return [{ text: converted }];
   }
-  blocks.push(...contextBlocks);
 
   const fallback = buildFallbackText(text);
   const groups = buildBlockGroups(blocks);

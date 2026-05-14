@@ -13,10 +13,10 @@ import subprocess
 import time
 from pathlib import Path
 
-STATE = Path.home() / "Orb/profiles/karry/data/.disk-usage-state.json"
+STATE = Path.home() / "Orb/profiles/<your-profile>/data/.disk-usage-state.json"
 WATCH_DIRS = [
     Path.home() / ".claude/projects",
-    Path.home() / "Orb/profiles/karry/data",
+    Path.home() / "Orb/profiles/<your-profile>/data",
     Path("/tmp"),
     Path.home() / "Library/Logs",
 ]

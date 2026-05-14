@@ -34,6 +34,32 @@ test('parseDailyNotesAppendToolUse prefers title for snippet and parses JSON too
   });
 });
 
+test('parseDailyNotesAppendToolUse falls back from unexpanded shell time', (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: new Date('2026-05-11T04:27:00.000Z') });
+
+  const entry = parseDailyNotesAppendToolUse({
+    name: 'Bash',
+    input: {
+      command: 'python3 daily-notes-append.py --mode narrative --time "$(date +%H:%M)" --body ok',
+    },
+  });
+
+  assert.equal(entry.time, '13:27');
+});
+
+test('parseDailyNotesAppendToolUse falls back when time is missing', (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: new Date('2026-05-11T04:28:00.000Z') });
+
+  const entry = parseDailyNotesAppendToolUse({
+    name: 'Bash',
+    input: {
+      command: 'python3 daily-notes-append.py --mode narrative --body ok',
+    },
+  });
+
+  assert.equal(entry.time, '13:28');
+});
+
 test('parseDailyNotesAppendToolUse ignores unrelated Bash commands', () => {
   assert.equal(parseDailyNotesAppendToolUse({
     name: 'Bash',

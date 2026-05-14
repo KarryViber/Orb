@@ -34,7 +34,12 @@ export function createTextStreamProcessor({ debounceMs = DEFAULT_TEXT_DEBOUNCE_M
     if (!text) return;
 
     const { ctx } = state;
-    if (ctx?.deferDeliveryUntilResult || ctx?.channelSemantics === 'silent') return;
+    if (ctx?.deferDeliveryUntilResult || ctx?.channelSemantics === 'silent') {
+      if (ctx?.channelSemantics === 'silent') {
+        warn(TAG, `[silent-suppress] blocked intermediate text: turnId=${key} len=${text.length}`);
+      }
+      return;
+    }
     const turn = ctx?.turn;
     const taskCardState = turn?.taskCardStates?.qi;
     const streamId = taskCardState?.streamId;

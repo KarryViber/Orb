@@ -5,7 +5,7 @@ slack-send-attachment.py — 向指定 thread 发送单条分段 blocks 消息�
 
 用法:
   python3 slack-send-attachment.py \
-    --channel CXXXXXXXXXX \
+    --channel C0123456789 \
     --thread-ts 1234567890.123456 \
     --color "#e74c3c" \
     --header ":red_circle: *持仓标的*" \
@@ -24,7 +24,7 @@ def load_token() -> str:
     token = os.environ.get("SLACK_BOT_TOKEN", "").strip()
     if token:
         return token
-    env_path = Path("/Users/karry/Orb/profiles/karry/.env")
+    env_path = Path("~/Orb/profiles/<your-profile>/.env")
     for line in env_path.read_text(encoding="utf-8").splitlines():
         if not line.startswith("SLACK_BOT_TOKEN="):
             continue
@@ -66,7 +66,7 @@ if args.channel_name and args.channel:
 if args.channel_name:
     import subprocess
     args.channel = subprocess.check_output(
-        ["python3", "/Users/karry/Orb/scripts/cron/channels-resolve.py", args.channel_name]
+        ["python3", "~/Orb/scripts/cron/channels-resolve.py", args.channel_name]
     ).decode().strip()
 if not args.channel:
     parser.error("必须提供 --channel 或 --channel-name")

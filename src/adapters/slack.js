@@ -7,7 +7,6 @@ import {
   extractSuggestedPrompts,
   markdownToMrkdwn,
 } from './slack-format.js';
-import { PlatformAdapter } from './interface.js';
 import { cleanImageCache } from './image-cache.js';
 import {
   ASSISTANT_TEXT_DELTA,
@@ -44,16 +43,14 @@ function auqValue({ requestId, qIdx = null, optIdx = null }) {
   return JSON.stringify({ requestId, qIdx, optIdx });
 }
 
-export class SlackAdapter extends PlatformAdapter {
-  constructor({ botToken, appToken, allowBots, replyBroadcast, freeResponseChannels, freeResponseUsers, dmRouting, getProfilePaths, ledger }) {
-    super();
+export class SlackAdapter {
+  constructor({ botToken, appToken, allowBots, replyBroadcast, ignoredChannels, dmRouting, getProfilePaths, ledger }) {
     this._botToken = botToken;
     this._slack = new WebClient(botToken);
     this._socket = new SocketModeClient({ appToken });
     this._allowBots = allowBots || 'none';
     this._replyBroadcast = replyBroadcast || false;
-    this._freeResponseChannels = freeResponseChannels || new Set();
-    this._freeResponseUsers = freeResponseUsers || new Set();
+    this._ignoredChannels = ignoredChannels || new Set();
     this._dmRouting = dmRouting || null;
     this._getProfilePaths = getProfilePaths || null;
     this._ledger = ledger || null;
@@ -95,8 +92,7 @@ export class SlackAdapter extends PlatformAdapter {
     this._messageRouter = createMessageRouter({
       webClient,
       allowBots: this._allowBots,
-      freeResponseChannels: this._freeResponseChannels,
-      freeResponseUsers: this._freeResponseUsers,
+      ignoredChannels: this._ignoredChannels,
       dmRouting: this._dmRouting,
       resolveLedger: (hint) => this._resolveAdapterEventLedger(hint),
       threadContext: this._threadContext,
@@ -514,16 +510,8 @@ export class SlackAdapter extends PlatformAdapter {
         return { streamId, ts: streamMessageTs };
       }
       if (intent.intent === TASK_PROGRESS_STOP) {
-        let finalBlocks = null;
-        if (meta.gitDiffSummary?.hasChanges || meta.dailyNotesSummary?.count) {
-          finalBlocks = this.buildPayloads('', {
-            gitDiffSummary: meta.gitDiffSummary,
-            dailyNotesSummary: meta.dailyNotesSummary,
-          }).flatMap((payload) => payload.blocks || []);
-        }
         await this.stopStream(streamId, {
           chunks: meta.chunks || [],
-          final_blocks: finalBlocks,
         });
         return { streamId, ts: streamMessageTs };
       }
@@ -532,31 +520,14 @@ export class SlackAdapter extends PlatformAdapter {
         return { streamId: turnState.streamId, ts: turnState.streamMessageTs || null };
       }
       if (intent.intent === ASSISTANT_TEXT_FINAL) {
-        let finalBlocks = null;
-        if (meta.gitDiffSummary?.hasChanges || meta.dailyNotesSummary?.count) {
-          finalBlocks = this.buildPayloads('', {
-            gitDiffSummary: meta.gitDiffSummary,
-            dailyNotesSummary: meta.dailyNotesSummary,
-          })
-            .flatMap((payload) => payload.blocks || []);
-        }
         try {
           await this.stopStream(turnState.streamId, {
             markdown_text: turnState.assistantStreamTextLen > 0 ? '' : text,
-            final_blocks: finalBlocks,
+            final_blocks: null,
           });
         } catch (err) {
-          if (!isStreamOwnershipError(err) || !finalBlocks?.length) throw err;
-          const payloads = this.buildPayloads('', {
-            gitDiffSummary: meta.gitDiffSummary || null,
-            dailyNotesSummary: meta.dailyNotesSummary || null,
-          });
-          let lastTs = null;
-          for (const payload of payloads) {
-            const result = await this.sendReply(slackChannel, threadTs, payload.text, payload.blocks ? { blocks: payload.blocks } : {});
-            lastTs = result?.ts || lastTs;
-          }
-          return { streamId: turnState.streamId, ts: lastTs };
+          if (!isStreamOwnershipError(err)) throw err;
+          return { streamId: turnState.streamId, ts: turnState.streamMessageTs || null };
         }
         return { streamId: turnState.streamId, ts: turnState.streamMessageTs || null };
       }
@@ -572,6 +543,7 @@ export class SlackAdapter extends PlatformAdapter {
         return { ts: result?.ts || null };
       }
       const payloads = this.buildPayloads(text, {
+        // Summary fields are routing metadata only; Slack no longer renders them.
         gitDiffSummary: meta.gitDiffSummary || null,
         dailyNotesSummary: meta.dailyNotesSummary || null,
       });

@@ -14,7 +14,7 @@
 #     --color "#1ABC9C"
 #
 #   bash ~/Orb/scripts/slack/slack-send-thread.sh \
-#     --channel CXXXXXXXXXX \
+#     --channel C0123456789 \
 #     --main-msg "🏃 活动 04/05｜7,123步 420kcal HR58" \
 #     --blocks-file /tmp/activity-blocks.json \
 #     --color "#2eb886"
@@ -38,8 +38,9 @@ THREAD_FILE=""
 BLOCKS_FILE=""
 COLOR="#5865F2"
 NO_THREAD=false
+PARENT_THREAD_TS=""
 MAX_CHARS=2800
-RECEIPT_DIR="${SLACK_SEND_RECEIPT_DIR:-/Users/karry/Orb/data/receipts/slack-send-thread}"
+RECEIPT_DIR="${SLACK_SEND_RECEIPT_DIR:-~/Orb/data/receipts/slack-send-thread}"
 mkdir -p "$RECEIPT_DIR"
 RECEIPT_FILE="$RECEIPT_DIR/$(date '+%Y-%m-%d_%H-%M-%S')-$$.log"
 
@@ -55,6 +56,7 @@ while [[ $# -gt 0 ]]; do
     --blocks-file) BLOCKS_FILE="$2"; shift 2 ;;
     --color) COLOR="$2"; shift 2 ;;
     --no-thread) NO_THREAD=true; shift ;;
+    --parent-thread-ts) PARENT_THREAD_TS="$2"; shift 2 ;;
     *) echo "未知参数: $1" >&2; exit 1 ;;
   esac
 done
@@ -75,10 +77,10 @@ if [[ "$NO_THREAD" == false ]]; then
   fi
 fi
 
-if [[ -z "${SLACK_BOT_TOKEN:-}" ]] && [[ -f "/Users/karry/Orb/.env" ]]; then
+if [[ -z "${SLACK_BOT_TOKEN:-}" ]] && [[ -f "~/Orb/.env" ]]; then
   SLACK_BOT_TOKEN=$(python3 - <<'PY'
 from pathlib import Path
-for line in Path('/Users/karry/Orb/.env').read_text(encoding='utf-8').splitlines():
+for line in Path('~/Orb/.env').read_text(encoding='utf-8').splitlines():
     line = line.strip()
     if not line or line.startswith('#') or '=' not in line:
         continue
@@ -96,16 +98,20 @@ if [[ -z "${SLACK_BOT_TOKEN:-}" ]]; then
 fi
 
 MAIN_ERR=$(mktemp)
-if ! MAIN_TS=$(SLACK_TOKEN="${SLACK_BOT_TOKEN}" SLACK_CHANNEL="$CHANNEL" SLACK_MAIN_MSG="$MAIN_MSG" python3 - <<'PYEOF' 2>"$MAIN_ERR"
+if ! MAIN_TS=$(SLACK_TOKEN="${SLACK_BOT_TOKEN}" SLACK_CHANNEL="$CHANNEL" SLACK_MAIN_MSG="$MAIN_MSG" SLACK_PARENT_TS="$PARENT_THREAD_TS" python3 - <<'PYEOF' 2>"$MAIN_ERR"
 import json, os, sys, urllib.request
 
 token = os.environ['SLACK_TOKEN']
-payload = json.dumps({
+body = {
     'channel': os.environ['SLACK_CHANNEL'],
     'text': os.environ['SLACK_MAIN_MSG'],
     'unfurl_links': False,
     'unfurl_media': False,
-}).encode('utf-8')
+}
+parent_ts = os.environ.get('SLACK_PARENT_TS', '').strip()
+if parent_ts:
+    body['thread_ts'] = parent_ts
+payload = json.dumps(body).encode('utf-8')
 
 req = urllib.request.Request(
     'https://slack.com/api/chat.postMessage',

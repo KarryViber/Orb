@@ -221,6 +221,8 @@ class MemoryStore:
             )
         if "trust_frozen" not in columns:
             self._conn.execute("ALTER TABLE facts ADD COLUMN trust_frozen INTEGER DEFAULT 0")
+        if "freshness_state" not in columns:
+            self._conn.execute("ALTER TABLE facts ADD COLUMN freshness_state TEXT DEFAULT 'unknown'")
         # Partial index: only live (non-tombstoned) facts, speeds up the default query path.
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_facts_valid ON facts(invalid_at) WHERE invalid_at IS NULL"
@@ -332,9 +334,9 @@ class MemoryStore:
                     """
                     INSERT INTO facts (
                         content, category, tags, source_kind, confidence,
-                        trust_score, source, trust_frozen, importance
+                        trust_score, source, trust_frozen, importance, freshness_state
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, 'fresh')
                     """,
                     (content, category, tags, source_kind, confidence_score, trust_score, source, importance),
                 )

@@ -13,7 +13,7 @@ function createScheduler(options = {}) {
     startExternalSessionListener: false,
     ...options,
   });
-  scheduler.addAdapter('slack', {
+  scheduler.setAdapter({
     async deliver(intent, ctx) {
       deliveries.push({ intent, ctx });
       return { ts: `ts-${deliveries.length}` };

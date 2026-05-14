@@ -17,6 +17,8 @@ const HYDRATE_STABLE_INTENTS = new Set([
   CONTROL_PLANE_MESSAGE,
   RECEIPT_SILENT_SUPPRESSED,
 ]);
+const TURN_RECORDS_TTL_MS = 24 * 60 * 60 * 1000;
+const TURN_RECORDS_EVICT_THRESHOLD = 500;
 
 function todayIsoDate() {
   return new Date().toISOString().slice(0, 10);
@@ -51,7 +53,22 @@ export class TurnDeliveryLedger {
     this._recordsByTurn.set(normalized.turnId, records);
     if (deliveredKey) this._deliveredKeys.add(String(deliveredKey));
     this._appendNdjson(normalized, { sync: HYDRATE_STABLE_INTENTS.has(normalized.intent) });
+    this._evictStaleRecords();
     return normalized;
+  }
+
+  // 长期运行后 _recordsByTurn 会持续增长（per-profile 进程一天上百 turn）。
+  // 仅在累积到一定规模时扫一次，把 24h 之前的 turn 整组移除。
+  _evictStaleRecords() {
+    if (this._recordsByTurn.size < TURN_RECORDS_EVICT_THRESHOLD) return;
+    const cutoff = Date.now() - TURN_RECORDS_TTL_MS;
+    for (const [turnId, records] of this._recordsByTurn) {
+      const newest = records[records.length - 1];
+      const newestTs = newest ? Date.parse(newest.createdAt) : NaN;
+      if (Number.isNaN(newestTs) || newestTs < cutoff) {
+        this._recordsByTurn.delete(turnId);
+      }
+    }
   }
 
   recordAdapterEvent({ source, eventType, channel, ts, platform, meta = {} }) {

@@ -9,7 +9,7 @@ export const scratchpadProvider = {
     const threadTs = ctx.threadTs || '';
     if (!THREAD_TS_RE.test(threadTs)) {
       // scratchpad is Slack-only by design (path-traversal-safe regex);
-      // non-Slack thread_ts (e.g. wechat ID) is inapplicable, not invalid.
+      // non-Slack platform thread_ts is inapplicable, not invalid.
       return [];
     }
     if (!ctx.dataDir) return [];

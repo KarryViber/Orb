@@ -1,6 +1,12 @@
 import { parseToolInput } from './worker/tool-event-state.js';
 
 const DAILY_NOTES_SNIPPET_MAX_CHARS = 40;
+const JST_OFFSET_MS = 9 * 60 * 60 * 1000;
+
+function nowJstHHMM() {
+  const t = new Date(Date.now() + JST_OFFSET_MS);
+  return `${String(t.getUTCHours()).padStart(2, '0')}:${String(t.getUTCMinutes()).padStart(2, '0')}`;
+}
 
 function splitShellWords(command) {
   const words = [];
@@ -69,6 +75,7 @@ function truncateSnippet(text, maxChars = DAILY_NOTES_SNIPPET_MAX_CHARS) {
 }
 
 export function parseDailyNotesAppendToolUse(toolUse) {
+  // Feeds routing-only dailyNotesSummary metadata; Slack rendering was removed on 2026-05-14.
   if (toolUse?.name !== 'Bash') return null;
   const input = parseToolInput(toolUse?.input);
   const command = typeof input?.command === 'string' ? input.command : '';
@@ -76,7 +83,8 @@ export function parseDailyNotesAppendToolUse(toolUse) {
 
   const words = splitShellWords(command);
   const mode = optionValue(words, '--mode') || 'line';
-  const time = optionValue(words, '--time') || '';
+  const rawTime = optionValue(words, '--time') || '';
+  const time = /^\d{2}:\d{2}$/.test(rawTime) ? rawTime : nowJstHHMM();
   const layer = optionValue(words, '--layer') || '';
   const title = optionValue(words, '--title') || '';
   const body = optionValue(words, '--body') || '';

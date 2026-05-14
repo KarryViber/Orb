@@ -14,8 +14,7 @@ const TAG = 'slack';
 export function createMessageRouter({
   webClient,
   allowBots,
-  freeResponseChannels,
-  freeResponseUsers,
+  ignoredChannels,
   dmRouting,
   resolveLedger,
   threadContext,
@@ -34,7 +33,7 @@ export function createMessageRouter({
   const REACTION_DEDUP_TTL = 30 * 1000;
 
   // Quick-reply emoji → text map (Slack reaction names, no colons)
-  // 详见 ~/Orb/.claude/skills/reaction-action-protocol/SKILL.md
+  // 详见 ~/Orb/profiles/.claude/skills/reaction-action-protocol/SKILL.md
   const QUICK_REPLY_MAP = {
     'white_check_mark': '收工',
     'point_right': '继续',
@@ -212,7 +211,6 @@ export function createMessageRouter({
       const isDM = channelType === 'im' || channelType === 'mpim';
       const isMention = event.text?.includes(`<@${botUserId}>`);
       const threadTs = event.thread_ts || event.ts;
-      const tracked = threadContext._isTrackedThread(threadTs);
       const isBotThread = event.thread_ts && router._isBotThread(event.thread_ts);
       let isAssistantThread = false;
       if (isDM && channelType === 'im' && event.thread_ts && !event.bot_id && !isBotThread) {
@@ -231,9 +229,8 @@ export function createMessageRouter({
         }
       }
 
-      const isFreeResponse = freeResponseChannels.has(event.channel) && freeResponseUsers.has(event.user);
-      if (!isDM && !isMention && !tracked && !isBotThread && !isFreeResponse) return;
-      if (isMention || isDM || isFreeResponse) threadContext._trackThread(threadTs);
+      if (ignoredChannels.has(event.channel)) return;
+      if (isMention || isDM) threadContext._trackThread(threadTs);
 
       const userText = (event.text || '').replace(new RegExp(`<@${botUserId}>`, 'g'), '').trim();
       if (!userText && (!event.files || event.files.length === 0)) return;

@@ -4,8 +4,8 @@
 set -euo pipefail
 
 ORB="$HOME/Orb"
-DATA="$ORB/profiles/karry/data"
-WS="$ORB/profiles/karry/workspace"
+DATA="$ORB/profiles/<your-profile>/data"
+WS="$ORB/profiles/<your-profile>/workspace"
 
 now=$(date +%s)
 report=()
@@ -67,10 +67,10 @@ done
 n=$(find "$ORB" -name '.DS_Store' -not -path '*/node_modules/*' -not -path '*/.git/*' -delete -print 2>/dev/null | wc -l | tr -d ' ')
 [ "$n" -gt 0 ] && report_add ".DS_Store: removed $n"
 
-# Output
+# Output（自进化频道统一标题协议：emoji + 中文名 MM/DD｜2-4 metric · 分隔）
 if [ ${#report[@]} -eq 0 ]; then
-  echo "🧹 cleanup-residue｜nothing to do"
+  echo "🧹 残留清理 $(date +%m/%d)｜无变更"
 else
-  echo "🧹 cleanup-residue｜$(date +%m/%d)"
+  echo "🧹 残留清理 $(date +%m/%d)｜${#report[@]} 项"
   for line in "${report[@]}"; do echo "  • $line"; done
 fi

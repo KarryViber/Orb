@@ -7,12 +7,12 @@
 const fs = require('fs');
 const path = require('path');
 
-const WORKSPACE = process.env.WORKSPACE || '/Users/karry/Orb/profiles/karry/workspace';
+const WORKSPACE = process.env.WORKSPACE || '~/Orb/profiles/<your-profile>/workspace';
 const CLAUDE_MD = path.join(WORKSPACE, 'CLAUDE.md');
 const ORB_ROOT = path.resolve(WORKSPACE, '../../..');
 const ORB_CLAUDE_MD = path.join(ORB_ROOT, 'CLAUDE.md');
 const ORB_SRC_DIR = path.join(ORB_ROOT, 'src');
-const ORB_WORKER_JS = path.join(ORB_SRC_DIR, 'worker.js');
+const ORB_IPC_SCHEMA_JS = path.join(ORB_SRC_DIR, 'ipc-schema.js');
 const LINE_WARN_THRESHOLD = 250;
 
 const REQUIRED_SECTIONS = [
@@ -82,17 +82,14 @@ if (fs.existsSync(ORB_CLAUDE_MD)) {
   // Check 1: src/ file list in Architecture section vs real src/*.js (incl. adapters/)
   if (fs.existsSync(ORB_SRC_DIR)) {
     const realSrcFiles = new Set();
-    for (const f of fs.readdirSync(ORB_SRC_DIR)) {
-      if (f.endsWith('.js') && fs.statSync(path.join(ORB_SRC_DIR, f)).isFile()) realSrcFiles.add(f);
-    }
-    for (const sub of ['adapters', 'turn-delivery', 'context-providers']) {
-      const subDir = path.join(ORB_SRC_DIR, sub);
-      if (fs.existsSync(subDir)) {
-        for (const f of fs.readdirSync(subDir)) {
-          if (f.endsWith('.js')) realSrcFiles.add(f);
-        }
+    const walk = function (dir) {
+      for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
+        const p = path.join(dir, ent.name);
+        if (ent.isDirectory()) walk(p);
+        else if (ent.isFile() && ent.name.endsWith('.js')) realSrcFiles.add(ent.name);
       }
-    }
+    };
+    walk(ORB_SRC_DIR);
     const docSrcFiles = new Set();
     const srcLineRe = /^\s{2,}([\w-]+\.js)\s+—/gm;
     let sm;
@@ -105,38 +102,54 @@ if (fs.existsSync(ORB_CLAUDE_MD)) {
     }
   }
 
-  // Check 2: IPC payload fields in markdown table vs worker.js JSDoc header
-  if (fs.existsSync(ORB_WORKER_JS)) {
-    const workerHead = fs.readFileSync(ORB_WORKER_JS, 'utf-8').slice(0, 4000);
-    const typeFieldsFromBlock = function (text) {
-      const map = {};
-      const re = /\{\s*type:\s*'(\w+)'\s*,\s*([^}]+?)\s*\}/g;
-      let mm;
-      while ((mm = re.exec(text)) !== null) {
-        const t = mm[1];
-        const cleaned = mm[2].replace(/\n\s*\*\s*/g, ' ');
-        const fields = cleaned
-          .split(',')
-          .map(function (s) { return s.trim().replace(/:.*$/, '').replace(/\?$/, ''); })
-          .filter(function (s) { return s && /^\w+$/.test(s); });
-        map[t] = new Set(fields);
+  // Check 2: IPC payload fields — ipc-schema.js is source of truth
+  if (fs.existsSync(ORB_IPC_SCHEMA_JS)) {
+    const schemaText = fs.readFileSync(ORB_IPC_SCHEMA_JS, 'utf-8');
+    const realTypes = {};
+    const factoryRe = /export function make\w+\([^)]*\)\s*\{[\s\S]*?return\s*\{([\s\S]*?)\n  \};/g;
+    let fm;
+    while ((fm = factoryRe.exec(schemaText)) !== null) {
+      const body = fm[1];
+      const typeMatch = body.match(/type:\s*IPC_TYPES\.(\w+)/);
+      if (!typeMatch) continue;
+      const typeKey = typeMatch[1];
+      const typeConstRe = new RegExp(typeKey + ":\\s*'(\\w+)'");
+      const typeNameMatch = schemaText.match(typeConstRe);
+      if (!typeNameMatch) continue;
+      const typeName = typeNameMatch[1];
+      const fields = new Set();
+      const fieldRe = /^\s{4}(\w+):/gm;
+      let xm;
+      while ((xm = fieldRe.exec(body)) !== null) {
+        if (xm[1] !== 'type') fields.add(xm[1]);
       }
-      return map;
-    };
-    const workerTypes = typeFieldsFromBlock(workerHead);
-    const docTypes = typeFieldsFromBlock(orbText);
-    for (const t of Object.keys(workerTypes)) {
+      realTypes[typeName] = fields;
+    }
+    const docTypes = {};
+    const docTypeRe = /\{\s*type:\s*'(\w+)'\s*(?:,\s*([\s\S]*?))?\s*\}\s*(?:`|\|)/g;
+    let dm;
+    while ((dm = docTypeRe.exec(orbText)) !== null) {
+      const t = dm[1];
+      let body = (dm[2] || '').replace(/\{[^{}]*\}/g, '');
+      const fields = new Set();
+      for (const part of body.split(',')) {
+        const name = part.trim().replace(/[?:].*$/, '').trim();
+        if (/^\w+$/.test(name)) fields.add(name);
+      }
+      docTypes[t] = fields;
+    }
+    for (const t of Object.keys(realTypes)) {
       if (!docTypes[t]) {
         warnings.push('orb-claudemd: IPC type missing in doc: ' + t);
         continue;
       }
-      const wf = workerTypes[t];
+      const rf = realTypes[t];
       const df = docTypes[t];
-      for (const f of wf) {
+      for (const f of rf) {
         if (!df.has(f)) warnings.push('orb-claudemd: IPC ' + t + ' doc missing field: ' + f);
       }
       for (const f of df) {
-        if (!wf.has(f)) warnings.push('orb-claudemd: IPC ' + t + ' doc has stale field: ' + f);
+        if (!rf.has(f)) warnings.push('orb-claudemd: IPC ' + t + ' doc has stale field: ' + f);
       }
     }
   }
@@ -145,7 +158,7 @@ if (fs.existsSync(ORB_CLAUDE_MD)) {
 // === Lesson similarity nudge (daily) ===
 try {
   const { spawnSync } = require('child_process');
-  const scanScript = '/Users/karry/Orb/profiles/karry/scripts/lesson-similarity-scan.py';
+  const scanScript = '~/Orb/profiles/<your-profile>/scripts/lesson-similarity-scan.py';
   if (fs.existsSync(scanScript)) {
     const out = spawnSync('python3', [scanScript], { encoding: 'utf-8', timeout: 30000 });
     if (out.status === 0 && out.stdout) {

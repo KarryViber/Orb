@@ -33,7 +33,7 @@ Claude Code CLI (one worker per thread, cwd = profiles/{name}/workspace/)
 ## Features
 
 - Multi-profile isolation with separate `scripts/`, `workspace/`, and `data/` directories per profile.
-- Slack Socket Mode adapter for production use, with adapter boundaries that keep new platforms isolated.
+- Slack Socket Mode adapter for production use. The `PlatformAdapter` abstraction stays, but Orb ships a single Slack instance; alternative platforms would require a custom adapter.
 - Holographic long-term memory in local SQLite for fact extraction, trust scoring, decay controls, and write-time arbitration.
 - DocStore full-text search in local SQLite FTS5, with project slug inference from the thread and registry-driven path mapping.
 - Cron scheduling with per-profile `cron-jobs.json`, fire-and-forget workers, and per-job inflight guards.
@@ -41,12 +41,13 @@ Claude Code CLI (one worker per thread, cwd = profiles/{name}/workspace/)
 - Short-lived per-thread workers that reuse the same Claude session for follow-up messages via `inject` IPC.
 
 
-## v0.5 Highlights
+## v0.6 Highlights
 
-- Per-turn delivery is organized under `src/turn-delivery/`, with separate ledgers, stream handling, adapter strategy, and cc_event subscription.
-- Context assembly uses providers for cron history, cron protocol, channel metadata, legacy attachments, scratchpad notes, document recall, memory recall, and thread history.
-- Cron delivery is adapter-owned through `deliver.mode` (`silent`, `direct`, `evolution_state`, `dm_only`) instead of the old shell delivery flow.
-- DocStore wide-mode path inference is configured with `DOCSTORE_WIDE_MAP_JSON`; start from `docs/docstore-wide-map.example.json` for custom repository layouts.
+- Single-adapter consolidation: the `PlatformAdapter` registry collapses to a single Slack instance. The WeChat adapter and its iLink CDN bridge are removed; the abstraction stays so a new adapter can still slot in cleanly.
+- Self-evolution cron is refactored into a three-stage pipeline: **A — mechanical** (deterministic data gathering, no LLM), **B — single-pass LLM** (one reasoning pass), **C — render** (deterministic card formatting). Each stage owns one failure mode and one model budget.
+- Lesson lifecycle automation: distill, narration audit, candidate auto-classify (new vs. merge), and weekly seed-landing approval share one canonical audit pass at 02:20 JST. Lesson similarity comparison swaps Jaccard for a Haiku LLM judge.
+- Four-layer `CLAUDE.md` prompt architecture: `~/.claude/CLAUDE.md` (user-private) / repo-root `CLAUDE.md` / `profiles/CLAUDE.md` (framework-wide engineering rules) / `profiles/{name}/workspace/CLAUDE.md` (profile-specific). Framework rules moved up from user-private into the repo so all profiles inherit them.
+- Slack signal-to-noise rebalance: auto-context injection (`git diff` + daily-notes receipt) is opt-in via `ORB_SLACK_AUTO_CONTEXT=1`; proactive stream rotation at 4 minutes is the default (`ORB_STREAM_AUTO_ROTATE=1`).
 
 ## Quickstart
 
@@ -123,11 +124,12 @@ The deeper walkthrough is in [docs/architecture.md](docs/architecture.md).
 
 Claude Code discovers the stable layers natively:
 
-- Layer 1: `~/.claude/CLAUDE.md`
-- Layer 2: repository-root `CLAUDE.md`
-- Layer 3: `profiles/{name}/workspace/CLAUDE.md`
+- Layer 1: `~/.claude/CLAUDE.md` (user-private global)
+- Layer 2: repository-root `CLAUDE.md` (project-wide rules)
+- Layer 3: `profiles/CLAUDE.md` (framework-level engineering rules; loaded into every profile worker via cwd walk-up)
+- Layer 4: `profiles/{name}/workspace/CLAUDE.md` (profile-specific)
 - Workspace add-ons: `profiles/{name}/workspace/.claude/skills/` and `profiles/{name}/workspace/.claude/agents/`
-- System-scope skills shared across profiles: repository-root `.claude/skills/` (loaded into every worker via `--add-dir`)
+- System-scope skills shared across profiles: `profiles/.claude/skills/` (loaded into every worker via `--add-dir`)
 - CLI-managed memory tied to the workspace `cwd`
 
 Orb only adds what the CLI does not already know:
@@ -219,7 +221,7 @@ See [docs/profile-guide.md](docs/profile-guide.md) for the full profile model.
 
 ## Adding A Platform
 
-New platforms plug in through the `PlatformAdapter` interface in `src/adapters/interface.js`. Orb keeps formatting, transport, and approval handling behind the adapter boundary so scheduler and worker code do not need platform-specific imports.
+New platforms plug in through the `PlatformAdapter` shape declared in `src/adapters/slack.js`. Orb keeps formatting, transport, and approval handling behind the adapter boundary so scheduler and worker code do not need platform-specific imports.
 
 See [docs/adapter-development.md](docs/adapter-development.md).
 
@@ -240,13 +242,15 @@ src/
 ├── stop-reason.js         # unified stopReason classification
 ├── format-utils.js        # adapter-agnostic text helpers
 └── adapters/
-    ├── interface.js
-    ├── slack.js
+    ├── slack.js                       # the single PlatformAdapter instance
     ├── slack-format.js
     ├── slack-permission-render.js
     ├── slack-stream-error.js
     ├── slack-block-actions.js
-    └── slack-dm-routing.js
+    ├── slack-block-action-card.js
+    ├── slack-block-action-script.js
+    ├── slack-dm-routing.js
+    └── image-cache.js
 
 lib/
 ├── holographic/           # Python memory bridge and maintenance
@@ -255,26 +259,23 @@ lib/
 └── memory-usage/          # memory usage tracking + decay
 
 scripts/
-├── cron/                  # cron-deliver, channel resolve, run log
+├── cron/                  # channel resolve, run log, narration audit, run mode = script
 ├── slack/                 # blockkit, send-thread, send-attachment, extract
-├── wechat/                # WeChat helpers
-├── infra/                 # backup, hardware monitor, mac health, outbound gate
-├── workflow/              # claudemd-lint, external-session-spawn, memory-crud
+├── infra/                 # cleanup, mac health, memory lint, outbound gate
+├── workflow/              # external-session-spawn, claudemd-lint, memory-crud
+├── git-hooks/             # pre-commit boundary guard
 └── hooks/                 # PreToolUse / docstore hint hooks
 
-.claude/
-└── skills/                # system-scope skills shared across profiles
-
 profiles/
-└── {name}/                # scripts + workspace + data
+├── CLAUDE.md              # framework-level engineering rules (Layer 3)
+├── .claude/skills/        # system-scope skills shared across profiles
+└── {name}/                # scripts + workspace + data per profile
 ```
 
 ## Status
 
 - Slack adapter: production path
-- WeChat adapter: in-repo but not documented here as a primary deployment target
-- Discord: not implemented
-- Other platforms: contributions welcome
+- Other platforms: not implemented; contributions welcome via the `PlatformAdapter` interface
 
 ## License
 

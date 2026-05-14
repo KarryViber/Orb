@@ -11,7 +11,7 @@ flowchart TD
   O --> STR[adapter strategy]
   STR --> A[adapter.deliver]
   A -->|stream| SL1[Slack chat.start/append/stopStream]
-  A -->|postMessage| SL2[Slack chat.postMessage or WeChat sendmessage]
+  A -->|postMessage| SL2[Slack chat.postMessage]
   A -->|edit| SL3[Slack chat.update]
   A -->|metadata| SL4[thread status / title / prompts]
   O --> L[TurnDeliveryLedger]
@@ -24,9 +24,9 @@ Every intent includes:
 
 - `turnId`: stable turn identity, usually worker `turnId` or `threadTs#attemptId`
 - `attemptId`: scheduler attempt id, used for replay de-duplication
-- `channel`: platform channel or WeChat user id
-- `threadTs`: delivery thread timestamp or WeChat peer id
-- `platform`: `slack`, `wechat`, or another adapter platform
+- `channel`: platform channel id
+- `threadTs`: delivery thread timestamp
+- `platform`: `slack` or another adapter platform
 - `channelSemantics`: `reply`, `broadcast`, or `silent`
 - `intent`: one of the typed intent names below
 - `text`: optional user-visible text
@@ -64,7 +64,6 @@ The strategy is platform-agnostic and reads only adapter capabilities plus turn 
 - Cron silent: `channelSemantics: "silent"` produces only `receipt.silent_suppressed` ledger records for assistant text.
 - SIGTERM replay: delivered keys include `turnId`, `attemptId`, intent, channel, source, and sequence where needed, so a replayed attempt is skipped.
 - Stream failure: failed stream state is stored on the turn; final text falls back to one assistant post and an explicit continuation marker.
-- WeChat: `capabilities.stream` is false, task progress is not externally emitted, and final assistant text uses the same post-message path backed by `sendmessage`.
 
 ## Ledger
 
@@ -101,10 +100,9 @@ Kept pieces:
 4. Injected turns reset turn-level delivery state.
 5. Same-attempt replay is skipped.
 6. Stream failure falls back to final reply plus continuation marker.
-7. WeChat final output uses sendmessage and has no stream calls.
-8. Control-plane messages are physically separate from assistant text.
-9. Metadata updates do not create new messages.
-10. Duplicate final emits are skipped by typed record state.
-11. Abnormal-exit warnings are suppressed only after visible delivery.
-12. Scheduler routes turn output through the orchestrator.
-13. Slack subscribers route output through the orchestrator.
+7. Control-plane messages are physically separate from assistant text.
+8. Metadata updates do not create new messages.
+9. Duplicate final emits are skipped by typed record state.
+10. Abnormal-exit warnings are suppressed only after visible delivery.
+11. Scheduler routes turn output through the orchestrator.
+12. Slack subscribers route output through the orchestrator.

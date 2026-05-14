@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ORB_BOUNDARY_HOOK_NAME=pre-commit exec "$SCRIPT_DIR/pre-commit-boundary-guard.sh"

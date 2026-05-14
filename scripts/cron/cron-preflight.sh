@@ -8,7 +8,7 @@ set -euo pipefail
 
 FAILED=0
 WARNED=0
-PROFILE_DIR="$HOME/Orb/profiles/karry"
+PROFILE_DIR="$HOME/Orb/profiles/<your-profile>"
 ENV_FILE="$PROFILE_DIR/.env"
 
 # Helper: read a key from .env file

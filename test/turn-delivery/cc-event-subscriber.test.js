@@ -112,7 +112,12 @@ test('turn-delivery unified subscriber dispatches Qi, text, status, and result c
   await bus.publish(toolUse('turn-unified', 'Bash', { description: 'Run tests' }), ctx);
   assert.equal(ctx.turn.taskCardStates.qi.streamId, 'stream-1');
   assert.deepEqual(adapter.calls[0].slice(0, 3), ['startStream', 'C1', '111.222']);
-  assert.deepEqual(adapter.calls.at(-1), ['setThreadStatus', 'C1', '111.222', 'Bash: Run tests']);
+  assert.equal(adapter.calls.some((call) => (
+    call[0] === 'setThreadStatus'
+    && call[1] === 'C1'
+    && call[2] === '111.222'
+    && call[3] === 'Bash: Run tests'
+  )), true);
 
   await bus.publish(textEvent('turn-unified', 'first'), ctx);
   await sleep(25);
@@ -170,7 +175,7 @@ test('turn-delivery text stream marks task card failed on Slack ownership loss',
   assert.equal(ctx.turn.taskCardStates.qi.failed, true);
 });
 
-test('turn-delivery includes early receipt summaries when stopping Qi stream', async () => {
+test('turn-delivery omits receipt summaries from Qi stream stop meta', async () => {
   const adapter = createMockAdapter();
   const bus = new EventBus();
   bus.subscribe(createTurnDeliveryCcEventSubscriber({ textDebounceMs: 1 }));
@@ -187,8 +192,9 @@ test('turn-delivery includes early receipt summaries when stopping Qi stream', a
 
   const stopRecord = ctx.orchestrator.ledger.getRecordsForTurn('turn-summary')
     .find((record) => record.intent === 'task_progress.stop' && record.deliveryChannel === 'stream');
-  assert.equal(stopRecord.meta.dailyNotesSummary.count, 2);
-  assert.equal(stopRecord.meta.gitDiffSummary.hasChanges, true);
+  assert.ok(stopRecord, 'task_progress.stop record should exist');
+  assert.equal(stopRecord.meta.dailyNotesSummary, undefined);
+  assert.equal(stopRecord.meta.gitDiffSummary, undefined);
 });
 
 test('turn-delivery starts separate Qi and TodoWrite streams in either order', async () => {

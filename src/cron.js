@@ -458,10 +458,6 @@ function loadJobs(dataDir) {
   }
 }
 
-function sleepSync(ms) {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-}
-
 function isPidAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
@@ -483,49 +479,58 @@ function readLockPid(lockPath) {
   }
 }
 
-function withJobsFileLock(dataDir, fn) {
+async function withJobsFileLock(dataDir, fn) {
   mkdirSync(dataDir, { recursive: true });
   const lockPath = join(dataDir, 'cron-jobs.json.lock');
   const startedAt = Date.now();
-  let fd = null;
 
-  while (fd == null) {
-    try {
-      fd = openSync(lockPath, 'wx');
-      writeFileSync(fd, JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }) + '\n', 'utf-8');
-    } catch (err) {
-      if (err?.code !== 'EEXIST') throw err;
-      const pid = readLockPid(lockPath);
-      let stale = !isPidAlive(pid);
+  // 非阻塞获取锁：用 setTimeout 异步轮询，避免 Atomics.wait 同步阻塞主线程事件循环
+  const fd = await new Promise((resolveLock, rejectLock) => {
+    const attempt = () => {
+      let opened = null;
       try {
-        stale = stale || Date.now() - statSync(lockPath).mtimeMs > JOBS_LOCK_STALE_MS;
-      } catch {
-        stale = true;
+        opened = openSync(lockPath, 'wx');
+        writeFileSync(opened, JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }) + '\n', 'utf-8');
+        resolveLock(opened);
+        return;
+      } catch (err) {
+        if (opened != null) { try { closeSync(opened); } catch {} }
+        if (err?.code !== 'EEXIST') { rejectLock(err); return; }
+        const pid = readLockPid(lockPath);
+        let stale = !isPidAlive(pid);
+        try {
+          stale = stale || Date.now() - statSync(lockPath).mtimeMs > JOBS_LOCK_STALE_MS;
+        } catch {
+          stale = true;
+        }
+        if (stale) {
+          try { unlinkSync(lockPath); } catch {}
+          attempt();
+          return;
+        }
+        if (Date.now() - startedAt >= JOBS_LOCK_TIMEOUT_MS) {
+          rejectLock(new Error(`timed out waiting for ${lockPath}`));
+          return;
+        }
+        setTimeout(attempt, 25);
       }
-      if (stale) {
-        try { unlinkSync(lockPath); } catch {}
-        continue;
-      }
-      if (Date.now() - startedAt >= JOBS_LOCK_TIMEOUT_MS) {
-        throw new Error(`timed out waiting for ${lockPath}`);
-      }
-      sleepSync(25);
-    }
-  }
+    };
+    attempt();
+  });
 
   try {
-    return fn();
+    return await fn();
   } finally {
     try { closeSync(fd); } catch {}
     try { unlinkSync(lockPath); } catch {}
   }
 }
 
-function saveJobs(dataDir, jobs) {
+async function saveJobs(dataDir, jobs) {
   const p = jobsPath(dataDir);
   const tmp = p + '.tmp.' + process.pid;
   try {
-    withJobsFileLock(dataDir, () => {
+    await withJobsFileLock(dataDir, () => {
       mkdirSync(join(p, '..'), { recursive: true });
       writeFileSync(tmp, JSON.stringify(jobs, null, 2) + '\n', 'utf-8');
       renameSync(tmp, p);
@@ -674,9 +679,17 @@ export class CronScheduler {
           } catch (err) {
             logError(TAG, `failed to persist cron nextRunAt updates: ${err.message}`);
             recordCronPersistenceFailure(paths.dataDir, err.message);
+            // 持久化失败 → in-memory 回滚 + 把受影响 job 从 dueJobs 移除，
+            // 防止本 tick 执行后无法落 nextRunAt，进程重启后重复触发
             for (const job of dueJobs) {
               const storedJob = jobs.find((item) => item.id === job.id);
               if (storedJob) job.nextRunAt = storedJob.nextRunAt;
+            }
+            const failedIds = new Set(nextRunUpdates.keys());
+            const skipped = dueJobs.filter((j) => failedIds.has(j.id));
+            if (skipped.length > 0) {
+              dueJobs.splice(0, dueJobs.length, ...dueJobs.filter((j) => !failedIds.has(j.id)));
+              warn(TAG, `skipped ${skipped.length} due job(s) after nextRunAt persistence failure`);
             }
           }
         }
@@ -785,7 +798,6 @@ export class CronScheduler {
   _resolveDeliveryAdapter(scheduler, platform) {
     if (!platform) return null;
     if (typeof scheduler?._getAdapter === 'function') return scheduler._getAdapter(platform);
-    if (scheduler?.adapters instanceof Map) return scheduler.adapters.get(platform) || null;
     return null;
   }
 
@@ -800,10 +812,10 @@ export class CronScheduler {
     const previous = this._jobWriteChains.get(dataDir) || Promise.resolve();
     const next = previous
       .catch(() => {})
-      .then(() => {
+      .then(async () => {
         const jobs = loadJobs(dataDir);
         if (!mutateJobs(jobs)) return;
-        saveJobs(dataDir, jobs);
+        await saveJobs(dataDir, jobs);
       });
 
     let tracked;

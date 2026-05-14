@@ -50,6 +50,7 @@ const MAX_AUTO_CONTINUE = 2;  // max auto-retries on empty result (context overf
 const PERMISSION_APPROVAL_TIMEOUT_MS = ORB_PERMISSION_TIMEOUT_MS;
 const STATUS_REFRESH_MS = 20_000;
 const SILENT_PREFIX = '[SILENT]';
+const MAX_SOCKET_BUFFER = 64 * 1024;
 const LOADING_MESSAGES = [
   'Cooking…',
   'Reading files…',
@@ -299,7 +300,7 @@ export class Scheduler {
         });
       },
     });
-    this.adapters = new Map();     // platform → adapter
+    this.adapter = null;           // single Slack adapter
     this.activeWorkers = new Map();
     this.threadQueues = new Map();
     this._skillToolCounts = new Map();   // profileName → cumulative tool count
@@ -331,7 +332,7 @@ export class Scheduler {
     this._restoreShutdownQueues();
   }
 
-  addAdapter(name, adapter) {
+  setAdapter(adapter) {
     if (typeof adapter?.deliver !== 'function') throw new Error('adapter must implement deliver()');
     if (typeof adapter.setAdapterEventLedgerResolver === 'function') {
       adapter.setAdapterEventLedgerResolver((hint = {}) => {
@@ -340,7 +341,7 @@ export class Scheduler {
         return this._getTurnDeliveryLedger(this.getProfile(userId));
       });
     }
-    this.adapters.set(name, adapter);
+    this.adapter = adapter;
     if (typeof adapter.installCcEventSubscriber === 'function') {
       adapter.installCcEventSubscriber(this.eventBus);
     }
@@ -363,8 +364,8 @@ export class Scheduler {
     });
   }
 
-  _getAdapter(platform) {
-    return this.adapters.get(platform) || null;
+  _getAdapter(_platform) {
+    return this.adapter;
   }
 
   _getTurnDeliveryLedger(profile) {
@@ -402,6 +403,11 @@ export class Scheduler {
 
     socket.on('data', (chunk) => {
       buffer += chunk;
+      if (buffer.length > MAX_SOCKET_BUFFER) {
+        warn(TAG, `permission socket buffer overflow, closing: ${buffer.length} bytes`);
+        socket.destroy();
+        return;
+      }
       const newlineIndex = buffer.indexOf('\n');
       if (newlineIndex === -1) return;
       const line = buffer.slice(0, newlineIndex).trim();
@@ -666,6 +672,23 @@ export class Scheduler {
 
     this._externalSessionServer = net.createServer((socket) => this._handleExternalSessionSocket(socket));
     this._externalSessionServer.on('error', (err) => {
+      if (err.code === 'EADDRINUSE') {
+        warn(TAG, `external session socket EADDRINUSE, retrying unlink: ${this._externalSessionSocketPath}`);
+        try {
+          unlinkSync(this._externalSessionSocketPath);
+          this._externalSessionServer.listen(this._externalSessionSocketPath, () => {
+            try {
+              chmodSync(this._externalSessionSocketPath, 0o600);
+            } catch (chmodErr) {
+              warn(TAG, `failed to chmod external session socket after retry: ${chmodErr.message}`);
+            }
+            info(TAG, `external session socket re-listening after EADDRINUSE recovery: ${this._externalSessionSocketPath}`);
+          });
+        } catch (retryErr) {
+          logError(TAG, `external session socket unrecoverable: ${retryErr.message}`);
+        }
+        return;
+      }
       logError(TAG, `external session socket server error: ${err.message}`);
     });
     this._externalSessionServer.listen(this._externalSessionSocketPath, () => {
@@ -683,6 +706,11 @@ export class Scheduler {
     let buffer = '';
     socket.on('data', (chunk) => {
       buffer += chunk;
+      if (buffer.length > MAX_SOCKET_BUFFER) {
+        warn(TAG, `external session socket buffer overflow, closing: ${buffer.length} bytes`);
+        socket.destroy();
+        return;
+      }
       let newlineIndex = buffer.indexOf('\n');
       while (newlineIndex !== -1) {
         const line = buffer.slice(0, newlineIndex).trim();
@@ -1034,9 +1062,9 @@ export class Scheduler {
   }
 
   _disconnectAdapters() {
-    for (const [name, adapter] of this.adapters) {
-      info(TAG, `disconnecting adapter: ${name}`);
-      adapter.disconnect();
+    if (this.adapter) {
+      info(TAG, 'disconnecting adapter: slack');
+      this.adapter.disconnect();
     }
   }
 

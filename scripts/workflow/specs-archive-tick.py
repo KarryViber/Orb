@@ -2,15 +2,12 @@
 import argparse
 import os
 import shutil
-import subprocess
 import sys
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
 
 AGE_DAYS = 14
-DEFAULT_DM_CHANNEL = "D0ANGB3M1CZ"
 
 
 def repo_root() -> Path:
@@ -43,43 +40,12 @@ def archive(candidates: list[Path], archive_dir: Path) -> list[Path]:
     return archived
 
 
-def deliver_dm(repo: Path, archived: list[Path]) -> None:
-    channel = os.environ.get("ORB_SPECS_ARCHIVE_DM_CHANNEL") or os.environ.get("ORB_FAILURE_DM_CHANNEL") or DEFAULT_DM_CHANNEL
-    thread = tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, prefix="specs-archive-", suffix=".md")
-    try:
-        with thread:
-            thread.write("\n".join(f"- `{path.name}`" for path in archived))
-            thread.write("\n")
-        main_msg = f"🗄️ Specs Archive Tick｜archived {len(archived)} completed specs"
-        subprocess.run(
-            [
-                "bash",
-                str(repo / "scripts/cron/cron-deliver.sh"),
-                "--cron-name",
-                "Specs Archive Tick",
-                "--channel",
-                channel,
-                "--main-msg",
-                main_msg,
-                "--thread-file",
-                thread.name,
-            ],
-            check=True,
-        )
-    finally:
-        try:
-            os.unlink(thread.name)
-        except FileNotFoundError:
-            pass
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description="Archive completed specs older than 14 days.")
     parser.add_argument("--dry-run", action="store_true", help="List candidates without moving files or sending DM.")
     args = parser.parse_args()
 
-    repo = repo_root()
-    specs_dir = repo / "specs"
+    specs_dir = repo_root() / "specs"
     archive_dir = specs_dir / ".archive"
     cutoff_ts = datetime.now(timezone.utc).timestamp() - AGE_DAYS * 24 * 60 * 60
 
@@ -96,7 +62,6 @@ def main() -> int:
     archived = archive(candidates, archive_dir)
     for path in archived:
         print(path)
-    deliver_dm(repo, archived)
     return 0
 
 

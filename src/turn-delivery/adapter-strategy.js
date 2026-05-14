@@ -33,6 +33,11 @@ export function resolveDeliveryChannel({ adapter, intent, turnState }) {
       return { channel: 'stream', reason: 'assistant-text-via-stream' };
     }
     if (type === ASSISTANT_TEXT_FINAL) {
+      // Text was already flushed to qi stream via DELTA — suppress to avoid duplication.
+      // streamFailed override in orchestrator.js fires after this and restores postMessage on failures.
+      if (turnState?.assistantStreamTextLen > 0) {
+        return { channel: 'silent', reason: 'already-streamed' };
+      }
       return { channel: 'postMessage', reason: 'assistant-text-no-stream' };
     }
     return { channel: 'silent', reason: 'delta-without-stream' };

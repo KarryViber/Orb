@@ -8,15 +8,13 @@ import { execFile } from 'node:child_process';
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
-import { PlatformAdapter } from './adapters/interface.js';
 
 const execFileAsync = promisify(execFile);
 const VALID_MODES = new Set(['direct', 'evolution_state', 'dm_only', 'silent']);
 const VALID_STATUSES = new Set(['ok', 'fail', 'failed', 'skip', 'silent']);
 
 function hasCronDeliveryOverride(adapter) {
-  return typeof adapter?.deliverCronOutput === 'function'
-    && adapter.deliverCronOutput !== PlatformAdapter.prototype.deliverCronOutput;
+  return typeof adapter?.deliverCronOutput === 'function';
 }
 
 export function resolveDeliveryMode(job, fallbackDm = null) {
@@ -123,7 +121,7 @@ export function renderCronBlocks(rawBlocks) {
     if (stringOrNull(item.header)) {
       itemBlocks.push({
         type: 'section',
-        text: { type: 'mrkdwn', text: `*${item.header.trim()}*` },
+        text: { type: 'mrkdwn', text: `*${item.header.trim().replace(/^#+\s*/, '')}*` },
       });
     }
     if (stringOrNull(item.body)) {

@@ -1,6 +1,6 @@
 import { spawn as spawnProcess } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -17,9 +17,10 @@ export const HANDLER_PID_LOG = join(HANDLER_LOG_DIR, 'pids.log');
 // @internal: test-only
 export function resolveHandlerScript(profilePaths, actionId) {
   if (!profilePaths?.scriptsDir) return null;
-  const handlersDir = join(profilePaths.scriptsDir, 'handlers');
+  const handlersDir = resolve(join(profilePaths.scriptsDir, 'handlers'));
   for (const ext of HANDLER_EXTENSIONS) {
-    const candidate = join(handlersDir, `${actionId}${ext}`);
+    const candidate = resolve(join(handlersDir, `${actionId}${ext}`));
+    if (!candidate.startsWith(handlersDir + sep)) continue;
     if (existsSync(candidate)) return candidate;
   }
   return null;

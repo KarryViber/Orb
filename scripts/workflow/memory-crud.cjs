@@ -9,7 +9,7 @@ const fs = require('fs');
 const path = require('path');
 
 const DATA_DIR = process.env.ORB_DATA || path.join(
-  process.env.WORKSPACE || '/Users/karry/Orb/profiles/karry/workspace',
+  process.env.WORKSPACE || '~/Orb/profiles/<your-profile>/workspace',
   '..', 'data'
 );
 const LESSONS_DIR = path.join(DATA_DIR, 'lessons');

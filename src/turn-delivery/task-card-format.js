@@ -72,7 +72,7 @@ export function buildPlanSnapshotTitle(todos) {
 }
 
 export function categorizeTool(toolName) {
-  if (/^(Bash|Read|Edit|Write|Grep|Glob|NotebookEdit|WebFetch|WebSearch)$/.test(toolName)) return 'Probe';
+  if (/^(Bash|Read|Edit|Write|Grep|Glob|NotebookEdit|WebFetch|WebSearch|LSP)$/.test(toolName)) return 'Probe';
   if (/^(Task|Agent|Skill|mcp__)/.test(toolName)) return 'Delegate';
   if (toolName === 'summary') return 'Distill';
   return null;

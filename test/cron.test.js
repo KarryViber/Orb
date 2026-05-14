@@ -265,7 +265,7 @@ test('cron direct delivery routes through scheduler platform adapter', async () 
     getProfilePaths: () => ({ dataDir, workspaceDir: dataDir, scriptsDir: dataDir }),
     getProfileNotifyDm: () => 'D0ANGB3M1CZ',
     scheduler: {
-      adapters: new Map([['slack', adapter]]),
+      _getAdapter: (platform) => platform === 'slack' ? adapter : null,
       executeTask: async () => ({
         text: '{"status":"ok","main":"direct text","blocks":[{"type":"section","text":{"type":"mrkdwn","text":"block text"}}]}',
         stopReason: 'success',
@@ -310,7 +310,7 @@ test('cron direct delivery failure persists failed status receipt and delivery l
     getProfilePaths: () => ({ dataDir, workspaceDir: dataDir, scriptsDir: dataDir }),
     getProfileNotifyDm: () => 'D0ANGB3M1CZ',
     scheduler: {
-      adapters: new Map([['wechat', adapter]]),
+      _getAdapter: (platform) => platform === 'wechat' ? adapter : null,
       executeTask: async () => ({
         text: '{"status":"ok","main":"direct text"}',
         stopReason: 'success',

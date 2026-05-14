@@ -66,7 +66,7 @@ function makeScheduler(sequence, adapter) {
       return { worker };
     },
   });
-  scheduler.addAdapter('slack', adapter);
+  scheduler.setAdapter(adapter);
   return scheduler;
 }
 

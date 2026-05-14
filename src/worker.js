@@ -1,7 +1,8 @@
 import { spawn } from 'node:child_process';
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, readFileSync, existsSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, existsSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFile as appendFileAsync, mkdir as mkdirAsync } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -66,6 +67,8 @@ import {
  *     - one Claude turn finished; text comes from worker turnBuffer assistant text blocks
  *       joined with "\n"; CLI result text is only a fallback when the buffer is empty.
  *       Block-level dedup suppresses repeated result lines within the same turn.
+ *     - gitDiffSummary/dailyNotesSummary are routing-only metadata and are
+ *       not rendered to Slack since 2026-05-14.
  *   { type: 'cc_event', turnId, attemptId?, origin?, eventType, payload }  — raw Claude Code event forwarded to scheduler subscribers
  *   { type: 'inject_failed', injectId?, attemptId?, userText, fileContent?, imagePaths?, fragments? }  — follow-up inject could not reach CLI;
  *     scheduler should respawn a fresh worker and replay the user payload.
@@ -122,6 +125,8 @@ let _stdoutParseFailCount = 0;
 let _stdoutParseFailLastSampleAt = 0;
 const STDOUT_PARSE_FAIL_THRESHOLD = 50;
 const STDOUT_PARSE_FAIL_SAMPLE_INTERVAL_MS = 60_000;
+// 防御超大单行 stream-json（含 base64 图片内联等）撑爆 V8 heap
+const STDOUT_BUF_MAX_BYTES = 64 * 1024 * 1024;
 
 process.on('message', async (msg) => {
   if (msg.type === 'inject') {
@@ -183,7 +188,7 @@ process.on('message', async (msg) => {
         fragments: msg.fragments || _currentFragments,
         origin: msg.origin || _currentOrigin || null,
       })).catch(() => {});
-      setImmediate(() => process.exit(0));
+      setImmediate(() => drainAppendChainsAndExit(0));
     }
     return;
   }
@@ -220,7 +225,7 @@ process.on('message', async (msg) => {
           channelSemantics: _currentChannelSemantics,
         }));
       } catch {}
-      setImmediate(() => process.exit(0));
+      setImmediate(() => drainAppendChainsAndExit(0));
       return;
     }
   }
@@ -315,7 +320,7 @@ process.on('message', async (msg) => {
       '--output-format', 'stream-json',
       '--exclude-dynamic-system-prompt-sections',
       '--verbose',
-      '--add-dir', ORB_ROOT,
+      '--add-dir', join(ORB_ROOT, 'profiles'),
     ];
     if (!permissionPromptDisabled) {
       streamArgs.push(
@@ -349,6 +354,7 @@ process.on('message', async (msg) => {
           toolInputs: turn.toolInputs || [],
           finalText: turn.text || '',
         }).catch((err) => console.warn(`[worker] memory usage record failed: ${err.message}`));
+        // Summary fields are routing-only metadata; Slack rendering was removed on 2026-05-14.
         const { gitDiffSummary, dailyNotesSummary } = turn.summarySnapshot
           || await collectCurrentTurnSummarySnapshot(WORKSPACE);
         const hasTurnText = Boolean(turn.text?.trim());
@@ -476,9 +482,9 @@ process.on('message', async (msg) => {
     cleanupTempFile(mcpConfigPath);
   }
 
-  // Worker exits after CLI closes — no explicit process.exit needed
-  // (CLI idle timeout → stdin.end → child close → exitPromise resolves → IPC sent → exit)
-  setImmediate(() => process.exit(0));
+  // Worker exits after CLI closes — drain pending jsonl writes first
+  // (CLI idle timeout → stdin.end → child close → exitPromise resolves → IPC sent → drain → exit)
+  setImmediate(() => drainAppendChainsAndExit(0));
 });
 
 const IDLE_TIMEOUT = WORKER_IDLE_TIMEOUT_MS; // idle → close stdin → CLI exits
@@ -647,49 +653,60 @@ function timestampJst() {
   return `${shifted.slice(0, -1)}+09:00`;
 }
 
+const _appendChains = new Map(); // filePath → Promise
+
+function appendJsonlAsync(dir, fileName, record, label) {
+  // per-file 串行 chain：同一 jsonl 文件的多次 append 顺序写，避免乱序/丢行；
+  // 跨文件仍并行；exit 前 drain 全部 chain（见 drainAppendChainsAndExit）。
+  const filePath = join(dir, fileName);
+  const line = `${JSON.stringify(record)}\n`;
+  const prev = _appendChains.get(filePath) ?? Promise.resolve();
+  const next = prev
+    .then(() => mkdirAsync(dir, { recursive: true }))
+    .then(() => appendFileAsync(filePath, line))
+    .catch((err) => console.warn(`[worker] failed to write ${label}: ${err.message}`));
+  _appendChains.set(filePath, next);
+  return next;
+}
+
+async function drainAppendChainsAndExit(code = 0) {
+  try {
+    await Promise.allSettled([..._appendChains.values()]);
+  } catch {}
+  process.exit(code);
+}
+
 function writeCcEvent({ event_type, payload }) {
   if (!_currentTurnId || !_currentDataDir) return;
-  try {
-    const dir = join(_currentDataDir, 'cc-events');
-    mkdirSync(dir, { recursive: true });
-    appendFileSync(join(dir, `${todayJstDate()}.jsonl`), `${JSON.stringify({
-      ts: timestampJst(),
-      thread_ts: _currentThreadTs || null,
-      turn_id: _currentTurnId,
-      job_id: _currentJobId,
-      profile: _currentProfileName || 'default',
-      attempt_id: _currentAttemptId || null,
-      origin: _currentOrigin || null,
-      event_type,
-      payload: payload || {},
-    })}\n`);
-  } catch (err) {
-    console.warn(`[worker] failed to write cc event: ${err.message}`);
-  }
+  appendJsonlAsync(join(_currentDataDir, 'cc-events'), `${todayJstDate()}.jsonl`, {
+    ts: timestampJst(),
+    thread_ts: _currentThreadTs || null,
+    turn_id: _currentTurnId,
+    job_id: _currentJobId,
+    profile: _currentProfileName || 'default',
+    attempt_id: _currentAttemptId || null,
+    origin: _currentOrigin || null,
+    event_type,
+    payload: payload || {},
+  }, 'cc event');
 }
 
 function writeTurnReceipt({ stopReason, toolCount, lastTool, usage }) {
   if (!_currentTurnId || !_currentDataDir) return;
-  try {
-    const dir = join(_currentDataDir, 'receipts');
-    mkdirSync(dir, { recursive: true });
-    appendFileSync(join(dir, `${todayJstDate()}.jsonl`), `${JSON.stringify({
-      ts: timestampJst(),
-      thread_ts: _currentThreadTs || null,
-      turn_id: _currentTurnId,
-      job_id: _currentJobId,
-      profile: _currentProfileName || 'default',
-      attempt_id: _currentAttemptId || null,
-      origin: _currentOrigin || null,
-      stop_reason: stopReason || null,
-      tool_count: toolCount || 0,
-      last_tool: lastTool || null,
-      channel_semantics: _currentChannelSemantics,
-      ...(usage ? { usage } : {}),
-    })}\n`);
-  } catch (err) {
-    console.warn(`[worker] failed to write turn receipt: ${err.message}`);
-  }
+  appendJsonlAsync(join(_currentDataDir, 'receipts'), `${todayJstDate()}.jsonl`, {
+    ts: timestampJst(),
+    thread_ts: _currentThreadTs || null,
+    turn_id: _currentTurnId,
+    job_id: _currentJobId,
+    profile: _currentProfileName || 'default',
+    attempt_id: _currentAttemptId || null,
+    origin: _currentOrigin || null,
+    stop_reason: stopReason || null,
+    tool_count: toolCount || 0,
+    last_tool: lastTool || null,
+    channel_semantics: _currentChannelSemantics,
+    ...(usage ? { usage } : {}),
+  }, 'turn receipt');
 }
 
 function sendCcEvent(eventType, payload) {
@@ -770,6 +787,18 @@ function runClaudeInteractive(args, initialContent, workspace) {
   let stdoutBuf = '';
   child.stdout.on('data', (chunk) => {
     stdoutBuf += chunk.toString();
+    if (stdoutBuf.length > STDOUT_BUF_MAX_BYTES) {
+      // 单行无换行符堆积超阈值（如 stream-json 中 base64 图片）→ 中止 worker
+      const bufLen = stdoutBuf.length;
+      stdoutBuf = '';
+      try {
+        process.send?.(makeError({
+          error: `cli stdout buffer overflow: ${bufLen} bytes`,
+          errorContext: { stdoutBufLen: bufLen, threshold: STDOUT_BUF_MAX_BYTES },
+        }));
+      } catch {}
+      process.exit(1);
+    }
     const lines = stdoutBuf.split('\n');
     stdoutBuf = lines.pop(); // keep incomplete line
 

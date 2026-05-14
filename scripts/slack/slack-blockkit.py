@@ -3,13 +3,13 @@
 
 Usage:
     # From file:
-    python3 slack-blockkit.py --channel CXXXXXXXXXX --text "Fallback" --color "#2eb886" --blocks blocks.json
+    python3 slack-blockkit.py --channel C0123456789 --text "Fallback" --color "#2eb886" --blocks blocks.json
     
     # From stdin:
-    echo '[{"type":"section","text":{"type":"mrkdwn","text":"*Hello*"}}]' | python3 slack-blockkit.py --channel CXXXXXXXXXX --text "Fallback"
+    echo '[{"type":"section","text":{"type":"mrkdwn","text":"*Hello*"}}]' | python3 slack-blockkit.py --channel C0123456789 --text "Fallback"
     
     # With thread:
-    python3 slack-blockkit.py --channel CXXXXXXXXXX --thread 1234567890.123456 --text "Reply" --blocks blocks.json
+    python3 slack-blockkit.py --channel C0123456789 --thread 1234567890.123456 --text "Reply" --blocks blocks.json
 
 Output: message timestamp (ts) on success, exits 1 on error.
 """
@@ -29,7 +29,7 @@ def get_slack_token():
     if token:
         return token
 
-    env_path = "/Users/karry/Orb/profiles/karry/.env"
+    env_path = "~/Orb/profiles/<your-profile>/.env"
     if os.path.exists(env_path):
         with open(env_path, encoding="utf-8") as f:
             for line in f:
@@ -90,7 +90,7 @@ def main():
     if args.channel_name:
         import subprocess
         args.channel = subprocess.check_output(
-            ["python3", "/Users/karry/Orb/scripts/cron/channels-resolve.py", args.channel_name]
+            ["python3", "~/Orb/scripts/cron/channels-resolve.py", args.channel_name]
         ).decode().strip()
     if not args.channel:
         parser.error("必须提供 --channel 或 --channel-name")

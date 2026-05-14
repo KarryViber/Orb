@@ -17,6 +17,8 @@ import { TurnDeliveryLedger } from './ledger.js';
 import { createTurnDeliveryCcEventSubscriber } from './cc-event-subscriber.js';
 import { chunksText } from './cc-event-format.js';
 
+// auto-rotate (default true since dae2c63) 在 4min 主动接管，理论上 Slack 5min lifetime
+// 不会再杀 stream。streamFailed fallback 保留作 rotate 自身失败 (network / API throw) 的兜底。
 const STREAM_INTERRUPTED_TEXT = 'stream interrupted, continuing here';
 const STREAM_CONTINUED_TEXT = '↩️ 续';
 
@@ -92,6 +94,13 @@ export class TurnDeliveryOrchestrator {
 
   getTurnState(turnId) {
     return this._turns.get(String(turnId || '')) || null;
+  }
+
+  markStreamFailed(turnState, { streamChannel = 'qi', error = null } = {}) {
+    if (!turnState) return;
+    turnState.streamFailed = true;
+    ensureTaskCardState(turnState, streamChannel).failed = true;
+    this.logger(`[turn-delivery] stream marked failed: ${error?.message || 'unknown stream failure'}`);
   }
 
   async handleCcEvent(msg, ctx = {}) {
@@ -239,13 +248,13 @@ export class TurnDeliveryOrchestrator {
 
   _handleDeliveryFailure(intent, turnState, deliveryChannel, err) {
     if (deliveryChannel === 'stream') {
-      turnState.streamFailed = true;
       if (intent.intent === TASK_PROGRESS_START || intent.intent === TASK_PROGRESS_APPEND || intent.intent === TASK_PROGRESS_STOP) {
-        ensureTaskCardState(turnState, inferTaskStreamChannel(intent)).failed = true;
+        this.markStreamFailed(turnState, { streamChannel: inferTaskStreamChannel(intent), error: err });
       } else if (turnState.taskCardStates?.qi) {
-        turnState.taskCardStates.qi.failed = true;
+        this.markStreamFailed(turnState, { streamChannel: 'qi', error: err });
+      } else {
+        this.markStreamFailed(turnState, { streamChannel: 'qi', error: err });
       }
-      this.logger(`[turn-delivery] stream delivery failed: ${err.message}`);
     }
   }
 

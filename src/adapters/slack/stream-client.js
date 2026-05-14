@@ -35,6 +35,7 @@ export function createStreamClient({
   autoRotateAfterMs = AUTO_ROTATE_AFTER_MS,
 }) {
   const streams = new Map();
+  const recipientCache = new Map();
 
   function cloneChunk(chunk) {
     return chunk && typeof chunk === 'object' ? { ...chunk } : chunk;
@@ -61,6 +62,26 @@ export function createStreamClient({
         stream.snapshot.tasks.set(id, next);
       }
     }
+  }
+
+  async function callWithRetry(apiMethod, params, methodName, maxRetries = 2) {
+    let lastErr = null;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        return await webClient.apiCall(apiMethod, params);
+      } catch (err) {
+        lastErr = err;
+        const code = err?.data?.error || '';
+        if (code === 'ratelimited' && attempt < maxRetries) {
+          const delay = (attempt + 1) * 1000;
+          warn(TAG, `${methodName} rate-limited, retry in ${delay}ms (attempt ${attempt + 1}/${maxRetries})`);
+          await new Promise((r) => setTimeout(r, delay));
+          continue;
+        }
+        throw err;
+      }
+    }
+    throw lastErr;
   }
 
   function snapshotChunks(stream) {
@@ -91,7 +112,7 @@ export function createStreamClient({
 
     let result;
     try {
-      result = await webClient.apiCall('chat.startStream', params);
+      result = await callWithRetry('chat.startStream', params, 'startStream');
     } catch (err) {
       throw buildStreamAPIError('startStream', err.data?.error || err.message, err);
     }
@@ -117,13 +138,13 @@ export function createStreamClient({
     const lifeMs = stream.startedAt ? Date.now() - stream.startedAt : null;
     try {
       info(TAG, `[slack:stopStream] summary stream_id=${streamId} life_ms=${lifeMs} total_appends=${stream.appendCount || 0} total_append_len=${stream.totalAppendLen || 0} final_len=${finalText.length} final_blocks=${finalBlocks ? finalBlocks.length : 0}`);
-      result = await webClient.apiCall('chat.stopStream', {
+      result = await callWithRetry('chat.stopStream', {
         channel: stream.channel,
         ts: stream.ts,
         ...(normalizedChunks.length > 0 ? { chunks: normalizedChunks } : {}),
         ...(sendMarkdownTop ? { markdown_text: finalText } : {}),
         ...(finalBlocks ? { blocks: finalBlocks } : {}),
-      });
+      }, 'stopStream');
     } catch (err) {
       info(TAG, `[slack:stopStream:error] stream_id=${streamId} error=${err.data?.error || err.message} total_appends=${stream.appendCount || 0} total_append_len=${stream.totalAppendLen || 0}`);
       throw buildStreamAPIError('stopStream', err.data?.error || err.message, err);
@@ -143,6 +164,14 @@ export function createStreamClient({
       });
     }, stream.autoRotateAfterMs);
     if (typeof stream.rotateTimer.unref === 'function') stream.rotateTimer.unref();
+  }
+
+  async function notifyRotateFailure(stream, payload, err) {
+    try {
+      await stream.onRotate?.({ ...payload, ok: false, error: err });
+    } catch (callbackErr) {
+      warn(TAG, `[slack:autoRotate:onRotate:error] stream_id=${payload.stream_id || payload.prev_stream_id || 'unknown'} error=${callbackErr.message}`);
+    }
   }
 
   const client = {
@@ -223,6 +252,9 @@ export function createStreamClient({
       const resolvedTeamId = getTeamId() || teamId || null;
       if (!resolvedTeamId) throw new StreamAPIError('missing Slack team_id for streaming API');
 
+      const cacheKey = `${channel}:${threadTs}`;
+      if (recipientCache.has(cacheKey)) return recipientCache.get(cacheKey);
+
       try {
         const result = await webClient.conversations.replies({
           channel,
@@ -232,7 +264,9 @@ export function createStreamClient({
         });
         const recipientUserId = result?.messages?.[0]?.user;
         if (!recipientUserId) throw new StreamAPIError(`failed to resolve recipient_user_id for thread ${threadTs}`);
-        return { recipient_user_id: recipientUserId, recipient_team_id: resolvedTeamId };
+        const resolved = { recipient_user_id: recipientUserId, recipient_team_id: resolvedTeamId };
+        recipientCache.set(cacheKey, resolved);
+        return resolved;
       } catch (err) {
         if (err instanceof StreamAPIError) throw err;
         throw new StreamAPIError(`failed to resolve stream recipient: ${err.message}`, err);
@@ -249,6 +283,26 @@ export function createStreamClient({
       rotate_after_ms = null,
     } = {}) {
       if (!threadTs) throw new StreamAPIError('chat.startStream requires thread_ts');
+
+      for (const [existingId, existingStream] of streams) {
+        if (
+          existingStream.channel === channel &&
+          existingStream.threadTs === threadTs &&
+          !existingStream.stopped
+        ) {
+          info(TAG, `[slack:startStream] closing orphan stream_id=${existingId}`);
+          await stopSlackStream(existingId, existingStream, {}).catch((err) => {
+            warn(TAG, `[slack:startStream:orphan-stop:error] stream_id=${existingId} error=${err.message}`);
+          });
+          existingStream.stopped = true;
+          if (existingStream.rotateTimer) {
+            clearTimeout(existingStream.rotateTimer);
+            existingStream.rotateTimer = null;
+          }
+          streams.delete(existingId);
+        }
+      }
+
       const { result, normalizedTaskDisplayMode, initialChunks } = await startSlackStream(channel, threadTs, {
         channel,
         threadTs,
@@ -280,6 +334,7 @@ export function createStreamClient({
         snapshot: { plan: null, tasks: new Map() },
         rotating: null,
         rotateTimer: null,
+        stopped: false,
       };
       mergeSnapshot(stream, initialChunks);
       streams.set(streamId, stream);
@@ -290,6 +345,10 @@ export function createStreamClient({
     async appendStream(streamId, chunks) {
       const stream = client._getStreamHandle(streamId);
       if (stream.rotating) await stream.rotating.catch(() => {});
+      if (stream.stopped) {
+        warn(TAG, `[slack:appendStream:stopped] stream_id=${streamId}`);
+        throw buildStreamAPIError('appendStream', 'stream_stopped');
+      }
       const normalizedChunks = client.normalizeStreamChunks(chunks);
       if (normalizedChunks.length === 0) return;
       mergeSnapshot(stream, normalizedChunks);
@@ -324,30 +383,51 @@ export function createStreamClient({
     },
 
     async stopAndRotate(streamId) {
-      const stream = client._getStreamHandle(streamId);
+      const stream = streams.get(streamId);
+      if (!stream || stream.stopped) {
+        info(TAG, `[slack:autoRotate] skip stream_id=${streamId} reason=already-stopped`);
+        return;
+      }
       if (!stream.autoRotate) return { rotated: false, stream_id: streamId, ts: stream.ts };
       if (stream.rotating) return stream.rotating;
       stream.rotating = (async () => {
         const prevStreamId = `${stream.channel}:${stream.ts}`;
         const prevTs = stream.ts;
-        const finalChunks = snapshotChunks(stream);
+        const failurePayload = {
+          reason: 'auto-rotate',
+          prev_stream_id: prevStreamId,
+          prev_ts: prevTs,
+          stream_id: prevStreamId,
+          ts: prevTs,
+        };
+        let previousStopped = false;
         if (stream.rotateTimer) {
           clearTimeout(stream.rotateTimer);
           stream.rotateTimer = null;
         }
-        await stopSlackStream(prevStreamId, stream, { chunks: finalChunks });
-        const nextInitialChunks = [
-          AUTO_ROTATE_MARKER_CHUNK,
-          ...snapshotChunks(stream),
-        ];
-        const { result, initialChunks } = await startSlackStream(stream.channel, stream.threadTs, {
-          task_display_mode: stream.taskDisplayMode,
-          initial_chunks: nextInitialChunks,
-          team_id: stream.teamId,
-        });
+        let result;
+        let initialChunks;
+        try {
+          await stopSlackStream(prevStreamId, stream, {});
+          previousStopped = true;
+          const nextInitialChunks = [
+            AUTO_ROTATE_MARKER_CHUNK,
+            ...snapshotChunks(stream),
+          ];
+          ({ result, initialChunks } = await startSlackStream(stream.channel, stream.threadTs, {
+            task_display_mode: stream.taskDisplayMode,
+            initial_chunks: nextInitialChunks,
+            team_id: stream.teamId,
+          }));
+        } catch (err) {
+          if (previousStopped) stream.stopped = true;
+          await notifyRotateFailure(stream, { ...failurePayload, stopped: previousStopped }, err);
+          throw err;
+        }
         const newStreamId = `${stream.channel}:${result.ts}`;
         streams.delete(prevStreamId);
         stream.ts = result.ts;
+        stream.stopped = false;
         stream.startedAt = Date.now();
         stream.appendCount = 0;
         stream.totalAppendLen = 0;
@@ -361,6 +441,7 @@ export function createStreamClient({
         scheduleAutoRotate(newStreamId, stream);
         info(TAG, `[slack:autoRotate] auto_rotated=true rotate_at_ms=${stream.autoRotateAfterMs} prev_stream_id=${prevStreamId} new_stream_id=${newStreamId}`);
         await stream.onRotate?.({
+          ok: true,
           reason: 'auto-rotate',
           prev_stream_id: prevStreamId,
           prev_ts: prevTs,
@@ -377,14 +458,17 @@ export function createStreamClient({
     async stopStream(streamId, { markdown_text, blocks, chunks, final_blocks } = {}) {
       const stream = client._getStreamHandle(streamId);
       if (stream.rotating) await stream.rotating.catch(() => {});
+      const currentStreamId = `${stream.channel}:${stream.ts}`;
       if (stream.rotateTimer) {
         clearTimeout(stream.rotateTimer);
         stream.rotateTimer = null;
       }
       try {
-        await stopSlackStream(streamId, stream, { markdown_text, blocks, chunks, final_blocks });
+        await stopSlackStream(currentStreamId, stream, { markdown_text, blocks, chunks, final_blocks });
+        stream.stopped = true;
       } finally {
         streams.delete(streamId);
+        if (currentStreamId !== streamId) streams.delete(currentStreamId);
       }
     },
 

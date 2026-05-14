@@ -38,16 +38,16 @@ const NEVER_TRUNCATE_SOURCE_TYPES = new Set([
 ]);
 
 // Prompt budget pruning order, first removed first:
-// linked_thread -> attachment -> web_content -> scratchpad -> thread_history -> doc_snippet
-// -> memory_fact -> slack_channel_meta. tool_result is outside context.js.
+// linked_thread -> attachment -> web_content -> scratchpad -> thread_history -> memory_fact
+// -> doc_snippet -> slack_channel_meta. tool_result is outside context.js.
 const TRUNCATE_SOURCE_ORDER = [
   'linked_thread',
   'attachment',
   'web_content',
   'scratchpad',
   'thread_history',
-  'doc_snippet',
   'memory_fact',
+  'doc_snippet',
   'slack_channel_meta',
 ];
 

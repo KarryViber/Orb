@@ -62,7 +62,8 @@ async function withLock(dataDir, fn) {
     throw new Error('session lock unavailable');
   }
   try {
-    fn();
+    // await 支持同步 / async 回调，避免未来 async fn 的 unhandledRejection 与提前释放锁
+    await fn();
   } finally {
     try { await release(); } catch {}
   }
